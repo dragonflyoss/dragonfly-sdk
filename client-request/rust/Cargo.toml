@@ -1,0 +1,53 @@
+[package]
+name = "dragonfly-client-request"
+description = "Request library for the dragonfly client"
+version = "1.5.0"
+authors = ["The Dragonfly Developers"]
+edition = "2021"
+readme = "README.md"
+homepage = "https://d7y.io/"
+repository = "https://github.com/dragonflyoss/dragonfly-sdk.git"
+license = "Apache-2.0"
+keywords = ["container", "docker-image", "dragonfly", "dragonfly-client", "p2p"]
+
+[features]
+default = []
+preheat = ["dep:oci-client", "dep:oci-spec"]
+
+[dependencies]
+dragonfly-client-core = "1.4.9"
+dragonfly-client-util = "1.4.9"
+dragonfly-api = "=2.2.32"
+async-trait = "0.1"
+futures = "0.3.32"
+hostname = "^0.4"
+bytes = "1.11"
+oci-client = { version = "0.17.0", default-features = false, features = [
+  "rustls-tls"
+], optional = true }
+oci-spec = { version = "0.9", optional = true }
+reqwest = { version = "0.12.28", default-features = false, features = [
+  "blocking",
+  "charset",
+  "hickory-dns",
+  "http2",
+  "rustls-tls-native-roots-no-provider",
+  "stream",
+  "system-proxy",
+] }
+reqwest-tracing = "0.5"
+reqwest-middleware = "0.4"
+prost-wkt-types = "0.7"
+rustls-pki-types = "1.14.1"
+tokio = { version = "1.52.3", features = ["full", "tracing"] }
+tokio-util = { version = "0.7.18", features = ["full"] }
+tonic = { version = "=0.14.2", features = ["tls-aws-lc"] }
+tracing = "0.1"
+url = "2.5.4"
+tonic-health = "=0.14.5"
+thiserror = "2.0"
+
+[dev-dependencies]
+# TODO(Gaius): Remove the git dependency after the next release of mocktail, refer to https://github.com/IBM/mocktail/issues/65.
+mocktail = { git = "https://github.com/IBM/mocktail", rev = "860e75e171a8eb818083813dbeed4401d1a40b3b", version = "0.3.0" }
+siphasher = "0.3"

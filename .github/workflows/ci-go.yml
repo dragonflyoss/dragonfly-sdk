@@ -1,0 +1,63 @@
+name: CI (Go)
+
+on:
+  push:
+    branches: [main, release-*]
+    paths: ['client-request/go/**', '.github/workflows/ci-go.yml']
+  pull_request:
+    branches: [main, release-*]
+    paths: ['client-request/go/**', '.github/workflows/ci-go.yml']
+
+defaults:
+  run:
+    working-directory: client-request/go
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: client-request/go/go.mod
+          cache-dependency-path: client-request/go/go.sum
+
+      - name: Run gofmt
+        run: |
+          test -z "$(gofmt -l .)"
+
+      - name: Run go vet
+        run: |
+          go vet ./...
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v7
+        with:
+          working-directory: client-request/go
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: client-request/go/go.mod
+          cache-dependency-path: client-request/go/go.sum
+
+      - name: Run go build
+        run: |
+          go build ./...
+
+      - name: Run go test
+        run: |
+          go test -race ./...
