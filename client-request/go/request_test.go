@@ -74,7 +74,7 @@ func (s *mockSeedPeer) DownloadTask(req *dfdaemonv2.DownloadTaskRequest, stream 
 		return s.downloadErr
 	}
 
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		if err := stream.Send(&dfdaemonv2.DownloadTaskResponse{
 			HostId: "seed-peer-1",
 			TaskId: "task-1",

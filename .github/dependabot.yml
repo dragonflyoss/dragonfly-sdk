@@ -1,0 +1,14 @@
+version: 2
+updates:
+- package-ecosystem: "cargo"
+  directory: "/client-request/rust"
+  schedule:
+    interval: "weekly"
+- package-ecosystem: "gomod"
+  directory: "/client-request/go"
+  schedule:
+    interval: "weekly"
+- package-ecosystem: "github-actions"
+  directory: "/"
+  schedule:
+    interval: "weekly"

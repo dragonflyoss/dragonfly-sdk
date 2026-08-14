@@ -64,30 +64,23 @@ const (
 	defaultMaxRetries = 1
 )
 
-// options holds the configurable settings for the Proxy.
-type options struct {
-	schedulerRequestTimeout time.Duration
-	healthCheckInterval     time.Duration
-	maxRetries              uint8
-}
-
 // Option configures the Proxy.
-type Option func(*options)
+type Option func(p *Proxy)
 
 // WithSchedulerRequestTimeout sets the timeout of requests to the scheduler
 // service.
 func WithSchedulerRequestTimeout(timeout time.Duration) Option {
-	return func(o *options) { o.schedulerRequestTimeout = timeout }
+	return func(p *Proxy) { p.schedulerRequestTimeout = timeout }
 }
 
 // WithHealthCheckInterval sets the interval of health check for seed peers.
 func WithHealthCheckInterval(interval time.Duration) Option {
-	return func(o *options) { o.healthCheckInterval = interval }
+	return func(p *Proxy) { p.healthCheckInterval = interval }
 }
 
 // WithMaxRetries sets the maximum number of retries.
 func WithMaxRetries(retries uint8) Option {
-	return func(o *options) { o.maxRetries = retries }
+	return func(p *Proxy) { p.maxRetries = retries }
 }
 
 // Proxy is the HTTP proxy client that sends requests via Dragonfly.
@@ -97,6 +90,13 @@ type Proxy struct {
 
 	// maxRetries is the number of times to retry a request.
 	maxRetries uint8
+
+	// schedulerRequestTimeout is the timeout of requests to the scheduler
+	// service.
+	schedulerRequestTimeout time.Duration
+
+	// healthCheckInterval is the interval of health check for seed peers.
+	healthCheckInterval time.Duration
 
 	// clientPool is the pool of clients.
 	clientPool *pool.Pool
@@ -108,16 +108,17 @@ type Proxy struct {
 // New creates a Proxy that connects to the given scheduler endpoint,
 // e.g. "http://127.0.0.1:8002".
 func New(ctx context.Context, schedulerEndpoint string, opts ...Option) (*Proxy, error) {
-	o := &options{
+	p := &Proxy{
+		maxRetries:              defaultMaxRetries,
 		schedulerRequestTimeout: defaultSchedulerRequestTimeout,
 		healthCheckInterval:     defaultHealthCheckInterval,
-		maxRetries:              defaultMaxRetries,
+		clientPool:              pool.New(httpClientFactory, defaultClientPoolCapacity, defaultClientPoolIdleTimeout),
 	}
 	for _, opt := range opts {
-		opt(o)
+		opt(p)
 	}
 
-	target, err := validate(schedulerEndpoint, o)
+	target, err := p.validate(schedulerEndpoint)
 	if err != nil {
 		return nil, err
 	}
@@ -127,7 +128,7 @@ func New(ctx context.Context, schedulerEndpoint string, opts ...Option) (*Proxy,
 		return nil, fmt.Errorf("%w: failed to connect to scheduler %s: %v", ErrInternal, schedulerEndpoint, err)
 	}
 
-	seedPeerSelector, err := selector.New(ctx, schedulerv2.NewSchedulerClient(schedulerConn), o.healthCheckInterval, o.schedulerRequestTimeout)
+	seedPeerSelector, err := selector.New(ctx, schedulerv2.NewSchedulerClient(schedulerConn), p.healthCheckInterval, p.schedulerRequestTimeout)
 	if err != nil {
 		schedulerConn.Close()
 		return nil, fmt.Errorf("%w: failed to create seed peer selector: %v", ErrInternal, err)
@@ -137,12 +138,9 @@ func New(ctx context.Context, schedulerEndpoint string, opts ...Option) (*Proxy,
 	// periodically.
 	go seedPeerSelector.Run()
 
-	return &Proxy{
-		seedPeerSelector: seedPeerSelector,
-		maxRetries:       o.maxRetries,
-		clientPool:       pool.New(httpClientFactory, defaultClientPoolCapacity, defaultClientPoolIdleTimeout),
-		schedulerConn:    schedulerConn,
-	}, nil
+	p.seedPeerSelector = seedPeerSelector
+	p.schedulerConn = schedulerConn
+	return p, nil
 }
 
 // Close stops the background seed peer refresh and closes the scheduler
@@ -154,21 +152,21 @@ func (p *Proxy) Close() error {
 
 // validate validates the input parameters and returns the scheduler grpc
 // target.
-func validate(schedulerEndpoint string, o *options) (string, error) {
+func (p *Proxy) validate(schedulerEndpoint string) (string, error) {
 	u, err := url.Parse(schedulerEndpoint)
 	if err != nil || u.Host == "" {
 		return "", fmt.Errorf("%w: invalid scheduler endpoint: %s", ErrInvalidArgument, schedulerEndpoint)
 	}
 
-	if o.schedulerRequestTimeout < 100*time.Millisecond {
+	if p.schedulerRequestTimeout < 100*time.Millisecond {
 		return "", fmt.Errorf("%w: scheduler request timeout must be at least 100 milliseconds", ErrInvalidArgument)
 	}
 
-	if o.healthCheckInterval < time.Second || o.healthCheckInterval > 600*time.Second {
+	if p.healthCheckInterval < time.Second || p.healthCheckInterval > 600*time.Second {
 		return "", fmt.Errorf("%w: health check interval must be between 1 and 600 seconds", ErrInvalidArgument)
 	}
 
-	if o.maxRetries > 10 {
+	if p.maxRetries > 10 {
 		return "", fmt.Errorf("%w: max retries must be between 0 and 10", ErrInvalidArgument)
 	}
 

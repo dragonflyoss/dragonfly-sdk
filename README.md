@@ -8,22 +8,7 @@
 [![Twitter](https://img.shields.io/twitter/url?style=social&url=https%3A%2F%2Ftwitter.com%2Fdragonfly_oss)](https://twitter.com/dragonfly_oss)
 [![LICENSE](https://img.shields.io/github/license/dragonflyoss/dragonfly.svg?style=flat-square)](https://github.com/dragonflyoss/dragonfly/blob/main/LICENSE)
 
-Public SDK for Dragonfly
-
-## Packages
-
-Each package lives in its own directory with one subdirectory per language.
-Every package/language pair is released independently with prefixed tags
-(e.g. `client-request/go/v1.5.0`).
-
-| Package | Language | Location | Install |
-|---|---|---|---|
-| client-request | Rust | [client-request/rust](./client-request/rust) | [`dragonfly-client-request`](https://crates.io/crates/dragonfly-client-request) on crates.io |
-| client-request | Go | [client-request/go](./client-request/go) | `go get d7y.io/dragonfly-sdk/client-request/go` |
-
-The Rust and Go implementations of a package are functionally identical.
-Cross-language consistency (task ids, hashring selection) is pinned by shared
-test vectors in both test suites.
+Multi-language SDKs for Dragonfly.
 
 ## Documentation
 

@@ -29,17 +29,20 @@ import (
 	commonv2 "d7y.io/api/v2/pkg/apis/common/v2"
 	dfdaemonv2 "d7y.io/api/v2/pkg/apis/dfdaemon/v2"
 	"d7y.io/dragonfly/v2/pkg/net/ip"
+	"d7y.io/dragonfly/v2/pkg/oci"
+	"github.com/containerd/platforms"
+	"github.com/distribution/reference"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/durationpb"
-
-	"d7y.io/dragonfly-sdk/client-request/go/internal/oci"
 )
 
-// Preheat preheats a file by downloading it to the seed peers via the
-// Dragonfly. It triggers the selected seed peers to download the file by the
-// dfdaemon download task API, without streaming the file content back to the
-// client.
+// dockerRegistryHost is the actual registry host for docker.io references.
+const dockerRegistryHost = "registry-1.docker.io"
+
+// Preheat preheats a file by downloading it to the seed peers via the Dragonfly.
+// It triggers the selected seed peers to download the file by the dfdaemon
+// download task API, without streaming the file content back to the client.
 func (p *Proxy) Preheat(ctx context.Context, req *PreheatRequest) error {
 	// Generate task id for selecting seed peer.
 	id, err := taskID(req.URL, req.PieceLength, req.Tag, req.Application, req.FilteredQueryParams, req.ContentForCalculatingTaskID, req.EnableTaskIDBasedBlobDigest)
@@ -59,19 +62,29 @@ func (p *Proxy) Preheat(ctx context.Context, req *PreheatRequest) error {
 	}
 
 	// Construct the download task request for preheating.
+	remoteIP := ip.IPv4.String()
 	download := &commonv2.Download{
 		Url:                         req.URL,
 		Type:                        commonv2.TaskType_STANDARD,
-		Tag:                         optional(req.Tag),
-		Application:                 optional(req.Application),
 		Priority:                    priority,
 		FilteredQueryParams:         req.FilteredQueryParams,
 		RequestHeader:               headerToMap(req.Header),
 		PieceLength:                 req.PieceLength,
 		Timeout:                     durationpb.New(req.Timeout),
-		ContentForCalculatingTaskId: optional(req.ContentForCalculatingTaskID),
-		RemoteIp:                    optional(ip.IPv4.String()),
+		RemoteIp:                    &remoteIP,
 		EnableTaskIdBasedBlobDigest: req.EnableTaskIDBasedBlobDigest,
+	}
+
+	if req.Tag != "" {
+		download.Tag = &req.Tag
+	}
+
+	if req.Application != "" {
+		download.Application = &req.Application
+	}
+
+	if req.ContentForCalculatingTaskID != "" {
+		download.ContentForCalculatingTaskId = &req.ContentForCalculatingTaskID
 	}
 
 	var lastErr error
@@ -93,8 +106,7 @@ func (p *Proxy) Preheat(ctx context.Context, req *PreheatRequest) error {
 	return fmt.Errorf("%w: failed to download task from any seed peer", ErrInternal)
 }
 
-// downloadTask triggers the seed peer to download the task and drains the
-// response stream.
+// downloadTask triggers the seed peer to download the task and drains the response stream.
 func (p *Proxy) downloadTask(ctx context.Context, peer *commonv2.Host, id string, download *commonv2.Download, req *PreheatRequest) error {
 	addr := net.JoinHostPort(peer.Ip, strconv.Itoa(int(peer.Port)))
 	conn, err := grpc.NewClient(
@@ -135,52 +147,101 @@ func (p *Proxy) downloadTask(ctx context.Context, peer *commonv2.Host, id string
 // indexes), and triggers the seed client to download each blob (config and
 // layers), without streaming the blob content back to the client.
 func (p *Proxy) PreheatImage(ctx context.Context, req *PreheatImageRequest) error {
-	result, err := oci.Resolve(ctx, &oci.ResolveOptions{
-		Image:    req.Image,
-		Username: req.Username,
-		Password: req.Password,
-		Platform: req.Platform,
-	})
+	ref, err := parseImage(req.Image)
 	if err != nil {
 		return err
 	}
 
-	if result.Token == "" {
+	httpClient := &http.Client{
+		Timeout:   req.Timeout,
+		Transport: http.DefaultTransport.(*http.Transport).Clone(),
+	}
+
+	client, err := oci.NewAuthClient(ref, httpClient, req.Username, req.Password)
+	if err != nil {
+		return fmt.Errorf("%w: failed to authenticate with registry: %v", ErrInternal, err)
+	}
+
+	platform := platforms.DefaultSpec()
+	if req.Platform != "" {
+		platform, err = platforms.Parse(req.Platform)
+		if err != nil {
+			return fmt.Errorf("%w: invalid platform format %q, expected \"os/arch\" (e.g., \"linux/amd64\"): %v", ErrInvalidArgument, req.Platform, err)
+		}
+	}
+
+	manifests, err := client.ResolveManifests(ctx, ref, make(http.Header), platform)
+	if err != nil {
+		return fmt.Errorf("%w: failed to pull image manifest: %v", ErrInternal, err)
+	}
+
+	if len(manifests) == 0 {
+		return fmt.Errorf("%w: no matching manifest for platform %s", ErrInternal, platforms.Format(platform))
+	}
+
+	token := client.AuthToken()
+	if token == "" {
 		return fmt.Errorf("%w: registry did not return authentication token", ErrInternal)
 	}
 
 	// Build authorization header for blob downloads through the Dragonfly.
 	header := make(http.Header)
-	header.Set("Authorization", result.Token)
+	header.Set("Authorization", token)
 
-	for _, blobURL := range result.BlobURLs {
-		preheatReq := &PreheatRequest{
-			URL:                         blobURL,
-			Header:                      header.Clone(),
-			PieceLength:                 req.PieceLength,
-			Tag:                         req.Tag,
-			Application:                 req.Application,
-			FilteredQueryParams:         req.FilteredQueryParams,
-			ContentForCalculatingTaskID: req.ContentForCalculatingTaskID,
-			EnableTaskIDBasedBlobDigest: req.EnableTaskIDBasedBlobDigest,
-			Priority:                    req.Priority,
-			Timeout:                     req.Timeout,
-			ClientCert:                  req.ClientCert,
-		}
+	for _, manifest := range manifests {
+		for _, desc := range manifest.References() {
+			preheatReq := &PreheatRequest{
+				URL:                         ref.BlobURL(desc.Digest.String()),
+				Header:                      header.Clone(),
+				PieceLength:                 req.PieceLength,
+				Tag:                         req.Tag,
+				Application:                 req.Application,
+				FilteredQueryParams:         req.FilteredQueryParams,
+				ContentForCalculatingTaskID: req.ContentForCalculatingTaskID,
+				EnableTaskIDBasedBlobDigest: req.EnableTaskIDBasedBlobDigest,
+				Priority:                    req.Priority,
+				Timeout:                     req.Timeout,
+				ClientCert:                  req.ClientCert,
+			}
 
-		if err := p.Preheat(ctx, preheatReq); err != nil {
-			return err
+			if err := p.Preheat(ctx, preheatReq); err != nil {
+				return err
+			}
 		}
 	}
 
 	return nil
 }
 
-// optional returns a pointer to the string, or nil when it is empty.
-func optional(s string) *string {
-	if s == "" {
-		return nil
+// parseImage parses an image reference (e.g., "docker.io/library/nginx:latest")
+// into a registry reference. The reference is normalized with docker
+// conventions, so "nginx:latest" resolves to "docker.io/library/nginx:latest".
+func parseImage(image string) (*oci.Reference, error) {
+	named, err := reference.ParseNormalizedNamed(image)
+	if err != nil {
+		return nil, fmt.Errorf("%w: invalid image reference: %v", ErrInvalidArgument, err)
+	}
+	named = reference.TagNameOnly(named)
+
+	var tag string
+	switch ref := named.(type) {
+	case reference.Digested:
+		tag = ref.Digest().String()
+	case reference.Tagged:
+		tag = ref.Tag()
+	default:
+		return nil, fmt.Errorf("%w: invalid image reference: %s", ErrInvalidArgument, image)
 	}
 
-	return &s
+	registry := reference.Domain(named)
+	if registry == "docker.io" {
+		registry = dockerRegistryHost
+	}
+
+	return &oci.Reference{
+		Scheme:     "https",
+		Registry:   registry,
+		Repository: reference.Path(named),
+		Reference:  tag,
+	}, nil
 }

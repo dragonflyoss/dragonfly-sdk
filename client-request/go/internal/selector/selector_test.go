@@ -140,14 +140,12 @@ func TestConcurrentSelect(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for i := range 10 {
+		wg.Go(func() {
 			hosts, err := s.Select(fmt.Sprintf("concurrent-task-%d", i), 2)
 			assert.NoError(err)
 			assert.Len(hosts, 3)
-		}()
+		})
 	}
 	wg.Wait()
 }

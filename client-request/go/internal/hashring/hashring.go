@@ -73,7 +73,7 @@ func New(replicaCount int) *VNodeHashRing {
 
 // Add adds replicaCount virtual nodes to the ring for the given node name.
 func (r *VNodeHashRing) Add(name string) {
-	for id := 0; id < r.replicaCount; id++ {
+	for id := range r.replicaCount {
 		vnode := VNode{id: id, name: name}
 		r.nodes = append(r.nodes, node{key: hashVNode(vnode), vnode: vnode})
 	}
@@ -106,7 +106,7 @@ func (r *VNodeHashRing) GetWithReplicas(key string, replicas int) []VNode {
 
 	start := r.search(hashKey(key))
 	vnodes := make([]VNode, 0, take)
-	for i := 0; i < take; i++ {
+	for i := range take {
 		vnodes = append(vnodes, r.nodes[(start+i)%len(r.nodes)].vnode)
 	}
 

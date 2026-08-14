@@ -63,14 +63,22 @@ type SeedPeerSelector struct {
 	// schedulerClient is the client to communicate with the scheduler service.
 	schedulerClient schedulerv2.SchedulerClient
 
-	mu    sync.RWMutex
+	// mu protects hosts and ring.
+	mu sync.RWMutex
+
+	// hosts is a map of seed peers by their name.
 	hosts map[string]*commonv2.Host
-	ring  *hashring.VNodeHashRing
+
+	// ring is a consistent hash ring of seed peers.
+	ring *hashring.VNodeHashRing
 
 	// refreshMu protects hot refresh.
 	refreshMu sync.Mutex
 
-	done      chan struct{}
+	// done is closed when the selector is closed.
+	done chan struct{}
+
+	// closeOnce ensures that the selector is closed only once.
 	closeOnce sync.Once
 }
 
@@ -161,14 +169,12 @@ func (s *SeedPeerSelector) refresh(ctx context.Context) error {
 	var wg sync.WaitGroup
 	healthy := make([]*commonv2.Host, len(seedPeers))
 	for i, peer := range seedPeers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			addr := net.JoinHostPort(peer.Ip, strconv.Itoa(int(peer.Port)))
 			if err := checkHealth(ctx, addr); err == nil {
 				healthy[i] = peer
 			}
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -183,12 +189,10 @@ func (s *SeedPeerSelector) refresh(ctx context.Context) error {
 		hosts[peer.Name] = peer
 	}
 
-	// The write lock is held for a very short time.
 	s.mu.Lock()
 	s.hosts = hosts
 	s.ring = ring
 	s.mu.Unlock()
-
 	return nil
 }
 
