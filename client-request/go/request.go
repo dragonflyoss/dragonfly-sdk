@@ -31,7 +31,7 @@ import (
 )
 
 // defaultRequestTimeout is the default timeout for requests.
-const defaultRequestTimeout = 300 * time.Second
+const defaultRequestTimeout = 30 * 60 * time.Second
 
 // Request is the interface for sending requests via the Dragonfly.
 //
@@ -91,9 +91,9 @@ type GetRequest struct {
 	// timeout is the timeout of the request.
 	timeout time.Duration
 
-	// clientCert is the client certificates for the request.
+	// certificates is the client certificates for the request.
 	// TODO(chlins): Support client certificates.
-	clientCert []*x509.Certificate
+	certificates []*x509.Certificate
 }
 
 // GetRequestOption configures the GetRequest.
@@ -157,14 +157,14 @@ func WithGetRequestTimeout(timeout time.Duration) GetRequestOption {
 	return func(r *GetRequest) { r.timeout = timeout }
 }
 
-// WithGetRequestClientCert sets the client certificates for the request.
+// WithGetRequestCertificates sets the client certificates for the request.
 // TODO(chlins): Support client certificates.
-func WithGetRequestClientCert(certs []*x509.Certificate) GetRequestOption {
-	return func(r *GetRequest) { r.clientCert = certs }
+func WithGetRequestCertificates(certs []*x509.Certificate) GetRequestOption {
+	return func(r *GetRequest) { r.certificates = certs }
 }
 
 // NewGetRequest returns a GetRequest for the url with default values: the
-// default filtered query params, blob digest based task id enabled and a 300s
+// default filtered query params, blob digest based task id enabled and a 600s
 // timeout.
 func NewGetRequest(url string, opts ...GetRequestOption) *GetRequest {
 	r := &GetRequest{
@@ -234,9 +234,9 @@ type PreheatRequest struct {
 	// timeout is the timeout of the request.
 	timeout time.Duration
 
-	// clientCert is the client certificates for the request.
+	// certificates is the client certificates for the request.
 	// TODO(chlins): Support client certificates.
-	clientCert []*x509.Certificate
+	certificates []*x509.Certificate
 }
 
 // PreheatRequestOption configures the PreheatRequest.
@@ -292,10 +292,10 @@ func WithPreheatRequestTimeout(timeout time.Duration) PreheatRequestOption {
 	return func(r *PreheatRequest) { r.timeout = timeout }
 }
 
-// WithPreheatRequestClientCert sets the client certificates for the request.
+// WithPreheatRequestCertificates sets the client certificates for the request.
 // TODO(chlins): Support client certificates.
-func WithPreheatRequestClientCert(certs []*x509.Certificate) PreheatRequestOption {
-	return func(r *PreheatRequest) { r.clientCert = certs }
+func WithPreheatRequestCertificates(certs []*x509.Certificate) PreheatRequestOption {
+	return func(r *PreheatRequest) { r.certificates = certs }
 }
 
 // NewPreheatRequest returns a PreheatRequest for the url with default values.
@@ -357,9 +357,9 @@ type PreheatImageRequest struct {
 	// timeout is the timeout for each blob download request.
 	timeout time.Duration
 
-	// clientCert is the client certificates for the request.
+	// certificates is the client certificates for the request.
 	// TODO(chlins): Support client certificates.
-	clientCert []*x509.Certificate
+	certificates []*x509.Certificate
 }
 
 // PreheatImageRequestOption configures the PreheatImageRequest.
@@ -426,10 +426,10 @@ func WithPreheatImageRequestTimeout(timeout time.Duration) PreheatImageRequestOp
 	return func(r *PreheatImageRequest) { r.timeout = timeout }
 }
 
-// WithPreheatImageRequestClientCert sets the client certificates for the request.
+// WithPreheatImageRequestCertificates sets the client certificates for the request.
 // TODO(chlins): Support client certificates.
-func WithPreheatImageRequestClientCert(certs []*x509.Certificate) PreheatImageRequestOption {
-	return func(r *PreheatImageRequest) { r.clientCert = certs }
+func WithPreheatImageRequestCertificates(certs []*x509.Certificate) PreheatImageRequestOption {
+	return func(r *PreheatImageRequest) { r.certificates = certs }
 }
 
 // NewPreheatImageRequest returns a PreheatImageRequest for the image with

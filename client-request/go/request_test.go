@@ -142,7 +142,7 @@ func TestNewInvalidRetryTimes(t *testing.T) {
 	assert := assert.New(t)
 	endpoint := setupMockScheduler(t, nil)
 
-	_, err := New(context.Background(), endpoint, WithMaxRetries(11))
+	_, err := New(context.Background(), endpoint, WithProxyMaxRetries(11))
 	assert.ErrorIs(err, ErrInvalidArgument)
 }
 
@@ -150,7 +150,7 @@ func TestNewInvalidHealthCheckInterval(t *testing.T) {
 	assert := assert.New(t)
 	endpoint := setupMockScheduler(t, nil)
 
-	_, err := New(context.Background(), endpoint, WithHealthCheckInterval(0))
+	_, err := New(context.Background(), endpoint, WithProxyHealthCheckInterval(0))
 	assert.ErrorIs(err, ErrInvalidArgument)
 }
 
@@ -248,35 +248,35 @@ func TestTaskIDVectors(t *testing.T) {
 	assert := assert.New(t)
 
 	pieceLength := uint64(4194304)
-	id, err := taskID(
-		"https://example.com/file.txt?Expires=e1&Signature=s1&foo=bar",
-		&pieceLength,
-		"tag1",
-		"app1",
-		[]string{"Expires", "Signature"},
-		"",
-		true,
-	)
+	id, err := generateTaskID(&GetRequest{
+		url:                         "https://example.com/file.txt?Expires=e1&Signature=s1&foo=bar",
+		pieceLength:                 &pieceLength,
+		tag:                         "tag1",
+		application:                 "app1",
+		filteredQueryParams:         []string{"Expires", "Signature"},
+		enableTaskIDBasedBlobDigest: true,
+	})
 	assert.NoError(err)
 	assert.Equal("2a0c4c713d7f2f65f36b78b79c4b78a6bf5d5f67b76730ed13485d3271482f1c", id)
 
-	id, err = taskID("https://example.com/file.txt", nil, "", "", nil, "", true)
+	id, err = generateTaskID(&GetRequest{
+		url:                         "https://example.com/file.txt",
+		enableTaskIDBasedBlobDigest: true,
+	})
 	assert.NoError(err)
 	assert.Equal("7fcf06e5f0b1e443065c1a563eed788eb2e168a05c6ad9c4b319f7a976322be0", id)
 
-	id, err = taskID("", nil, "", "", nil, "This is a test file", true)
+	id, err = generateTaskID(&GetRequest{
+		contentForCalculatingTaskID: "This is a test file",
+		enableTaskIDBasedBlobDigest: true,
+	})
 	assert.NoError(err)
 	assert.Equal("e2d0fe1585a63ec6009c8016ff8dda8b17719a637405a4e23c0ff81339148249", id)
 
-	id, err = taskID(
-		"http://registry.example.com/v2/library/ubuntu/blobs/sha256:b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e",
-		nil,
-		"",
-		"",
-		nil,
-		"",
-		true,
-	)
+	id, err = generateTaskID(&GetRequest{
+		url:                         "http://registry.example.com/v2/library/ubuntu/blobs/sha256:b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e",
+		enableTaskIDBasedBlobDigest: true,
+	})
 	assert.NoError(err)
 	assert.Equal("b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e", id)
 }
@@ -287,7 +287,7 @@ func TestTaskIDBlobDigestDisabled(t *testing.T) {
 	assert := assert.New(t)
 
 	blobURL := "http://registry.example.com/v2/library/ubuntu/blobs/sha256:b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e"
-	id, err := taskID(blobURL, nil, "", "", nil, "", false)
+	id, err := generateTaskID(&GetRequest{url: blobURL})
 	assert.NoError(err)
 	assert.NotEqual("b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e", id)
 }

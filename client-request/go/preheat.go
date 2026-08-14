@@ -30,22 +30,21 @@ import (
 	dfdaemonv2 "d7y.io/api/v2/pkg/apis/dfdaemon/v2"
 	"d7y.io/dragonfly/v2/pkg/net/ip"
 	"d7y.io/dragonfly/v2/pkg/oci"
-	"github.com/containerd/platforms"
-	"github.com/distribution/reference"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/durationpb"
 )
 
-// dockerRegistryHost is the actual registry host for docker.io references.
-const dockerRegistryHost = "registry-1.docker.io"
-
 // Preheat preheats a file by downloading it to the seed peers via the Dragonfly.
 // It triggers the selected seed peers to download the file by the dfdaemon
 // download task API, without streaming the file content back to the client.
 func (p *Proxy) Preheat(ctx context.Context, req *PreheatRequest) error {
-	// Generate task id for selecting seed peer.
-	id, err := taskID(req.url, req.pieceLength, req.tag, req.application, req.filteredQueryParams, req.contentForCalculatingTaskID, req.enableTaskIDBasedBlobDigest)
+	ctx, cancel := context.WithTimeout(ctx, req.timeout)
+	defer cancel()
+
+	// Generate task id for selecting seed peer. PreheatRequest has the same
+	// fields as GetRequest, so it converts directly.
+	id, err := generateTaskID((*GetRequest)(req))
 	if err != nil {
 		return fmt.Errorf("%w: failed to generate task id: %v", ErrInternal, err)
 	}
@@ -91,7 +90,7 @@ func (p *Proxy) Preheat(ctx context.Context, req *PreheatRequest) error {
 	for _, peer := range seedPeers {
 		// Trigger the seed peer to download the task and wait for the download
 		// task to finish, without streaming the file content back to the client.
-		if err := p.downloadTask(ctx, peer, id, download, req); err != nil {
+		if err := p.downloadTask(ctx, peer, id, download); err != nil {
 			lastErr = err
 			continue
 		}
@@ -107,7 +106,7 @@ func (p *Proxy) Preheat(ctx context.Context, req *PreheatRequest) error {
 }
 
 // downloadTask triggers the seed peer to download the task and drains the response stream.
-func (p *Proxy) downloadTask(ctx context.Context, peer *commonv2.Host, id string, download *commonv2.Download, req *PreheatRequest) error {
+func (p *Proxy) downloadTask(ctx context.Context, peer *commonv2.Host, id string, download *commonv2.Download) error {
 	addr := net.JoinHostPort(peer.Ip, strconv.Itoa(int(peer.Port)))
 	conn, err := grpc.NewClient(
 		addr,
@@ -121,9 +120,6 @@ func (p *Proxy) downloadTask(ctx context.Context, peer *commonv2.Host, id string
 		return fmt.Errorf("%w: failed to connect to seed peer %s: %v", ErrInternal, addr, err)
 	}
 	defer conn.Close()
-
-	ctx, cancel := context.WithTimeout(ctx, req.timeout)
-	defer cancel()
 
 	stream, err := dfdaemonv2.NewDfdaemonUploadClient(conn).DownloadTask(ctx, &dfdaemonv2.DownloadTaskRequest{Download: download})
 	if err != nil {
@@ -147,9 +143,9 @@ func (p *Proxy) downloadTask(ctx context.Context, peer *commonv2.Host, id string
 // indexes), and triggers the seed client to download each blob (config and
 // layers), without streaming the blob content back to the client.
 func (p *Proxy) PreheatImage(ctx context.Context, req *PreheatImageRequest) error {
-	ref, err := parseImage(req.image)
+	ref, err := oci.ParseImage(req.image)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %v", ErrInvalidArgument, err)
 	}
 
 	httpClient := &http.Client{
@@ -157,29 +153,17 @@ func (p *Proxy) PreheatImage(ctx context.Context, req *PreheatImageRequest) erro
 		Transport: http.DefaultTransport.(*http.Transport).Clone(),
 	}
 
-	client, err := oci.NewAuthClient(ref, httpClient, req.username, req.password)
+	// Resolve the image manifests (including multi-platform image indexes) and
+	// collect the blob urls along with the authorization token.
+	blobURLs, token, err := oci.Resolve(ctx, ref,
+		oci.WithAuth(req.username, req.password),
+		oci.WithPlatform(req.platform),
+		oci.WithHTTPClient(httpClient),
+	)
 	if err != nil {
-		return fmt.Errorf("%w: failed to authenticate with registry: %v", ErrInternal, err)
+		return fmt.Errorf("%w: %v", ErrInternal, err)
 	}
 
-	platform := platforms.DefaultSpec()
-	if req.platform != "" {
-		platform, err = platforms.Parse(req.platform)
-		if err != nil {
-			return fmt.Errorf("%w: invalid platform format %q, expected \"os/arch\" (e.g., \"linux/amd64\"): %v", ErrInvalidArgument, req.platform, err)
-		}
-	}
-
-	manifests, err := client.ResolveManifests(ctx, ref, make(http.Header), platform)
-	if err != nil {
-		return fmt.Errorf("%w: failed to pull image manifest: %v", ErrInternal, err)
-	}
-
-	if len(manifests) == 0 {
-		return fmt.Errorf("%w: no matching manifest for platform %s", ErrInternal, platforms.Format(platform))
-	}
-
-	token := client.AuthToken()
 	if token == "" {
 		return fmt.Errorf("%w: registry did not return authentication token", ErrInternal)
 	}
@@ -188,60 +172,38 @@ func (p *Proxy) PreheatImage(ctx context.Context, req *PreheatImageRequest) erro
 	header := make(http.Header)
 	header.Set("Authorization", token)
 
-	for _, manifest := range manifests {
-		for _, desc := range manifest.References() {
-			preheatReq := &PreheatRequest{
-				url:                         ref.BlobURL(desc.Digest.String()),
-				header:                      header.Clone(),
-				pieceLength:                 req.pieceLength,
-				tag:                         req.tag,
-				application:                 req.application,
-				filteredQueryParams:         req.filteredQueryParams,
-				contentForCalculatingTaskID: req.contentForCalculatingTaskID,
-				enableTaskIDBasedBlobDigest: req.enableTaskIDBasedBlobDigest,
-				priority:                    req.priority,
-				timeout:                     req.timeout,
-				clientCert:                  req.clientCert,
-			}
+	for _, blobURL := range blobURLs {
+		preheatReq := &PreheatRequest{
+			url:                         blobURL,
+			header:                      header.Clone(),
+			pieceLength:                 req.pieceLength,
+			tag:                         req.tag,
+			application:                 req.application,
+			filteredQueryParams:         req.filteredQueryParams,
+			contentForCalculatingTaskID: req.contentForCalculatingTaskID,
+			enableTaskIDBasedBlobDigest: req.enableTaskIDBasedBlobDigest,
+			priority:                    req.priority,
+			timeout:                     req.timeout,
+			certificates:                req.certificates,
+		}
 
-			if err := p.Preheat(ctx, preheatReq); err != nil {
-				return err
-			}
+		if err := p.Preheat(ctx, preheatReq); err != nil {
+			return err
 		}
 	}
 
 	return nil
 }
 
-// parseImage parses an image reference (e.g., "docker.io/library/nginx:latest")
-// into a registry reference. The reference is normalized with docker
-// conventions, so "nginx:latest" resolves to "docker.io/library/nginx:latest".
-func parseImage(image string) (*oci.Reference, error) {
-	named, err := reference.ParseNormalizedNamed(image)
-	if err != nil {
-		return nil, fmt.Errorf("%w: invalid image reference: %v", ErrInvalidArgument, err)
-	}
-	named = reference.TagNameOnly(named)
-
-	var tag string
-	switch ref := named.(type) {
-	case reference.Digested:
-		tag = ref.Digest().String()
-	case reference.Tagged:
-		tag = ref.Tag()
-	default:
-		return nil, fmt.Errorf("%w: invalid image reference: %s", ErrInvalidArgument, image)
+// headerToMap converts an http.Header to a map, the last value wins for
+// duplicate keys.
+func headerToMap(header http.Header) map[string]string {
+	m := make(map[string]string, len(header))
+	for k, v := range header {
+		if len(v) > 0 {
+			m[k] = v[len(v)-1]
+		}
 	}
 
-	registry := reference.Domain(named)
-	if registry == "docker.io" {
-		registry = dockerRegistryHost
-	}
-
-	return &oci.Reference{
-		Scheme:     "https",
-		Registry:   registry,
-		Repository: reference.Path(named),
-		Reference:  tag,
-	}, nil
+	return m
 }

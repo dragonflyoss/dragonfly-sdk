@@ -19,6 +19,7 @@ package request
 import (
 	"errors"
 	"fmt"
+	"net/http"
 )
 
 var (
@@ -38,7 +39,7 @@ type BackendError struct {
 	Message string
 
 	// Header is the backend HTTP response header.
-	Header map[string]string
+	Header http.Header
 
 	// StatusCode is the backend HTTP status code.
 	StatusCode int
@@ -55,7 +56,7 @@ type ProxyError struct {
 	Message string
 
 	// Header is the proxy HTTP response header.
-	Header map[string]string
+	Header http.Header
 
 	// StatusCode is the proxy HTTP status code.
 	StatusCode int

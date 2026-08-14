@@ -1,7 +1,7 @@
 d7y.io/api/v2 v2.2.32 h1:tGK/llLBoWdHVN8bwB1k7tXGw3FNUDv82XdhzAcXJWg=
 d7y.io/api/v2 v2.2.32/go.mod h1:8qiLrU0pd3yVZdjraORYLdVPD1was3AXp4dRyCo7N1Q=
-d7y.io/dragonfly/v2 v2.5.2-0.20260813134516-d7f4566591e5 h1:lhe5YRFGexqPfKeooA68oVJxnQ4LOaFMcGlyV4tVJHQ=
-d7y.io/dragonfly/v2 v2.5.2-0.20260813134516-d7f4566591e5/go.mod h1:4RTDwKJWw1XUcLZ0JCNo1SVoR45ARA5CoWWwGlBWyXY=
+d7y.io/dragonfly/v2 v2.5.2-0.20260814065647-890ca861b579 h1:w+V8zgQToeDKU63r+elipCx3fHR5vjET72TfisyeGd4=
+d7y.io/dragonfly/v2 v2.5.2-0.20260814065647-890ca861b579/go.mod h1:EMDbzqKyoweP8mjozB3X1wZkhvZd7wdqs3+WKFdv80Q=
 github.com/alecthomas/template v0.0.0-20160405071501-a0175ee3bccc/go.mod h1:LOuyumcjzFXgccqObfd/Ljyb9UuFJ6TxHnclSeseNhc=
 github.com/alecthomas/units v0.0.0-20151022065526-2efee857e7cf/go.mod h1:ybxpYRFXyAe+OPACYpWeL0wqObRcbAqCMya13uyzqw0=
 github.com/beorn7/perks v0.0.0-20180321164747-3a771d992973/go.mod h1:Dwedo/Wpr24TaqPxmxbtue+5NUziq4I4S80YR8gNf3Q=
