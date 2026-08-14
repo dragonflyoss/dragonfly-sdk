@@ -162,9 +162,7 @@ func TestPreheatNoAvailableSeedPeers(t *testing.T) {
 	assert.NoError(err)
 	defer proxy.Close()
 
-	req := NewPreheatRequest("http://example.com/payload.txt")
-	req.Tag = "preheat"
-	req.Application = "dfctl"
+	req := NewPreheatRequest("http://example.com/payload.txt", WithPreheatRequestTag("preheat"), WithPreheatRequestApplication("dfctl"))
 
 	err = proxy.Preheat(context.Background(), req)
 	assert.ErrorIs(err, ErrInternal)
@@ -180,9 +178,7 @@ func TestPreheatSucceedsWithSeedPeer(t *testing.T) {
 	assert.NoError(err)
 	defer proxy.Close()
 
-	req := NewPreheatRequest("http://example.com/payload.txt")
-	req.Tag = "preheat"
-	req.Application = "dfctl"
+	req := NewPreheatRequest("http://example.com/payload.txt", WithPreheatRequestTag("preheat"), WithPreheatRequestApplication("dfctl"))
 
 	assert.NoError(proxy.Preheat(context.Background(), req))
 }
@@ -196,9 +192,7 @@ func TestPreheatFailsWhenSeedPeerDownloadFails(t *testing.T) {
 	assert.NoError(err)
 	defer proxy.Close()
 
-	req := NewPreheatRequest("http://example.com/payload.txt")
-	req.Tag = "preheat"
-	req.Application = "dfctl"
+	req := NewPreheatRequest("http://example.com/payload.txt", WithPreheatRequestTag("preheat"), WithPreheatRequestApplication("dfctl"))
 
 	err = proxy.Preheat(context.Background(), req)
 	assert.ErrorContains(err, "failed to download task")
@@ -226,8 +220,7 @@ func TestPreheatImageInvalidPlatform(t *testing.T) {
 	defer proxy.Close()
 
 	// The platform must be in the format "os/arch" (e.g., "linux/amd64").
-	req := NewPreheatImageRequest("docker.io/library/nginx:latest")
-	req.Platform = "linux-amd64"
+	req := NewPreheatImageRequest("docker.io/library/nginx:latest", WithPreheatImageRequestPlatform("linux-amd64"))
 
 	err = proxy.PreheatImage(context.Background(), req)
 	assert.Error(err)
@@ -242,8 +235,7 @@ func TestPreheatImageUnreachableRegistry(t *testing.T) {
 	defer proxy.Close()
 
 	// Port 1 is reserved and refuses connections, so pulling the manifest fails.
-	req := NewPreheatImageRequest("127.0.0.1:1/library/nginx:latest")
-	req.Timeout = 5 * time.Second
+	req := NewPreheatImageRequest("127.0.0.1:1/library/nginx:latest", WithPreheatImageRequestTimeout(5*time.Second))
 
 	err = proxy.PreheatImage(context.Background(), req)
 	assert.Error(err)

@@ -258,7 +258,7 @@ func taskID(url string, pieceLength *uint64, tag, application string, filteredQu
 // clients returns pooled HTTP clients with proxy configuration for the
 // selected seed peers.
 func (p *Proxy) clients(req *GetRequest) ([]*http.Client, error) {
-	id, err := taskID(req.URL, req.PieceLength, req.Tag, req.Application, req.FilteredQueryParams, req.ContentForCalculatingTaskID, req.EnableTaskIDBasedBlobDigest)
+	id, err := taskID(req.url, req.pieceLength, req.tag, req.application, req.filteredQueryParams, req.contentForCalculatingTaskID, req.enableTaskIDBasedBlobDigest)
 	if err != nil {
 		return nil, fmt.Errorf("%w: failed to generate task id: %v", ErrInternal, err)
 	}
@@ -319,8 +319,8 @@ func (p *Proxy) send(ctx context.Context, client *http.Client, req *GetRequest) 
 	// The timeout covers the whole request including the body read, so the
 	// cancel function is returned to the caller and called when the body is
 	// closed.
-	tctx, cancel := context.WithTimeout(ctx, req.Timeout)
-	httpReq, err := http.NewRequestWithContext(tctx, http.MethodGet, req.URL, nil)
+	tctx, cancel := context.WithTimeout(ctx, req.timeout)
+	httpReq, err := http.NewRequestWithContext(tctx, http.MethodGet, req.url, nil)
 	if err != nil {
 		cancel()
 		return nil, nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
@@ -367,35 +367,35 @@ func (p *Proxy) send(ctx context.Context, client *http.Client, req *GetRequest) 
 
 // makeRequestHeaders applies p2p related headers to the request headers.
 func makeRequestHeaders(req *GetRequest) (http.Header, error) {
-	headers := req.Header.Clone()
+	headers := req.header.Clone()
 	if headers == nil {
 		headers = make(http.Header)
 	}
 
-	if req.PieceLength != nil {
-		headers.Set("X-Dragonfly-Piece-Length", strconv.FormatUint(*req.PieceLength, 10))
+	if req.pieceLength != nil {
+		headers.Set("X-Dragonfly-Piece-Length", strconv.FormatUint(*req.pieceLength, 10))
 	}
 
-	if req.Tag != "" {
-		headers.Set("X-Dragonfly-Tag", req.Tag)
+	if req.tag != "" {
+		headers.Set("X-Dragonfly-Tag", req.tag)
 	}
 
-	if req.Application != "" {
-		headers.Set("X-Dragonfly-Application", req.Application)
+	if req.application != "" {
+		headers.Set("X-Dragonfly-Application", req.application)
 	}
 
-	if req.ContentForCalculatingTaskID != "" {
-		headers.Set("X-Dragonfly-Content-For-Calculating-Task-ID", req.ContentForCalculatingTaskID)
+	if req.contentForCalculatingTaskID != "" {
+		headers.Set("X-Dragonfly-Content-For-Calculating-Task-ID", req.contentForCalculatingTaskID)
 	}
 
-	headers.Set("X-Dragonfly-Enable-Task-ID-Based-Blob-Digest", strconv.FormatBool(req.EnableTaskIDBasedBlobDigest))
+	headers.Set("X-Dragonfly-Enable-Task-ID-Based-Blob-Digest", strconv.FormatBool(req.enableTaskIDBasedBlobDigest))
 
-	if req.Priority != nil {
-		headers.Set("X-Dragonfly-Priority", strconv.FormatInt(int64(*req.Priority), 10))
+	if req.priority != nil {
+		headers.Set("X-Dragonfly-Priority", strconv.FormatInt(int64(*req.priority), 10))
 	}
 
-	if len(req.FilteredQueryParams) > 0 {
-		headers.Set("X-Dragonfly-Filtered-Query-Params", strings.Join(req.FilteredQueryParams, ","))
+	if len(req.filteredQueryParams) > 0 {
+		headers.Set("X-Dragonfly-Filtered-Query-Params", strings.Join(req.filteredQueryParams, ","))
 	}
 
 	headers.Set("X-Dragonfly-Use-P2P", "true")

@@ -43,6 +43,17 @@ func main() {
 }
 ```
 
+Optional request parameters are set with `With*` options:
+
+```go
+req := request.NewGetRequest(
+    "https://example.com/file.txt",
+    request.WithGetRequestTag("tag"),
+    request.WithGetRequestApplication("app"),
+    request.WithGetRequestTimeout(30*time.Second),
+)
+```
+
 Preheat a file or an OCI image to the seed peers:
 
 ```go

@@ -57,66 +57,128 @@ type Request interface {
 	PreheatImage(ctx context.Context, req *PreheatImageRequest) error
 }
 
-// GetRequest represents a GET request to be sent via the Dragonfly.
+// GetRequest represents a GET request to be sent via the Dragonfly. Construct
+// it with NewGetRequest and set the optional parameters with GetRequestOption.
 type GetRequest struct {
-	// URL is the url of the request.
-	URL string
+	// url is the url of the request.
+	url string
 
-	// Header is the headers of the request.
-	Header http.Header
+	// header is the headers of the request.
+	header http.Header
 
-	// PieceLength is the task piece length.
-	PieceLength *uint64
+	// pieceLength is the task piece length.
+	pieceLength *uint64
 
-	// Tag identifies different tasks for the same url.
-	Tag string
+	// tag identifies different tasks for the same url.
+	tag string
 
-	// Application identifies different tasks for the same url.
-	Application string
+	// application identifies different tasks for the same url.
+	application string
 
-	// FilteredQueryParams is the filtered query params to generate the task id.
-	// When the filter is ["Signature", "Expires", "ns"], for example:
-	// http://example.com/xyz?Expires=e1&Signature=s1&ns=docker.io and
-	// http://example.com/xyz?Expires=e2&Signature=s2&ns=docker.io
-	// will generate the same task id.
-	FilteredQueryParams []string
+	// filteredQueryParams is the filtered query params to generate the task id.
+	filteredQueryParams []string
 
-	// ContentForCalculatingTaskID is the content for calculating the task id.
-	// This is used when the task id cannot be calculated based on the url and
-	// other parameters, such as when the url contains dynamic query parameters
-	// that cannot be filtered out.
-	ContentForCalculatingTaskID string
+	// contentForCalculatingTaskID is the content for calculating the task id.
+	contentForCalculatingTaskID string
 
-	// EnableTaskIDBasedBlobDigest indicates whether to use the blob digest for
-	// task id calculation when downloading from OCI registries. When enabled
-	// for OCI blob urls (e.g., /v2/<name>/blobs/sha256:<digest>), the task id
-	// is derived from the blob digest rather than the full url. This enables
-	// deduplication across registries.
-	EnableTaskIDBasedBlobDigest bool
+	// enableTaskIDBasedBlobDigest indicates whether to use the blob digest for
+	// task id calculation when downloading from OCI registries.
+	enableTaskIDBasedBlobDigest bool
 
-	// Priority is the task priority, refer to
-	// https://github.com/dragonflyoss/api/blob/main/proto/common.proto#L67.
-	Priority *int32
+	// priority is the task priority.
+	priority *int32
 
-	// Timeout is the timeout of the request.
-	Timeout time.Duration
+	// timeout is the timeout of the request.
+	timeout time.Duration
 
-	// ClientCert is the client certificates for the request.
+	// clientCert is the client certificates for the request.
 	// TODO(chlins): Support client certificates.
-	ClientCert []*x509.Certificate
+	clientCert []*x509.Certificate
+}
+
+// GetRequestOption configures the GetRequest.
+type GetRequestOption func(r *GetRequest)
+
+// WithGetRequestHeader sets the headers of the request.
+func WithGetRequestHeader(header http.Header) GetRequestOption {
+	return func(r *GetRequest) { r.header = header }
+}
+
+// WithGetRequestPieceLength sets the task piece length.
+func WithGetRequestPieceLength(pieceLength uint64) GetRequestOption {
+	return func(r *GetRequest) { r.pieceLength = &pieceLength }
+}
+
+// WithGetRequestTag sets the tag that identifies different tasks for the same url.
+func WithGetRequestTag(tag string) GetRequestOption {
+	return func(r *GetRequest) { r.tag = tag }
+}
+
+// WithGetRequestApplication sets the application that identifies different tasks for
+// the same url.
+func WithGetRequestApplication(application string) GetRequestOption {
+	return func(r *GetRequest) { r.application = application }
+}
+
+// WithGetRequestFilteredQueryParams sets the filtered query params to generate the
+// task id. When the filter is ["Signature", "Expires", "ns"], for example:
+// http://example.com/xyz?Expires=e1&Signature=s1&ns=docker.io and
+// http://example.com/xyz?Expires=e2&Signature=s2&ns=docker.io
+// will generate the same task id.
+func WithGetRequestFilteredQueryParams(params []string) GetRequestOption {
+	return func(r *GetRequest) { r.filteredQueryParams = params }
+}
+
+// WithGetRequestContentForCalculatingTaskID sets the content for calculating the task
+// id. This is used when the task id cannot be calculated based on the url and
+// other parameters, such as when the url contains dynamic query parameters
+// that cannot be filtered out.
+func WithGetRequestContentForCalculatingTaskID(content string) GetRequestOption {
+	return func(r *GetRequest) { r.contentForCalculatingTaskID = content }
+}
+
+// WithGetRequestEnableTaskIDBasedBlobDigest sets whether to use the blob digest for
+// task id calculation when downloading from OCI registries. When enabled for
+// OCI blob urls (e.g., /v2/<name>/blobs/sha256:<digest>), the task id is
+// derived from the blob digest rather than the full url. This enables
+// deduplication across registries.
+func WithGetRequestEnableTaskIDBasedBlobDigest(enable bool) GetRequestOption {
+	return func(r *GetRequest) { r.enableTaskIDBasedBlobDigest = enable }
+}
+
+// WithGetRequestPriority sets the task priority, refer to
+// https://github.com/dragonflyoss/api/blob/main/proto/common.proto#L67.
+func WithGetRequestPriority(priority int32) GetRequestOption {
+	return func(r *GetRequest) { r.priority = &priority }
+}
+
+// WithGetRequestTimeout sets the timeout of the request.
+func WithGetRequestTimeout(timeout time.Duration) GetRequestOption {
+	return func(r *GetRequest) { r.timeout = timeout }
+}
+
+// WithGetRequestClientCert sets the client certificates for the request.
+// TODO(chlins): Support client certificates.
+func WithGetRequestClientCert(certs []*x509.Certificate) GetRequestOption {
+	return func(r *GetRequest) { r.clientCert = certs }
 }
 
 // NewGetRequest returns a GetRequest for the url with default values: the
 // default filtered query params, blob digest based task id enabled and a 300s
 // timeout.
-func NewGetRequest(url string) *GetRequest {
-	return &GetRequest{
-		URL:                         url,
-		Header:                      make(http.Header),
-		FilteredQueryParams:         idgen.DefaultFilteredQueryParams,
-		EnableTaskIDBasedBlobDigest: true,
-		Timeout:                     defaultRequestTimeout,
+func NewGetRequest(url string, opts ...GetRequestOption) *GetRequest {
+	r := &GetRequest{
+		url:                         url,
+		header:                      make(http.Header),
+		filteredQueryParams:         idgen.DefaultFilteredQueryParams,
+		enableTaskIDBasedBlobDigest: true,
+		timeout:                     defaultRequestTimeout,
 	}
+	for _, opt := range opts {
+		opt(r)
+	}
+
+	return r
 }
 
 // GetResponse represents a GET response received via the Dragonfly.
@@ -138,111 +200,250 @@ type GetResponse struct {
 // PreheatRequest represents a request to preheat a file through the Dragonfly
 // seed client. The preheat downloads the specified file via the Dragonfly
 // proxy, effectively caching it in the P2P network for faster downloading.
+// Construct it with NewPreheatRequest and set the optional parameters with
+// PreheatRequestOption.
 type PreheatRequest struct {
-	// URL is the url of the request.
-	URL string
+	// url is the url of the request.
+	url string
 
-	// Header is the headers of the request.
-	Header http.Header
+	// header is the headers of the request.
+	header http.Header
 
-	// PieceLength is the task piece length.
-	PieceLength *uint64
+	// pieceLength is the task piece length.
+	pieceLength *uint64
 
-	// Tag identifies different tasks for the same url.
-	Tag string
+	// tag identifies different tasks for the same url.
+	tag string
 
-	// Application identifies different tasks for the same url.
-	Application string
+	// application identifies different tasks for the same url.
+	application string
 
-	// FilteredQueryParams is the filtered query params to generate the task id.
-	FilteredQueryParams []string
+	// filteredQueryParams is the filtered query params to generate the task id.
+	filteredQueryParams []string
 
-	// ContentForCalculatingTaskID is the content for calculating the task id.
-	ContentForCalculatingTaskID string
+	// contentForCalculatingTaskID is the content for calculating the task id.
+	contentForCalculatingTaskID string
 
-	// EnableTaskIDBasedBlobDigest indicates whether to use the blob digest for
+	// enableTaskIDBasedBlobDigest indicates whether to use the blob digest for
 	// task id calculation when downloading from OCI registries.
-	EnableTaskIDBasedBlobDigest bool
+	enableTaskIDBasedBlobDigest bool
 
-	// Priority is the task priority.
-	Priority *int32
+	// priority is the task priority.
+	priority *int32
 
-	// Timeout is the timeout of the request.
-	Timeout time.Duration
+	// timeout is the timeout of the request.
+	timeout time.Duration
 
-	// ClientCert is the client certificates for the request.
+	// clientCert is the client certificates for the request.
 	// TODO(chlins): Support client certificates.
-	ClientCert []*x509.Certificate
+	clientCert []*x509.Certificate
+}
+
+// PreheatRequestOption configures the PreheatRequest.
+type PreheatRequestOption func(r *PreheatRequest)
+
+// WithPreheatRequestHeader sets the headers of the request.
+func WithPreheatRequestHeader(header http.Header) PreheatRequestOption {
+	return func(r *PreheatRequest) { r.header = header }
+}
+
+// WithPreheatRequestPieceLength sets the task piece length.
+func WithPreheatRequestPieceLength(pieceLength uint64) PreheatRequestOption {
+	return func(r *PreheatRequest) { r.pieceLength = &pieceLength }
+}
+
+// WithPreheatRequestTag sets the tag that identifies different tasks for the same
+// url.
+func WithPreheatRequestTag(tag string) PreheatRequestOption {
+	return func(r *PreheatRequest) { r.tag = tag }
+}
+
+// WithPreheatRequestApplication sets the application that identifies different tasks
+// for the same url.
+func WithPreheatRequestApplication(application string) PreheatRequestOption {
+	return func(r *PreheatRequest) { r.application = application }
+}
+
+// WithPreheatRequestFilteredQueryParams sets the filtered query params to generate
+// the task id.
+func WithPreheatRequestFilteredQueryParams(params []string) PreheatRequestOption {
+	return func(r *PreheatRequest) { r.filteredQueryParams = params }
+}
+
+// WithPreheatRequestContentForCalculatingTaskID sets the content for calculating the
+// task id.
+func WithPreheatRequestContentForCalculatingTaskID(content string) PreheatRequestOption {
+	return func(r *PreheatRequest) { r.contentForCalculatingTaskID = content }
+}
+
+// WithPreheatRequestEnableTaskIDBasedBlobDigest sets whether to use the blob digest
+// for task id calculation when downloading from OCI registries.
+func WithPreheatRequestEnableTaskIDBasedBlobDigest(enable bool) PreheatRequestOption {
+	return func(r *PreheatRequest) { r.enableTaskIDBasedBlobDigest = enable }
+}
+
+// WithPreheatRequestPriority sets the task priority.
+func WithPreheatRequestPriority(priority int32) PreheatRequestOption {
+	return func(r *PreheatRequest) { r.priority = &priority }
+}
+
+// WithPreheatRequestTimeout sets the timeout of the request.
+func WithPreheatRequestTimeout(timeout time.Duration) PreheatRequestOption {
+	return func(r *PreheatRequest) { r.timeout = timeout }
+}
+
+// WithPreheatRequestClientCert sets the client certificates for the request.
+// TODO(chlins): Support client certificates.
+func WithPreheatRequestClientCert(certs []*x509.Certificate) PreheatRequestOption {
+	return func(r *PreheatRequest) { r.clientCert = certs }
 }
 
 // NewPreheatRequest returns a PreheatRequest for the url with default values.
-func NewPreheatRequest(url string) *PreheatRequest {
-	return &PreheatRequest{
-		URL:                         url,
-		Header:                      make(http.Header),
-		FilteredQueryParams:         idgen.DefaultFilteredQueryParams,
-		EnableTaskIDBasedBlobDigest: true,
-		Timeout:                     defaultRequestTimeout,
+func NewPreheatRequest(url string, opts ...PreheatRequestOption) *PreheatRequest {
+	r := &PreheatRequest{
+		url:                         url,
+		header:                      make(http.Header),
+		filteredQueryParams:         idgen.DefaultFilteredQueryParams,
+		enableTaskIDBasedBlobDigest: true,
+		timeout:                     defaultRequestTimeout,
 	}
+	for _, opt := range opts {
+		opt(r)
+	}
+
+	return r
 }
 
 // PreheatImageRequest represents a request to preheat an OCI image through
 // the Dragonfly seed client. The preheat downloads all blobs (config and
-// layers) of the specified image via the Dragonfly proxy.
+// layers) of the specified image via the Dragonfly proxy. Construct it with
+// NewPreheatImageRequest and set the optional parameters with
+// PreheatImageRequestOption.
 type PreheatImageRequest struct {
-	// Image is the OCI image reference (e.g., "docker.io/library/nginx:latest").
-	Image string
+	// image is the OCI image reference (e.g., "docker.io/library/nginx:latest").
+	image string
 
-	// Username is the username for registry authentication. If not provided,
-	// anonymous access is used.
-	Username string
+	// username is the username for registry authentication.
+	username string
 
-	// Password is the password for registry authentication. If not provided,
-	// anonymous access is used.
-	Password string
+	// password is the password for registry authentication.
+	password string
 
-	// Platform specifies the target platform in the format "os/arch"
-	// (e.g., "linux/amd64", "linux/arm64"). This is used to select the correct
-	// manifest from a multi-platform image index, default is current platform.
-	Platform string
+	// platform specifies the target platform in the format "os/arch".
+	platform string
 
-	// PieceLength is the optional piece length for the Dragonfly task.
-	PieceLength *uint64
+	// pieceLength is the task piece length.
+	pieceLength *uint64
 
-	// Tag identifies different tasks for the same url.
-	Tag string
+	// tag identifies different tasks for the same url.
+	tag string
 
-	// Application identifies different tasks for the same url.
-	Application string
+	// application identifies different tasks for the same url.
+	application string
 
-	// FilteredQueryParams is the filtered query params to generate the task id.
-	FilteredQueryParams []string
+	// filteredQueryParams is the filtered query params to generate the task id.
+	filteredQueryParams []string
 
-	// ContentForCalculatingTaskID is the content for calculating the task id.
-	ContentForCalculatingTaskID string
+	// contentForCalculatingTaskID is the content for calculating the task id.
+	contentForCalculatingTaskID string
 
-	// EnableTaskIDBasedBlobDigest indicates whether to use the blob digest for
+	// enableTaskIDBasedBlobDigest indicates whether to use the blob digest for
 	// task id calculation when downloading from OCI registries.
-	EnableTaskIDBasedBlobDigest bool
+	enableTaskIDBasedBlobDigest bool
 
-	// Priority is the task priority.
-	Priority *int32
+	// priority is the task priority.
+	priority *int32
 
-	// Timeout is the timeout for each blob download request.
-	Timeout time.Duration
+	// timeout is the timeout for each blob download request.
+	timeout time.Duration
 
-	// ClientCert is the client certificates for the request.
+	// clientCert is the client certificates for the request.
 	// TODO(chlins): Support client certificates.
-	ClientCert []*x509.Certificate
+	clientCert []*x509.Certificate
+}
+
+// PreheatImageRequestOption configures the PreheatImageRequest.
+type PreheatImageRequestOption func(r *PreheatImageRequest)
+
+// WithPreheatImageRequestAuth sets the username and password for registry
+// authentication. If not provided, anonymous access is used.
+func WithPreheatImageRequestAuth(username, password string) PreheatImageRequestOption {
+	return func(r *PreheatImageRequest) {
+		r.username = username
+		r.password = password
+	}
+}
+
+// WithPreheatImageRequestPlatform sets the target platform in the format "os/arch"
+// (e.g., "linux/amd64", "linux/arm64"). This is used to select the correct
+// manifest from a multi-platform image index, default is current platform.
+func WithPreheatImageRequestPlatform(platform string) PreheatImageRequestOption {
+	return func(r *PreheatImageRequest) { r.platform = platform }
+}
+
+// WithPreheatImageRequestPieceLength sets the task piece length.
+func WithPreheatImageRequestPieceLength(pieceLength uint64) PreheatImageRequestOption {
+	return func(r *PreheatImageRequest) { r.pieceLength = &pieceLength }
+}
+
+// WithPreheatImageRequestTag sets the tag that identifies different tasks for the
+// same url.
+func WithPreheatImageRequestTag(tag string) PreheatImageRequestOption {
+	return func(r *PreheatImageRequest) { r.tag = tag }
+}
+
+// WithPreheatImageRequestApplication sets the application that identifies different
+// tasks for the same url.
+func WithPreheatImageRequestApplication(application string) PreheatImageRequestOption {
+	return func(r *PreheatImageRequest) { r.application = application }
+}
+
+// WithPreheatImageRequestFilteredQueryParams sets the filtered query params to
+// generate the task id.
+func WithPreheatImageRequestFilteredQueryParams(params []string) PreheatImageRequestOption {
+	return func(r *PreheatImageRequest) { r.filteredQueryParams = params }
+}
+
+// WithPreheatImageRequestContentForCalculatingTaskID sets the content for calculating
+// the task id.
+func WithPreheatImageRequestContentForCalculatingTaskID(content string) PreheatImageRequestOption {
+	return func(r *PreheatImageRequest) { r.contentForCalculatingTaskID = content }
+}
+
+// WithPreheatImageRequestEnableTaskIDBasedBlobDigest sets whether to use the blob
+// digest for task id calculation when downloading from OCI registries.
+func WithPreheatImageRequestEnableTaskIDBasedBlobDigest(enable bool) PreheatImageRequestOption {
+	return func(r *PreheatImageRequest) { r.enableTaskIDBasedBlobDigest = enable }
+}
+
+// WithPreheatImageRequestPriority sets the task priority.
+func WithPreheatImageRequestPriority(priority int32) PreheatImageRequestOption {
+	return func(r *PreheatImageRequest) { r.priority = &priority }
+}
+
+// WithPreheatImageRequestTimeout sets the timeout for each blob download request.
+func WithPreheatImageRequestTimeout(timeout time.Duration) PreheatImageRequestOption {
+	return func(r *PreheatImageRequest) { r.timeout = timeout }
+}
+
+// WithPreheatImageRequestClientCert sets the client certificates for the request.
+// TODO(chlins): Support client certificates.
+func WithPreheatImageRequestClientCert(certs []*x509.Certificate) PreheatImageRequestOption {
+	return func(r *PreheatImageRequest) { r.clientCert = certs }
 }
 
 // NewPreheatImageRequest returns a PreheatImageRequest for the image with
 // default values.
-func NewPreheatImageRequest(image string) *PreheatImageRequest {
-	return &PreheatImageRequest{
-		Image:                       image,
-		FilteredQueryParams:         idgen.DefaultFilteredQueryParams,
-		EnableTaskIDBasedBlobDigest: true,
-		Timeout:                     defaultRequestTimeout,
+func NewPreheatImageRequest(image string, opts ...PreheatImageRequestOption) *PreheatImageRequest {
+	r := &PreheatImageRequest{
+		image:                       image,
+		filteredQueryParams:         idgen.DefaultFilteredQueryParams,
+		enableTaskIDBasedBlobDigest: true,
+		timeout:                     defaultRequestTimeout,
 	}
+	for _, opt := range opts {
+		opt(r)
+	}
+
+	return r
 }

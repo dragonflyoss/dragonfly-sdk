@@ -45,7 +45,7 @@ const dockerRegistryHost = "registry-1.docker.io"
 // download task API, without streaming the file content back to the client.
 func (p *Proxy) Preheat(ctx context.Context, req *PreheatRequest) error {
 	// Generate task id for selecting seed peer.
-	id, err := taskID(req.URL, req.PieceLength, req.Tag, req.Application, req.FilteredQueryParams, req.ContentForCalculatingTaskID, req.EnableTaskIDBasedBlobDigest)
+	id, err := taskID(req.url, req.pieceLength, req.tag, req.application, req.filteredQueryParams, req.contentForCalculatingTaskID, req.enableTaskIDBasedBlobDigest)
 	if err != nil {
 		return fmt.Errorf("%w: failed to generate task id: %v", ErrInternal, err)
 	}
@@ -57,34 +57,34 @@ func (p *Proxy) Preheat(ctx context.Context, req *PreheatRequest) error {
 	}
 
 	priority := commonv2.Priority_LEVEL6
-	if req.Priority != nil {
-		priority = commonv2.Priority(*req.Priority)
+	if req.priority != nil {
+		priority = commonv2.Priority(*req.priority)
 	}
 
 	// Construct the download task request for preheating.
 	remoteIP := ip.IPv4.String()
 	download := &commonv2.Download{
-		Url:                         req.URL,
+		Url:                         req.url,
 		Type:                        commonv2.TaskType_STANDARD,
 		Priority:                    priority,
-		FilteredQueryParams:         req.FilteredQueryParams,
-		RequestHeader:               headerToMap(req.Header),
-		PieceLength:                 req.PieceLength,
-		Timeout:                     durationpb.New(req.Timeout),
+		FilteredQueryParams:         req.filteredQueryParams,
+		RequestHeader:               headerToMap(req.header),
+		PieceLength:                 req.pieceLength,
+		Timeout:                     durationpb.New(req.timeout),
 		RemoteIp:                    &remoteIP,
-		EnableTaskIdBasedBlobDigest: req.EnableTaskIDBasedBlobDigest,
+		EnableTaskIdBasedBlobDigest: req.enableTaskIDBasedBlobDigest,
 	}
 
-	if req.Tag != "" {
-		download.Tag = &req.Tag
+	if req.tag != "" {
+		download.Tag = &req.tag
 	}
 
-	if req.Application != "" {
-		download.Application = &req.Application
+	if req.application != "" {
+		download.Application = &req.application
 	}
 
-	if req.ContentForCalculatingTaskID != "" {
-		download.ContentForCalculatingTaskId = &req.ContentForCalculatingTaskID
+	if req.contentForCalculatingTaskID != "" {
+		download.ContentForCalculatingTaskId = &req.contentForCalculatingTaskID
 	}
 
 	var lastErr error
@@ -122,7 +122,7 @@ func (p *Proxy) downloadTask(ctx context.Context, peer *commonv2.Host, id string
 	}
 	defer conn.Close()
 
-	ctx, cancel := context.WithTimeout(ctx, req.Timeout)
+	ctx, cancel := context.WithTimeout(ctx, req.timeout)
 	defer cancel()
 
 	stream, err := dfdaemonv2.NewDfdaemonUploadClient(conn).DownloadTask(ctx, &dfdaemonv2.DownloadTaskRequest{Download: download})
@@ -147,26 +147,26 @@ func (p *Proxy) downloadTask(ctx context.Context, peer *commonv2.Host, id string
 // indexes), and triggers the seed client to download each blob (config and
 // layers), without streaming the blob content back to the client.
 func (p *Proxy) PreheatImage(ctx context.Context, req *PreheatImageRequest) error {
-	ref, err := parseImage(req.Image)
+	ref, err := parseImage(req.image)
 	if err != nil {
 		return err
 	}
 
 	httpClient := &http.Client{
-		Timeout:   req.Timeout,
+		Timeout:   req.timeout,
 		Transport: http.DefaultTransport.(*http.Transport).Clone(),
 	}
 
-	client, err := oci.NewAuthClient(ref, httpClient, req.Username, req.Password)
+	client, err := oci.NewAuthClient(ref, httpClient, req.username, req.password)
 	if err != nil {
 		return fmt.Errorf("%w: failed to authenticate with registry: %v", ErrInternal, err)
 	}
 
 	platform := platforms.DefaultSpec()
-	if req.Platform != "" {
-		platform, err = platforms.Parse(req.Platform)
+	if req.platform != "" {
+		platform, err = platforms.Parse(req.platform)
 		if err != nil {
-			return fmt.Errorf("%w: invalid platform format %q, expected \"os/arch\" (e.g., \"linux/amd64\"): %v", ErrInvalidArgument, req.Platform, err)
+			return fmt.Errorf("%w: invalid platform format %q, expected \"os/arch\" (e.g., \"linux/amd64\"): %v", ErrInvalidArgument, req.platform, err)
 		}
 	}
 
@@ -191,17 +191,17 @@ func (p *Proxy) PreheatImage(ctx context.Context, req *PreheatImageRequest) erro
 	for _, manifest := range manifests {
 		for _, desc := range manifest.References() {
 			preheatReq := &PreheatRequest{
-				URL:                         ref.BlobURL(desc.Digest.String()),
-				Header:                      header.Clone(),
-				PieceLength:                 req.PieceLength,
-				Tag:                         req.Tag,
-				Application:                 req.Application,
-				FilteredQueryParams:         req.FilteredQueryParams,
-				ContentForCalculatingTaskID: req.ContentForCalculatingTaskID,
-				EnableTaskIDBasedBlobDigest: req.EnableTaskIDBasedBlobDigest,
-				Priority:                    req.Priority,
-				Timeout:                     req.Timeout,
-				ClientCert:                  req.ClientCert,
+				url:                         ref.BlobURL(desc.Digest.String()),
+				header:                      header.Clone(),
+				pieceLength:                 req.pieceLength,
+				tag:                         req.tag,
+				application:                 req.application,
+				filteredQueryParams:         req.filteredQueryParams,
+				contentForCalculatingTaskID: req.contentForCalculatingTaskID,
+				enableTaskIDBasedBlobDigest: req.enableTaskIDBasedBlobDigest,
+				priority:                    req.priority,
+				timeout:                     req.timeout,
+				clientCert:                  req.clientCert,
 			}
 
 			if err := p.Preheat(ctx, preheatReq); err != nil {
