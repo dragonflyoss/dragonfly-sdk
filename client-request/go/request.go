@@ -55,6 +55,12 @@ type Request interface {
 	// Dragonfly. It resolves the image manifest (including multi-platform
 	// image indexes) and triggers the seed client to download each blob.
 	PreheatImage(ctx context.Context, req *PreheatImageRequest) error
+
+	// LookupEndpoints looks up the endpoints of the seed peers serving the
+	// request, in the consistent hash ring selection order for the request's
+	// task id. The number of endpoints is limited by the max retries, and the
+	// same seed peer may appear multiple times when it is selected for retries.
+	LookupEndpoints(ctx context.Context, req *GetRequest) ([]string, error)
 }
 
 // GetRequest represents a GET request to be sent via the Dragonfly. Construct

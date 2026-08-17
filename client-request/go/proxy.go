@@ -247,11 +247,12 @@ func (p *Proxy) GetInto(ctx context.Context, req *GetRequest, w io.Writer) (*Get
 	}, nil
 }
 
-// SeedPeerAddrs returns the seed peer addresses (e.g., "http://127.0.0.1:4000")
-// serving the request, ordered by the consistent hash ring selection for the
-// request's task id. The number of addresses is limited by the max retries of
-// the Proxy.
-func (p *Proxy) SeedPeerAddrs(req *GetRequest) ([]string, error) {
+// LookupEndpoints looks up the endpoints (e.g., "http://127.0.0.1:4000") of
+// the seed peers serving the request, in the consistent hash ring selection
+// order for the request's task id. The number of endpoints is limited by the
+// max retries of the Proxy, and the same seed peer may appear multiple times
+// when it is selected for retries.
+func (p *Proxy) LookupEndpoints(ctx context.Context, req *GetRequest) ([]string, error) {
 	taskID, err := generateTaskID(req)
 	if err != nil {
 		return nil, fmt.Errorf("%w: failed to generate task id: %v", ErrInternal, err)

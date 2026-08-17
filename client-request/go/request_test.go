@@ -111,14 +111,14 @@ func setupMockSeedPeer(t *testing.T, downloadErr error) int32 {
 
 // createSeedPeerHost creates a seed peer host pointing at the mock seed peer
 // server.
-func createSeedPeerHost(port int32) *commonv2.Host {
+func createSeedPeerHost(name string, port int32) *commonv2.Host {
 	return &commonv2.Host{
-		Id:       "seed-peer-1",
+		Id:       name,
 		Type:     1,
-		Hostname: "seed-peer-1",
+		Hostname: name,
 		Ip:       "127.0.0.1",
 		Port:     port,
-		Name:     "seed-peer-1",
+		Name:     name,
 	}
 }
 
@@ -172,7 +172,7 @@ func TestPreheatNoAvailableSeedPeers(t *testing.T) {
 func TestPreheatSucceedsWithSeedPeer(t *testing.T) {
 	assert := assert.New(t)
 	port := setupMockSeedPeer(t, nil)
-	endpoint := setupMockScheduler(t, []*commonv2.Host{createSeedPeerHost(port)})
+	endpoint := setupMockScheduler(t, []*commonv2.Host{createSeedPeerHost("seed-peer-1", port)})
 
 	proxy, err := New(context.Background(), endpoint)
 	assert.NoError(err)
@@ -186,7 +186,7 @@ func TestPreheatSucceedsWithSeedPeer(t *testing.T) {
 func TestPreheatFailsWhenSeedPeerDownloadFails(t *testing.T) {
 	assert := assert.New(t)
 	port := setupMockSeedPeer(t, status.Error(codes.Internal, "storage is full"))
-	endpoint := setupMockScheduler(t, []*commonv2.Host{createSeedPeerHost(port)})
+	endpoint := setupMockScheduler(t, []*commonv2.Host{createSeedPeerHost("seed-peer-1", port)})
 
 	proxy, err := New(context.Background(), endpoint)
 	assert.NoError(err)
@@ -241,9 +241,86 @@ func TestPreheatImageUnreachableRegistry(t *testing.T) {
 	assert.Error(err)
 }
 
+// TestLookupEndpointsVectors asserts the fixed endpoint selection vectors
+// shared with the Rust test suite (client-request/rust/src/lib.rs). Both sides
+// must produce the same outputs; do not change one without the other.
+func TestLookupEndpointsVectors(t *testing.T) {
+	assert := assert.New(t)
+
+	// Start a mock seed peer for each name and record its endpoint.
+	endpoints := make(map[string]string, 3)
+	var hosts []*commonv2.Host
+	for _, name := range []string{"seed-peer-1", "seed-peer-2", "seed-peer-3"} {
+		port := setupMockSeedPeer(t, nil)
+		endpoints[name] = fmt.Sprintf("http://127.0.0.1:%d", port)
+		hosts = append(hosts, createSeedPeerHost(name, port))
+	}
+	endpoint := setupMockScheduler(t, hosts)
+
+	proxy, err := New(context.Background(), endpoint, WithProxyMaxRetries(3))
+	assert.NoError(err)
+	defer proxy.Close()
+
+	tests := []struct {
+		req   *GetRequest
+		names []string
+	}{
+		{
+			req: NewGetRequest(
+				"https://example.com/file.txt?Expires=e1&Signature=s1&foo=bar",
+				WithGetRequestPieceLength(4194304),
+				WithGetRequestTag("tag1"),
+				WithGetRequestApplication("app1"),
+				WithGetRequestFilteredQueryParams([]string{"Expires", "Signature"}),
+			),
+			names: []string{"seed-peer-1", "seed-peer-3", "seed-peer-1", "seed-peer-2"},
+		},
+		{
+			req:   NewGetRequest("https://example.com/file.txt"),
+			names: []string{"seed-peer-1", "seed-peer-2", "seed-peer-2", "seed-peer-1"},
+		},
+		{
+			req: NewGetRequest(
+				"https://example.com/file.txt",
+				WithGetRequestContentForCalculatingTaskID("This is a test file"),
+			),
+			names: []string{"seed-peer-2", "seed-peer-3", "seed-peer-3", "seed-peer-1"},
+		},
+		{
+			req:   NewGetRequest("http://registry.example.com/v2/library/ubuntu/blobs/sha256:b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e"),
+			names: []string{"seed-peer-3", "seed-peer-2", "seed-peer-1", "seed-peer-2"},
+		},
+	}
+
+	for _, tt := range tests {
+		expected := make([]string, 0, len(tt.names))
+		for _, name := range tt.names {
+			expected = append(expected, endpoints[name])
+		}
+
+		addrs, err := proxy.LookupEndpoints(context.Background(), tt.req)
+		assert.NoError(err)
+		assert.Equal(expected, addrs)
+	}
+}
+
+func TestLookupEndpointsNoAvailableSeedPeers(t *testing.T) {
+	assert := assert.New(t)
+	endpoint := setupMockScheduler(t, nil)
+
+	proxy, err := New(context.Background(), endpoint)
+	assert.NoError(err)
+	defer proxy.Close()
+
+	_, err = proxy.LookupEndpoints(context.Background(), NewGetRequest("http://example.com/payload.txt"))
+	assert.ErrorIs(err, ErrInternal)
+	assert.ErrorContains(err, "failed to select seed peers")
+}
+
 // TestTaskIDVectors asserts the fixed task id vectors shared with the Rust
 // test suite (client-request/rust/tests/consistency.rs). Both sides must
-// produce the same outputs; do not change one without the other.func TestTaskIDVectors(t *testing.T) {
+// produce the same outputs; do not change one without the other.
+func TestTaskIDVectors(t *testing.T) {
 	assert := assert.New(t)
 
 	pieceLength := uint64(4194304)
