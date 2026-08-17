@@ -25,6 +25,18 @@ let response = proxy
     .await?;
 ```
 
+Look up the endpoints of the seed peers serving a request, in the consistent
+hash ring selection order:
+
+```rust
+let endpoints = proxy
+    .lookup_endpoints(&GetRequest {
+        url: "https://example.com/file.txt".to_string(),
+        ..Default::default()
+    })
+    .await?;
+```
+
 The `preheat` feature enables preheating OCI images by resolving manifests from
 the registry and triggering seed peers to download each blob:
 
@@ -32,6 +44,8 @@ the registry and triggering seed peers to download each blob:
 [dependencies]
 dragonfly-client-request = { version = "1.5.0", features = ["preheat"] }
 ```
+
+See [examples](./examples) for runnable examples.
 
 ## Documentation
 

@@ -66,6 +66,17 @@ if err := proxy.PreheatImage(ctx, request.NewPreheatImageRequest("docker.io/libr
 }
 ```
 
+Look up the endpoints of the seed peers serving a request, in the consistent
+hash ring selection order:
+
+```go
+endpoints, err := proxy.LookupEndpoints(ctx, request.NewGetRequest("https://example.com/file.txt"))
+if err != nil {
+    panic(err)
+}
+// endpoints: ["http://127.0.0.1:4000", ...]
+```
+
 See [examples](./examples) for runnable examples.
 
 ## Documentation

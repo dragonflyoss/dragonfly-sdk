@@ -241,10 +241,10 @@ func TestPreheatImageUnreachableRegistry(t *testing.T) {
 	assert.Error(err)
 }
 
-// TestLookupEndpointsVectors asserts the fixed endpoint selection vectors
+// TestLookupEndpoints asserts the fixed endpoint selection vectors
 // shared with the Rust test suite (client-request/rust/src/lib.rs). Both sides
 // must produce the same outputs; do not change one without the other.
-func TestLookupEndpointsVectors(t *testing.T) {
+func TestLookupEndpoints(t *testing.T) {
 	assert := assert.New(t)
 
 	// Start a mock seed peer for each name and record its endpoint.
