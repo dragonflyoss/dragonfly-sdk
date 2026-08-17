@@ -1,4 +1,4 @@
-version: "2"
+version: '2'
 
 run:
   modules-download-mode: readonly
@@ -22,6 +22,10 @@ linters:
       - common-false-positives
       - legacy
       - std-error-handling
+    rules:
+      - path: _test\.go
+        linters:
+          - goconst
     paths:
       - third_party$
       - builtin$

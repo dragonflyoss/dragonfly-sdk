@@ -243,8 +243,7 @@ func TestPreheatImageUnreachableRegistry(t *testing.T) {
 
 // TestTaskIDVectors asserts the fixed task id vectors shared with the Rust
 // test suite (client-request/rust/tests/consistency.rs). Both sides must
-// produce the same outputs; do not change one without the other.
-func TestTaskIDVectors(t *testing.T) {
+// produce the same outputs; do not change one without the other.func TestTaskIDVectors(t *testing.T) {
 	assert := assert.New(t)
 
 	pieceLength := uint64(4194304)

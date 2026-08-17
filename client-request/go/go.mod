@@ -3,12 +3,12 @@ module d7y.io/dragonfly-sdk/client-request/go
 go 1.25.6
 
 require (
-	d7y.io/api/v2 v2.2.32
+	d7y.io/api/v2 v2.3.0
 	d7y.io/dragonfly/v2 v2.5.2-0.20260817025753-bc9a1267534a
 	github.com/dchest/siphash v1.2.3
 	github.com/stretchr/testify v1.11.1
 	google.golang.org/grpc v1.83.0
-	google.golang.org/protobuf v1.36.11
+	google.golang.org/protobuf v1.36.12
 )
 
 require (
