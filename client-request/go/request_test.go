@@ -56,7 +56,7 @@ func setupMockScheduler(t *testing.T, hosts []*commonv2.Host) string {
 
 	server := grpc.NewServer()
 	schedulerv2.RegisterSchedulerServer(server, &mockScheduler{hosts: hosts})
-	go server.Serve(listener)
+	go func() { _ = server.Serve(listener) }()
 	t.Cleanup(server.Stop)
 
 	return fmt.Sprintf("http://%s", listener.Addr())
@@ -103,7 +103,7 @@ func setupMockSeedPeer(t *testing.T, downloadErr error) int32 {
 	healthServer.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
 	healthpb.RegisterHealthServer(server, healthServer)
 
-	go server.Serve(listener)
+	go func() { _ = server.Serve(listener) }()
 	t.Cleanup(server.Stop)
 
 	return int32(listener.Addr().(*net.TCPAddr).Port)
