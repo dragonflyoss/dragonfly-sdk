@@ -247,6 +247,30 @@ func (p *Proxy) GetInto(ctx context.Context, req *GetRequest, w io.Writer) (*Get
 	}, nil
 }
 
+// LookupEndpoints looks up the endpoints (e.g., "http://127.0.0.1:4000") of
+// the seed peers serving the request, in the consistent hash ring selection
+// order for the request's task id. The number of endpoints is limited by the
+// max retries of the Proxy, and the same seed peer may appear multiple times
+// when it is selected for retries.
+func (p *Proxy) LookupEndpoints(ctx context.Context, req *GetRequest) ([]string, error) {
+	taskID, err := generateTaskID(req)
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to generate task id: %v", ErrInternal, err)
+	}
+
+	seedPeers, err := p.seedPeerSelector.Select(taskID, uint32(p.maxRetries))
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to select seed peers from scheduler: %v", ErrInternal, err)
+	}
+
+	addrs := make([]string, 0, len(seedPeers))
+	for _, peer := range seedPeers {
+		addrs = append(addrs, fmt.Sprintf("http://%s", net.JoinHostPort(peer.Ip, strconv.Itoa(int(peer.Port)))))
+	}
+
+	return addrs, nil
+}
+
 // generateTaskID generates the task id for the request parameters, identical
 // to the Rust client's task id generation.
 func generateTaskID(req *GetRequest) (string, error) {

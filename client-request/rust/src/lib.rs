@@ -129,6 +129,15 @@ pub trait Request {
     /// the cluster. It triggers the selected seed peers to download the file by the dfdaemon
     /// download task API, without streaming the file content back to the client.
     async fn preheat(&self, request: &PreheatRequest) -> Result<()>;
+
+    /// Looks up the endpoints of the seed peers serving the request, in the consistent
+    /// hash ring selection order for the request's task id.
+    ///
+    /// This method is designed for scenarios where clients need to know which seed peers
+    /// would serve the request without sending it. The number of endpoints is limited by
+    /// the max retries of the proxy, and the same seed peer may appear multiple times
+    /// when it is selected for retries.
+    async fn lookup_endpoints(&self, request: &GetRequest) -> Result<Vec<String>>;
 }
 
 /// Represents a GET request to be sent via the Dragonfly.
@@ -839,6 +848,52 @@ impl Request for Proxy {
             "failed to download task from any seed peer".to_string(),
         ))
     }
+
+    /// Looks up the endpoints of the seed peers serving the request, in the consistent
+    /// hash ring selection order for the request's task id.
+    async fn lookup_endpoints(&self, request: &GetRequest) -> Result<Vec<String>> {
+        // Generate task id for selecting seed peer.
+        let task_id = self
+            .id_generator
+            .task_id(
+                if let Some(content) = request.content_for_calculating_task_id.clone() {
+                    TaskIDParameter::Content(content)
+                } else if request.enable_task_id_based_blob_digest && is_blob_url(&request.url) {
+                    TaskIDParameter::BlobDigestBased(request.url.clone())
+                } else {
+                    TaskIDParameter::URLBased {
+                        url: request.url.clone(),
+                        piece_length: request.piece_length,
+                        tag: request.tag.clone(),
+                        application: request.application.clone(),
+                        filtered_query_params: request.filtered_query_params.clone(),
+                        revision: None,
+                    }
+                },
+            )
+            .map_err(|err| Error::Internal(format!("failed to generate task id: {err}")))?;
+
+        // Select seed peers for downloading.
+        let seed_peers = self
+            .seed_peer_selector
+            .select(task_id.clone(), self.max_retries as u32)
+            .await
+            .map_err(|err| {
+                Error::Internal(format!("failed to select seed peers from scheduler: {err}"))
+            })?;
+        debug!("task {} selected seed peers: {:?}", task_id, seed_peers);
+
+        let mut addrs = Vec::with_capacity(seed_peers.len());
+        for peer in seed_peers.iter() {
+            addrs.push(format_url(
+                "http",
+                IpAddr::from_str(&peer.ip).map_err(|err| Error::Internal(err.to_string()))?,
+                peer.port as u16,
+            ));
+        }
+
+        Ok(addrs)
+    }
 }
 
 /// Implements proxy request logic.
@@ -1146,14 +1201,14 @@ mod tests {
     }
 
     // Creates a seed peer host pointing at the mock seed peer server.
-    fn create_seed_peer_host(port: u16) -> Host {
+    fn create_seed_peer_host(name: &str, port: u16) -> Host {
         Host {
-            id: "seed-peer-1".to_string(),
+            id: name.to_string(),
             r#type: 1,
-            hostname: "seed-peer-1".to_string(),
+            hostname: name.to_string(),
             ip: "127.0.0.1".to_string(),
             port: port as i32,
-            name: "seed-peer-1".to_string(),
+            name: name.to_string(),
             ..Default::default()
         }
     }
@@ -1258,10 +1313,12 @@ mod tests {
         });
 
         let mock_seed_peer = setup_mock_seed_peer(mocks).await.unwrap();
-        let mock_scheduler =
-            setup_mock_scheduler(vec![create_seed_peer_host(mock_seed_peer.port().unwrap())])
-                .await
-                .unwrap();
+        let mock_scheduler = setup_mock_scheduler(vec![create_seed_peer_host(
+            "seed-peer-1",
+            mock_seed_peer.port().unwrap(),
+        )])
+        .await
+        .unwrap();
 
         let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
         let proxy = Proxy::builder()
@@ -1281,6 +1338,99 @@ mod tests {
         assert!(result.is_ok(), "preheat should succeed: {:?}", result.err());
     }
 
+    // Asserts the fixed endpoint selection vectors shared with the Go test suite
+    // (client-request/go/request_test.go). Both sides must produce the same
+    // outputs; do not change one without the other.
+    #[tokio::test]
+    async fn test_lookup_endpoints() {
+        // Start a mock seed peer for each name and record its endpoint.
+        let mut servers = Vec::new();
+        let mut endpoints = std::collections::HashMap::new();
+        let mut hosts = Vec::new();
+        for name in ["seed-peer-1", "seed-peer-2", "seed-peer-3"] {
+            let server = setup_mock_seed_peer(MockSet::new()).await.unwrap();
+            let port = server.port().unwrap();
+            endpoints.insert(name, format!("http://127.0.0.1:{port}"));
+            hosts.push(create_seed_peer_host(name, port));
+            servers.push(server);
+        }
+
+        let mock_scheduler = setup_mock_scheduler(hosts).await.unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .max_retries(3)
+            .build()
+            .await
+            .unwrap();
+
+        let cases = [
+            (
+                GetRequest {
+                    url: "https://example.com/file.txt?Expires=e1&Signature=s1&foo=bar"
+                        .to_string(),
+                    piece_length: Some(4194304),
+                    tag: Some("tag1".to_string()),
+                    application: Some("app1".to_string()),
+                    filtered_query_params: vec!["Expires".to_string(), "Signature".to_string()],
+                    ..Default::default()
+                },
+                vec!["seed-peer-1", "seed-peer-3", "seed-peer-1", "seed-peer-2"],
+            ),
+            (
+                GetRequest {
+                    url: "https://example.com/file.txt".to_string(),
+                    ..Default::default()
+                },
+                vec!["seed-peer-1", "seed-peer-2", "seed-peer-2", "seed-peer-1"],
+            ),
+            (
+                GetRequest {
+                    url: "https://example.com/file.txt".to_string(),
+                    content_for_calculating_task_id: Some("This is a test file".to_string()),
+                    ..Default::default()
+                },
+                vec!["seed-peer-2", "seed-peer-3", "seed-peer-3", "seed-peer-1"],
+            ),
+            (
+                GetRequest {
+                    url: "http://registry.example.com/v2/library/ubuntu/blobs/sha256:b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e".to_string(),
+                    ..Default::default()
+                },
+                vec!["seed-peer-3", "seed-peer-2", "seed-peer-1", "seed-peer-2"],
+            ),
+        ];
+
+        for (request, expected_names) in cases {
+            let expected: Vec<String> = expected_names
+                .iter()
+                .map(|name| endpoints[name].clone())
+                .collect();
+            assert_eq!(proxy.lookup_endpoints(&request).await.unwrap(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_lookup_endpoints_no_available_seed_peers() {
+        let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let request = GetRequest {
+            url: "http://example.com/payload.txt".to_string(),
+            ..Default::default()
+        };
+
+        let result = proxy.lookup_endpoints(&request).await;
+        assert!(
+            matches!(result, Err(Error::Internal(message)) if message.contains("failed to select seed peers"))
+        );
+    }
+
     #[tokio::test]
     async fn test_preheat_fails_when_seed_peer_download_fails() {
         // The seed peer is healthy but fails to serve the download task request.
@@ -1291,10 +1441,12 @@ mod tests {
         });
 
         let mock_seed_peer = setup_mock_seed_peer(mocks).await.unwrap();
-        let mock_scheduler =
-            setup_mock_scheduler(vec![create_seed_peer_host(mock_seed_peer.port().unwrap())])
-                .await
-                .unwrap();
+        let mock_scheduler = setup_mock_scheduler(vec![create_seed_peer_host(
+            "seed-peer-1",
+            mock_seed_peer.port().unwrap(),
+        )])
+        .await
+        .unwrap();
 
         let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
         let proxy = Proxy::builder()
