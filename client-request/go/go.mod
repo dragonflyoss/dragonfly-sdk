@@ -4,7 +4,7 @@ go 1.25.6
 
 require (
 	d7y.io/api/v2 v2.2.32
-	d7y.io/dragonfly/v2 v2.5.2-0.20260814065647-890ca861b579
+	d7y.io/dragonfly/v2 v2.5.2-0.20260817025753-bc9a1267534a
 	github.com/dchest/siphash v1.2.3
 	github.com/stretchr/testify v1.11.1
 	google.golang.org/grpc v1.83.0

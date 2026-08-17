@@ -148,17 +148,12 @@ func (p *Proxy) PreheatImage(ctx context.Context, req *PreheatImageRequest) erro
 		return fmt.Errorf("%w: %v", ErrInvalidArgument, err)
 	}
 
-	httpClient := &http.Client{
-		Timeout:   req.timeout,
-		Transport: http.DefaultTransport.(*http.Transport).Clone(),
-	}
-
 	// Resolve the image manifests (including multi-platform image indexes) and
 	// collect the blob urls along with the authorization token.
 	blobURLs, token, err := oci.Resolve(ctx, ref,
 		oci.WithAuth(req.username, req.password),
 		oci.WithPlatform(req.platform),
-		oci.WithHTTPClient(httpClient),
+		oci.WithHTTPClient(oci.DefaultHTTPClient()),
 	)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrInternal, err)
@@ -171,7 +166,6 @@ func (p *Proxy) PreheatImage(ctx context.Context, req *PreheatImageRequest) erro
 	// Build authorization header for blob downloads through the Dragonfly.
 	header := make(http.Header)
 	header.Set("Authorization", token)
-
 	for _, blobURL := range blobURLs {
 		preheatReq := &PreheatRequest{
 			url:                         blobURL,

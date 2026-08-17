@@ -30,7 +30,10 @@ type Factory func(addr string) (*http.Client, error)
 
 // entry pairs a client with its last active time.
 type entry struct {
-	client    *http.Client
+	// client is the HTTP client instance.
+	client *http.Client
+
+	// activedAt is the last time the client was used.
 	activedAt time.Time
 }
 
@@ -46,8 +49,13 @@ type Pool struct {
 	// idleTimeout is the idle timeout for clients in the pool.
 	idleTimeout time.Duration
 
-	mu        sync.Mutex
-	clients   map[string]*entry
+	// mu protects access to the clients map.
+	mu sync.Mutex
+
+	// clients maps keys to client entries.
+	clients map[string]*entry
+
+	// cleanupAt is the last time the pool performed cleanup.
 	cleanupAt time.Time
 }
 

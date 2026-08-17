@@ -52,7 +52,10 @@ func (v VNode) String() string {
 
 // node pairs a vnode with its position on the ring.
 type node struct {
-	key   uint64
+	// key is the hash of the vnode, which determines its position on the ring.
+	key uint64
+
+	// vnode is the virtual node associated with this ring position.
 	vnode VNode
 }
 
