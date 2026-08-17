@@ -889,9 +889,9 @@ dependencies = [
 
 [[package]]
 name = "dragonfly-client-core"
-version = "1.4.9"
+version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "342568ee5af29792a8bf43dd5a959f9df6cc4ad37f52a03150389cfab7e10b7f"
+checksum = "69b9a76d14c5fb9f3d2cb8ab0d5d9049d43ab41d59b686b234f6c57ec7183871"
 dependencies = [
  "cgroups-rs",
  "http",
