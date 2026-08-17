@@ -19,6 +19,8 @@
 //! Usage: cargo run --example get -- <scheduler-endpoint> <url>
 
 use dragonfly_client_request::{GetRequest, Proxy, Request};
+use futures::TryStreamExt;
+use tokio::io::AsyncWriteExt;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -40,8 +42,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await?;
 
-    let mut reader = response.reader.ok_or("missing response body")?;
-    tokio::io::copy(&mut reader, &mut tokio::io::stdout()).await?;
+    // The body is a stream of zero-copy `Bytes` chunks.
+    let mut body = response.body.ok_or("missing response body")?;
+    let mut stdout = tokio::io::stdout();
+    while let Some(chunk) = body.try_next().await? {
+        stdout.write_all(&chunk).await?;
+    }
+    stdout.flush().await?;
 
     Ok(())
 }

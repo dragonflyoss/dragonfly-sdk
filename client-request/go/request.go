@@ -33,6 +33,9 @@ import (
 // defaultRequestTimeout is the default timeout for requests.
 const defaultRequestTimeout = 30 * 60 * time.Second
 
+// defaultConcurrentTaskCount is the default number of blobs to preheat concurrently.
+const defaultConcurrentTaskCount = 4
+
 // Request is the interface for sending requests via the Dragonfly.
 //
 // It enables interaction with remote servers through the Dragonfly, shielding
@@ -375,6 +378,9 @@ type PreheatImageRequest struct {
 	// timeout is the timeout for each blob download request.
 	timeout time.Duration
 
+	// concurrentTaskCount is the number of blobs to preheat concurrently.
+	concurrentTaskCount int
+
 	// certificates is the client certificates for the request.
 	// TODO(chlins): Support client certificates.
 	certificates []*x509.Certificate
@@ -444,6 +450,12 @@ func WithPreheatImageRequestTimeout(timeout time.Duration) PreheatImageRequestOp
 	return func(r *PreheatImageRequest) { r.timeout = timeout }
 }
 
+// WithPreheatImageRequestConcurrentTaskCount sets the number of blobs to
+// preheat concurrently, default is 4.
+func WithPreheatImageRequestConcurrentTaskCount(count int) PreheatImageRequestOption {
+	return func(r *PreheatImageRequest) { r.concurrentTaskCount = count }
+}
+
 // WithPreheatImageRequestCertificates sets the client certificates for the request.
 // TODO(chlins): Support client certificates.
 func WithPreheatImageRequestCertificates(certs []*x509.Certificate) PreheatImageRequestOption {
@@ -458,6 +470,7 @@ func NewPreheatImageRequest(image string, opts ...PreheatImageRequestOption) *Pr
 		filteredQueryParams:         idgen.DefaultFilteredQueryParams,
 		enableTaskIDBasedBlobDigest: true,
 		timeout:                     defaultRequestTimeout,
+		concurrentTaskCount:         defaultConcurrentTaskCount,
 	}
 	for _, opt := range opts {
 		opt(r)

@@ -15,7 +15,7 @@
  */
 
 use async_trait::async_trait;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use dragonfly_api::common::v2::{Download, Priority, TaskType};
 use dragonfly_api::dfdaemon::v2::{
     dfdaemon_upload_client::DfdaemonUploadClient as DfdaemonUploadGRPCClient, DownloadTaskRequest,
@@ -30,7 +30,7 @@ use dragonfly_client_util::net::format_url;
 use dragonfly_client_util::net::preferred_local_ip;
 use dragonfly_client_util::pool::{Builder as PoolBuilder, Entry, Factory, Pool};
 use errors::{BackendError, DfdaemonError, Error, ProxyError};
-use futures::TryStreamExt;
+use futures::{Stream, TryStreamExt};
 use reqwest::{
     header::{HeaderMap, HeaderValue},
     Client,
@@ -39,13 +39,10 @@ use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_tracing::TracingMiddleware;
 use rustls_pki_types::CertificateDer;
 use selector::{SeedPeerSelector, Selector};
-use std::io::Error as IOError;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncRead;
-use tokio_util::io::StreamReader;
 use tonic::transport::{Channel, Endpoint};
 use tracing::{debug, error};
 
@@ -58,6 +55,12 @@ use oci_client::{
 use oci_spec::image::{Arch, Os};
 #[cfg(feature = "preheat")]
 use reqwest::header::AUTHORIZATION;
+#[cfg(feature = "preheat")]
+use tokio::sync::Semaphore;
+#[cfg(feature = "preheat")]
+use tokio::task::JoinSet;
+#[cfg(feature = "preheat")]
+use tracing::Instrument;
 
 pub mod errors;
 mod selector;
@@ -81,8 +84,8 @@ const DEFAULT_SCHEDULER_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// A specialized Result type for the proxy module.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// The type alias for the response body reader.
-pub type Body = Box<dyn AsyncRead + Send + Unpin>;
+/// The type alias for the response body stream of zero-copy `Bytes` chunks.
+pub type Body = Box<dyn Stream<Item = Result<Bytes>> + Send + Unpin>;
 
 /// Defines the interface for sending requests via the Dragonfly.
 ///
@@ -225,10 +228,7 @@ impl Default for GetRequest {
 }
 
 /// Represents a GET response received via the Dragonfly.
-pub struct GetResponse<R = Body>
-where
-    R: AsyncRead + Unpin,
-{
+pub struct GetResponse<R = Body> {
     /// The success of the response.
     pub success: bool,
 
@@ -238,8 +238,8 @@ where
     /// The status code of the response.
     pub status_code: Option<reqwest::StatusCode>,
 
-    /// The content of the response.
-    pub reader: Option<R>,
+    /// The body of the response.
+    pub body: Option<R>,
 }
 
 /// Represents a request to preheat an OCI image through the
@@ -296,6 +296,9 @@ pub struct PreheatImageRequest {
     /// The timeout for each blob download request, default is 300s.
     pub timeout: Duration,
 
+    /// The number of blobs to preheat concurrently, default is 4.
+    pub concurrent_task_count: usize,
+
     /// The optional client certificates for the request.
     pub client_cert: Option<Vec<CertificateDer<'static>>>,
 }
@@ -319,6 +322,7 @@ impl Default for PreheatImageRequest {
             enable_task_id_based_blob_digest: true,
             priority: None,
             timeout: Duration::from_secs(300),
+            concurrent_task_count: 4,
             client_cert: None,
         }
     }
@@ -528,10 +532,12 @@ impl Builder {
         let proxy = Proxy {
             seed_peer_selector,
             max_retries: self.max_retries,
-            client_pool: PoolBuilder::new(HTTPClientFactory::default())
-                .capacity(DEFAULT_CLIENT_POOL_CAPACITY)
-                .idle_timeout(DEFAULT_CLIENT_POOL_IDLE_TIMEOUT)
-                .build(),
+            client_pool: Arc::new(
+                PoolBuilder::new(HTTPClientFactory::default())
+                    .capacity(DEFAULT_CLIENT_POOL_CAPACITY)
+                    .idle_timeout(DEFAULT_CLIENT_POOL_IDLE_TIMEOUT)
+                    .build(),
+            ),
             id_generator: Arc::new(id_generator),
         };
 
@@ -567,6 +573,7 @@ impl Builder {
 }
 
 /// The HTTP proxy client that sends requests via Dragonfly.
+#[derive(Clone)]
 pub struct Proxy {
     /// The selector service for selecting seed peers.
     seed_peer_selector: Arc<SeedPeerSelector>,
@@ -575,7 +582,7 @@ pub struct Proxy {
     max_retries: u8,
 
     /// The pool of clients.
-    client_pool: Pool<String, String, ClientWithMiddleware, HTTPClientFactory>,
+    client_pool: Arc<Pool<String, String, ClientWithMiddleware, HTTPClientFactory>>,
 
     /// The task id generator.
     id_generator: Arc<IDGenerator>,
@@ -604,21 +611,33 @@ impl Request for Proxy {
     ///
     /// This method is designed for scenarios where the response body is expected to be processed as a
     /// stream, allowing efficient handling of large or continuous data. The response includes metadata
-    /// such as status codes and headers, along with a streaming `Body` for accessing the response content.
+    /// such as status codes and headers, along with a streaming `Body` of zero-copy `Bytes` chunks
+    /// for accessing the response content.
     async fn get(&self, request: &GetRequest) -> Result<GetResponse> {
-        let response = self.try_send(request).await?;
-        let header = response.headers().clone();
-        let status_code = response.status();
-        let reader = Box::new(StreamReader::new(
-            response.bytes_stream().map_err(IOError::other),
-        ));
+        let get = async {
+            let response = self.try_send(request).await?;
+            let header = response.headers().clone();
+            let status_code = response.status();
+            let body: Body = Box::new(
+                response
+                    .bytes_stream()
+                    .map_err(|err| Error::Internal(err.to_string())),
+            );
 
-        Ok(GetResponse {
-            success: status_code.is_success(),
-            header,
-            status_code: Some(status_code),
-            reader: Some(reader),
-        })
+            Ok(GetResponse {
+                success: status_code.is_success(),
+                header,
+                status_code: Some(status_code),
+                body: Some(body),
+            })
+        };
+
+        // The timeout covers sending the request and receiving the response
+        // headers; reading the body stream is covered by the request timeout
+        // set in send.
+        tokio::time::timeout(request.timeout, get)
+            .await
+            .map_err(|err| Error::RequestTimeout(err.to_string()))?
     }
 
     /// Sends an GET request to a remote server via the Dragonfly and writes the response
@@ -630,23 +649,33 @@ impl Request for Proxy {
     /// and headers) is returned separately.
     async fn get_into(&self, request: &GetRequest, buf: &mut BytesMut) -> Result<GetResponse> {
         let get_into = async {
-            let response = self.try_send(request).await?;
+            let mut response = self.try_send(request).await?;
             let status = response.status();
             let header = response.headers().clone();
 
             if status.is_success() {
-                let bytes = response.bytes().await.map_err(|err| {
-                    Error::Internal(format!("failed to read response body: {err}"))
-                })?;
+                // Reserve the capacity upfront and copy each chunk into the buffer
+                // directly, without aggregating the whole body first.
+                if let Some(content_length) = response.content_length() {
+                    buf.reserve(content_length as usize);
+                }
 
-                buf.extend_from_slice(&bytes);
+                while let Some(chunk) = response.chunk().await.map_err(|err| {
+                    if err.is_timeout() {
+                        return Error::RequestTimeout(err.to_string());
+                    }
+
+                    Error::Internal(format!("failed to read response body: {err}"))
+                })? {
+                    buf.extend_from_slice(&chunk);
+                }
             }
 
             Ok(GetResponse {
                 success: status.is_success(),
                 header,
                 status_code: Some(status),
-                reader: None,
+                body: None,
             })
         };
 
@@ -660,21 +689,32 @@ impl Request for Proxy {
     /// Dragonfly (e.g., one returned by `lookup_endpoints`), instead of selecting a seed
     /// peer by the consistent hash ring, and returns a response with a streaming body.
     async fn get_with_endpoint(&self, endpoint: &str, request: &GetRequest) -> Result<GetResponse> {
-        let endpoint = endpoint.to_string();
-        let entry = self.client_pool.entry(&endpoint, &endpoint).await?;
-        let response = self.send(&entry, request).await?;
-        let header = response.headers().clone();
-        let status_code = response.status();
-        let reader = Box::new(StreamReader::new(
-            response.bytes_stream().map_err(IOError::other),
-        ));
+        let get = async {
+            let endpoint = endpoint.to_string();
+            let entry = self.client_pool.entry(&endpoint, &endpoint).await?;
+            let response = self.send(&entry, request).await?;
+            let header = response.headers().clone();
+            let status_code = response.status();
+            let body: Body = Box::new(
+                response
+                    .bytes_stream()
+                    .map_err(|err| Error::Internal(err.to_string())),
+            );
 
-        Ok(GetResponse {
-            success: status_code.is_success(),
-            header,
-            status_code: Some(status_code),
-            reader: Some(reader),
-        })
+            Ok(GetResponse {
+                success: status_code.is_success(),
+                header,
+                status_code: Some(status_code),
+                body: Some(body),
+            })
+        };
+
+        // The timeout covers sending the request and receiving the response
+        // headers; reading the body stream is covered by the request timeout
+        // set in send.
+        tokio::time::timeout(request.timeout, get)
+            .await
+            .map_err(|err| Error::RequestTimeout(err.to_string()))?
     }
 
     /// Sends an GET request to a remote server via the given seed peer endpoint of the
@@ -688,23 +728,33 @@ impl Request for Proxy {
         let get_into = async {
             let endpoint = endpoint.to_string();
             let entry = self.client_pool.entry(&endpoint, &endpoint).await?;
-            let response = self.send(&entry, request).await?;
+            let mut response = self.send(&entry, request).await?;
             let status = response.status();
             let header = response.headers().clone();
 
             if status.is_success() {
-                let bytes = response.bytes().await.map_err(|err| {
-                    Error::Internal(format!("failed to read response body: {err}"))
-                })?;
+                // Reserve the capacity upfront and copy each chunk into the buffer
+                // directly, without aggregating the whole body first.
+                if let Some(content_length) = response.content_length() {
+                    buf.reserve(content_length as usize);
+                }
 
-                buf.extend_from_slice(&bytes);
+                while let Some(chunk) = response.chunk().await.map_err(|err| {
+                    if err.is_timeout() {
+                        return Error::RequestTimeout(err.to_string());
+                    }
+
+                    Error::Internal(format!("failed to read response body: {err}"))
+                })? {
+                    buf.extend_from_slice(&chunk);
+                }
             }
 
             Ok(GetResponse {
                 success: status.is_success(),
                 header,
                 status_code: Some(status),
-                reader: None,
+                body: None,
             })
         };
 
@@ -724,6 +774,12 @@ impl Request for Proxy {
     /// back to the client.
     #[cfg(feature = "preheat")]
     async fn preheat_image(&self, request: &PreheatImageRequest) -> Result<()> {
+        if request.concurrent_task_count == 0 {
+            return Err(Error::InvalidArgument(
+                "concurrent task count must be positive".to_string(),
+            ));
+        }
+
         let oci_client = Self::oci_client(request.platform.clone())?;
 
         // Parse image reference.
@@ -772,12 +828,17 @@ impl Request for Proxy {
 
         let registry = reference.resolve_registry();
         let repository = reference.repository();
+
+        // Preheat the blobs concurrently, limited by the concurrent task count.
+        let semaphore = Arc::new(Semaphore::new(request.concurrent_task_count));
+        let mut join_set: JoinSet<Result<()>> = JoinSet::new();
         for digest in std::iter::once(&manifest.config.digest)
             .chain(manifest.layers.iter().map(|layer| &layer.digest))
         {
-            let url = Self::build_blob_url(registry, repository, digest);
-            let request = PreheatRequest {
-                url: url.clone(),
+            let semaphore = semaphore.clone();
+            let proxy = self.clone();
+            let preheat_request = PreheatRequest {
+                url: Self::build_blob_url(registry, repository, digest),
                 header: header.clone(),
                 piece_length: request.piece_length,
                 tag: request.tag.clone(),
@@ -790,8 +851,24 @@ impl Request for Proxy {
                 client_cert: request.client_cert.clone(),
             };
 
-            self.preheat(&request).await?;
-            debug!("preheated blob: {}", url);
+            join_set.spawn(
+                async move {
+                    let _permit = semaphore
+                        .acquire()
+                        .await
+                        .map_err(|err| Error::Internal(err.to_string()))?;
+
+                    proxy.preheat(&preheat_request).await?;
+                    debug!("preheated blob: {}", preheat_request.url);
+                    Ok(())
+                }
+                .in_current_span(),
+            );
+        }
+
+        // Wait for the preheats to finish.
+        while let Some(result) = join_set.join_next().await {
+            result.map_err(|err| Error::Internal(err.to_string()))??;
         }
 
         debug!("preheat completed for image: {}", request.image);
@@ -1072,7 +1149,12 @@ impl Proxy {
             .timeout(request.timeout)
             .send()
             .await
-            .map_err(|err| Error::Internal(err.to_string()))?;
+            .map_err(|err| match err {
+                reqwest_middleware::Error::Reqwest(err) if err.is_timeout() => {
+                    Error::RequestTimeout(err.to_string())
+                }
+                err => Error::Internal(err.to_string()),
+            })?;
 
         let status = response.status();
         if status.is_success() {

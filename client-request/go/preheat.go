@@ -30,6 +30,7 @@ import (
 	dfdaemonv2 "d7y.io/api/v2/pkg/apis/dfdaemon/v2"
 	"d7y.io/dragonfly/v2/pkg/net/ip"
 	"d7y.io/dragonfly/v2/pkg/oci"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -143,6 +144,10 @@ func (p *Proxy) downloadTask(ctx context.Context, peer *commonv2.Host, id string
 // indexes), and triggers the seed client to download each blob (config and
 // layers), without streaming the blob content back to the client.
 func (p *Proxy) PreheatImage(ctx context.Context, req *PreheatImageRequest) error {
+	if req.concurrentTaskCount <= 0 {
+		return fmt.Errorf("%w: concurrent task count must be positive", ErrInvalidArgument)
+	}
+
 	ref, err := oci.ParseImage(req.image)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidArgument, err)
@@ -166,27 +171,31 @@ func (p *Proxy) PreheatImage(ctx context.Context, req *PreheatImageRequest) erro
 	// Build authorization header for blob downloads through the Dragonfly.
 	header := make(http.Header)
 	header.Set("Authorization", token)
-	for _, blobURL := range blobURLs {
-		preheatReq := &PreheatRequest{
-			url:                         blobURL,
-			header:                      header.Clone(),
-			pieceLength:                 req.pieceLength,
-			tag:                         req.tag,
-			application:                 req.application,
-			filteredQueryParams:         req.filteredQueryParams,
-			contentForCalculatingTaskID: req.contentForCalculatingTaskID,
-			enableTaskIDBasedBlobDigest: req.enableTaskIDBasedBlobDigest,
-			priority:                    req.priority,
-			timeout:                     req.timeout,
-			certificates:                req.certificates,
-		}
 
-		if err := p.Preheat(ctx, preheatReq); err != nil {
-			return err
-		}
+	// Preheat the blobs concurrently, limited by the concurrent task count.
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(req.concurrentTaskCount)
+	for _, blobURL := range blobURLs {
+		g.Go(func() error {
+			preheatReq := &PreheatRequest{
+				url:                         blobURL,
+				header:                      header.Clone(),
+				pieceLength:                 req.pieceLength,
+				tag:                         req.tag,
+				application:                 req.application,
+				filteredQueryParams:         req.filteredQueryParams,
+				contentForCalculatingTaskID: req.contentForCalculatingTaskID,
+				enableTaskIDBasedBlobDigest: req.enableTaskIDBasedBlobDigest,
+				priority:                    req.priority,
+				timeout:                     req.timeout,
+				certificates:                req.certificates,
+			}
+
+			return p.Preheat(ctx, preheatReq)
+		})
 	}
 
-	return nil
+	return g.Wait()
 }
 
 // headerToMap converts an http.Header to a map, the last value wins for
