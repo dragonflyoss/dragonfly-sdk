@@ -208,12 +208,7 @@ func (p *Proxy) Get(ctx context.Context, req *GetRequest) (*GetResponse, error) 
 		return nil, err
 	}
 
-	return &GetResponse{
-		Success:    true,
-		Header:     resp.Header.Clone(),
-		StatusCode: resp.StatusCode,
-		Body:       &cancelReadCloser{body: resp.Body, cancel: cancel},
-	}, nil
+	return streamResponse(resp, cancel), nil
 }
 
 // GetInto sends a GET request to a remote server via the Dragonfly and writes
@@ -230,6 +225,70 @@ func (p *Proxy) GetInto(ctx context.Context, req *GetRequest, w io.Writer) (*Get
 
 		return nil, err
 	}
+
+	return copyResponse(resp, w)
+}
+
+// GetWithEndpoint sends a GET request to a remote server via the given seed
+// peer endpoint of the Dragonfly (e.g., one returned by LookupEndpoints),
+// instead of selecting a seed peer by the consistent hash ring. It returns a
+// response with a streaming body and the caller must close the body.
+func (p *Proxy) GetWithEndpoint(ctx context.Context, endpoint string, req *GetRequest) (*GetResponse, error) {
+	// The timeout covers the whole request including the body read, so the
+	// cancel function is called when the body is closed.
+	ctx, cancel := context.WithTimeout(ctx, req.timeout)
+	resp, err := p.sendWithEndpoint(ctx, endpoint, req)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+
+	return streamResponse(resp, cancel), nil
+}
+
+// GetIntoWithEndpoint sends a GET request to a remote server via the given
+// seed peer endpoint of the Dragonfly and writes the response body directly
+// into the provided writer.
+func (p *Proxy) GetIntoWithEndpoint(ctx context.Context, endpoint string, req *GetRequest, w io.Writer) (*GetResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, req.timeout)
+	defer cancel()
+
+	resp, err := p.sendWithEndpoint(ctx, endpoint, req)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, fmt.Errorf("%w: %v", ErrRequestTimeout, err)
+		}
+
+		return nil, err
+	}
+
+	return copyResponse(resp, w)
+}
+
+// sendWithEndpoint sends the request to the given seed peer endpoint directly.
+func (p *Proxy) sendWithEndpoint(ctx context.Context, endpoint string, req *GetRequest) (*http.Response, error) {
+	client, err := p.clientPool.Entry(endpoint, endpoint)
+	if err != nil {
+		return nil, err
+	}
+
+	return p.send(ctx, client, req)
+}
+
+// streamResponse builds the response with a streaming body that releases the
+// request timeout when the body is closed.
+func streamResponse(resp *http.Response, cancel context.CancelFunc) *GetResponse {
+	return &GetResponse{
+		Success:    true,
+		Header:     resp.Header.Clone(),
+		StatusCode: resp.StatusCode,
+		Body:       &cancelReadCloser{body: resp.Body, cancel: cancel},
+	}
+}
+
+// copyResponse drains the response body into the writer and builds the
+// response.
+func copyResponse(resp *http.Response, w io.Writer) (*GetResponse, error) {
 	defer resp.Body.Close()
 
 	if _, err := io.Copy(w, resp.Body); err != nil {

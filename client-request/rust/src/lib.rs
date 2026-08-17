@@ -111,6 +111,24 @@ pub trait Request {
     /// and headers) is returned separately.
     async fn get_into(&self, request: &GetRequest, buf: &mut BytesMut) -> Result<GetResponse>;
 
+    /// Sends an GET request to a remote server via the given seed peer endpoint of the
+    /// Dragonfly (e.g., one returned by `lookup_endpoints`), instead of selecting a seed
+    /// peer by the consistent hash ring, and returns a response with a streaming body.
+    async fn get_with_endpoint(
+        &self,
+        endpoint: &str,
+        request: &GetRequest,
+    ) -> Result<GetResponse<Body>>;
+
+    /// Sends an GET request to a remote server via the given seed peer endpoint of the
+    /// Dragonfly and writes the response body directly into the provided buffer.
+    async fn get_into_with_endpoint(
+        &self,
+        endpoint: &str,
+        request: &GetRequest,
+        buf: &mut BytesMut,
+    ) -> Result<GetResponse>;
+
     /// Preheats an OCI image by downloading all its blobs via the Dragonfly.
     ///
     /// This method is designed for scenarios where OCI image content needs to be pre-cached in
@@ -613,6 +631,64 @@ impl Request for Proxy {
     async fn get_into(&self, request: &GetRequest, buf: &mut BytesMut) -> Result<GetResponse> {
         let get_into = async {
             let response = self.try_send(request).await?;
+            let status = response.status();
+            let header = response.headers().clone();
+
+            if status.is_success() {
+                let bytes = response.bytes().await.map_err(|err| {
+                    Error::Internal(format!("failed to read response body: {err}"))
+                })?;
+
+                buf.extend_from_slice(&bytes);
+            }
+
+            Ok(GetResponse {
+                success: status.is_success(),
+                header,
+                status_code: Some(status),
+                reader: None,
+            })
+        };
+
+        // Apply timeout which will properly cancel the operation when timeout is reached.
+        tokio::time::timeout(request.timeout, get_into)
+            .await
+            .map_err(|err| Error::RequestTimeout(err.to_string()))?
+    }
+
+    /// Sends an GET request to a remote server via the given seed peer endpoint of the
+    /// Dragonfly (e.g., one returned by `lookup_endpoints`), instead of selecting a seed
+    /// peer by the consistent hash ring, and returns a response with a streaming body.
+    async fn get_with_endpoint(&self, endpoint: &str, request: &GetRequest) -> Result<GetResponse> {
+        let endpoint = endpoint.to_string();
+        let entry = self.client_pool.entry(&endpoint, &endpoint).await?;
+        let response = self.send(&entry, request).await?;
+        let header = response.headers().clone();
+        let status_code = response.status();
+        let reader = Box::new(StreamReader::new(
+            response.bytes_stream().map_err(IOError::other),
+        ));
+
+        Ok(GetResponse {
+            success: status_code.is_success(),
+            header,
+            status_code: Some(status_code),
+            reader: Some(reader),
+        })
+    }
+
+    /// Sends an GET request to a remote server via the given seed peer endpoint of the
+    /// Dragonfly and writes the response body directly into the provided buffer.
+    async fn get_into_with_endpoint(
+        &self,
+        endpoint: &str,
+        request: &GetRequest,
+        buf: &mut BytesMut,
+    ) -> Result<GetResponse> {
+        let get_into = async {
+            let endpoint = endpoint.to_string();
+            let entry = self.client_pool.entry(&endpoint, &endpoint).await?;
+            let response = self.send(&entry, request).await?;
             let status = response.status();
             let header = response.headers().clone();
 

@@ -25,16 +25,20 @@ let response = proxy
     .await?;
 ```
 
-Look up the endpoints of the seed peers serving a request, in the consistent
-hash ring selection order:
+Look up the endpoints of the seed peers serving a request, then download
+directly from a specific endpoint, skipping the hash ring selection:
 
 ```rust
-let endpoints = proxy
-    .lookup_endpoints(&GetRequest {
-        url: "https://example.com/file.txt".to_string(),
-        ..Default::default()
-    })
-    .await?;
+let request = GetRequest {
+    url: "https://example.com/file.txt".to_string(),
+    ..Default::default()
+};
+
+let endpoints = proxy.lookup_endpoints(&request).await?;
+let response = proxy.get_with_endpoint(&endpoints[0], &request).await?;
+
+// Or write the response body directly into a buffer:
+// let response = proxy.get_into_with_endpoint(&endpoints[0], &request, &mut buf).await?;
 ```
 
 The `preheat` feature enables preheating OCI images by resolving manifests from

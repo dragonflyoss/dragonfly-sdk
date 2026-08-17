@@ -47,6 +47,18 @@ type Request interface {
 	// writes the response body directly into the provided writer.
 	GetInto(ctx context.Context, req *GetRequest, w io.Writer) (*GetResponse, error)
 
+	// GetWithEndpoint sends a GET request to a remote server via the given
+	// seed peer endpoint of the Dragonfly (e.g., one returned by
+	// LookupEndpoints), instead of selecting a seed peer by the consistent
+	// hash ring. It returns a response with a streaming body and the caller
+	// must close the body.
+	GetWithEndpoint(ctx context.Context, endpoint string, req *GetRequest) (*GetResponse, error)
+
+	// GetIntoWithEndpoint sends a GET request to a remote server via the
+	// given seed peer endpoint of the Dragonfly and writes the response body
+	// directly into the provided writer.
+	GetIntoWithEndpoint(ctx context.Context, endpoint string, req *GetRequest, w io.Writer) (*GetResponse, error)
+
 	// Preheat preheats a file by downloading it to the seed peers via the
 	// Dragonfly, without streaming the file content back to the client.
 	Preheat(ctx context.Context, req *PreheatRequest) error

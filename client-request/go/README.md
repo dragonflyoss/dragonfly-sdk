@@ -66,15 +66,24 @@ if err := proxy.PreheatImage(ctx, request.NewPreheatImageRequest("docker.io/libr
 }
 ```
 
-Look up the endpoints of the seed peers serving a request, in the consistent
-hash ring selection order:
+Look up the endpoints of the seed peers serving a request, then download
+directly from a specific endpoint, skipping the hash ring selection:
 
 ```go
-endpoints, err := proxy.LookupEndpoints(ctx, request.NewGetRequest("https://example.com/file.txt"))
+req := request.NewGetRequest("https://example.com/file.txt")
+endpoints, err := proxy.LookupEndpoints(ctx, req)
 if err != nil {
     panic(err)
 }
-// endpoints: ["http://127.0.0.1:4000", ...]
+
+resp, err := proxy.GetWithEndpoint(ctx, endpoints[0], req)
+if err != nil {
+    panic(err)
+}
+defer resp.Body.Close()
+
+// Or write the response body directly into a writer:
+// resp, err := proxy.GetIntoWithEndpoint(ctx, endpoints[0], req, w)
 ```
 
 See [examples](./examples) for runnable examples.
