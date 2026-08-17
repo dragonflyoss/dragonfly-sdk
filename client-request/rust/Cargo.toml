@@ -50,4 +50,4 @@ thiserror = "2.0"
 [dev-dependencies]
 # TODO(Gaius): Remove the git dependency after the next release of mocktail, refer to https://github.com/IBM/mocktail/issues/65.
 mocktail = { git = "https://github.com/IBM/mocktail", rev = "860e75e171a8eb818083813dbeed4401d1a40b3b", version = "0.3.0" }
-siphasher = "0.3"
+siphasher = "1.0"
