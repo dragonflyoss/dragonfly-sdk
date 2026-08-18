@@ -14,9 +14,9 @@
  * limitations under the License.
  */
 
-// Command get-with-endpoint looks up the endpoints of the seed peers serving
-// the url via the Dragonfly, then downloads the file from the first endpoint
-// and writes it to stdout.
+// Command get-with-endpoints looks up the endpoints of the seed peers serving
+// the url via the Dragonfly, then downloads the file from a randomly picked
+// endpoint and writes it to stdout.
 package main
 
 import (
@@ -49,7 +49,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	resp, err := proxy.GetWithEndpoint(ctx, endpoints[0], req)
+	resp, err := proxy.GetWithEndpoints(ctx, endpoints, req)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

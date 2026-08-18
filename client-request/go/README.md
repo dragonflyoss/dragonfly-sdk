@@ -66,8 +66,27 @@ if err := proxy.PreheatImage(ctx, request.NewPreheatImageRequest("docker.io/libr
 }
 ```
 
-Look up the endpoints of the seed peers serving a request, then download
-directly from a specific endpoint, skipping the hash ring selection:
+Preheat with multiple replicas and scatter downloads across them. Preheating
+writes the file to the given number of distinct seed peers, and downloading
+scatters each request across those replicas by picking a random one, retrying
+on the others up to the max retries. Preheating fails when the available seed
+peers are fewer than the replicas, while downloading clamps the replicas to
+the available seed peers. The default replicas is 2:
+
+```go
+if err := proxy.Preheat(ctx, request.NewPreheatRequest("https://example.com/file.txt", request.WithPreheatRequestReplicas(3))); err != nil {
+    panic(err)
+}
+
+resp, err := proxy.Get(ctx, request.NewGetRequest("https://example.com/file.txt", request.WithGetRequestReplicas(3)))
+if err != nil {
+    panic(err)
+}
+defer resp.Body.Close()
+```
+
+Look up the endpoints of the seed peers serving a request, then download from
+the looked-up endpoints directly, scattering the request across them:
 
 ```go
 req := request.NewGetRequest("https://example.com/file.txt")
@@ -76,14 +95,14 @@ if err != nil {
     panic(err)
 }
 
-resp, err := proxy.GetWithEndpoint(ctx, endpoints[0], req)
+resp, err := proxy.GetWithEndpoints(ctx, endpoints, req)
 if err != nil {
     panic(err)
 }
 defer resp.Body.Close()
 
 // Or write the response body directly into a writer:
-// resp, err := proxy.GetIntoWithEndpoint(ctx, endpoints[0], req, w)
+// resp, err := proxy.GetIntoWithEndpoints(ctx, endpoints, req, w)
 ```
 
 See [examples](./examples) for runnable examples.

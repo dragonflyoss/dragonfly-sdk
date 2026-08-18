@@ -73,12 +73,9 @@ func TestSelectWithSingleHost(t *testing.T) {
 	hosts, err := s.Select("test-task", 1)
 	assert.NoError(err)
 
-	// A single host with one vnode wraps around to two entries.
-	assert.Len(hosts, 2)
+	assert.Len(hosts, 1)
 	assert.Equal("1", hosts[0].Id)
 	assert.Equal("192.168.1.1", hosts[0].Ip)
-	assert.Equal("1", hosts[1].Id)
-	assert.Equal("192.168.1.1", hosts[1].Ip)
 }
 
 func TestSelectWithMultipleHosts(t *testing.T) {
@@ -90,8 +87,13 @@ func TestSelectWithMultipleHosts(t *testing.T) {
 
 	hosts, err := s.Select("test-task", 3)
 	assert.NoError(err)
-	assert.NotEmpty(hosts)
-	assert.LessOrEqual(len(hosts), 4)
+	assert.Len(hosts, 3)
+
+	seen := make(map[string]struct{}, len(hosts))
+	for _, host := range hosts {
+		seen[host.Id] = struct{}{}
+	}
+	assert.Len(seen, 3)
 }
 
 func TestSelectReplicasExceedsAvailable(t *testing.T) {
@@ -103,7 +105,7 @@ func TestSelectReplicasExceedsAvailable(t *testing.T) {
 
 	hosts, err := s.Select("test-task", 5)
 	assert.NoError(err)
-	assert.Len(hosts, 3)
+	assert.Len(hosts, 2)
 }
 
 func TestSelectConsistency(t *testing.T) {
@@ -144,7 +146,7 @@ func TestConcurrentSelect(t *testing.T) {
 		wg.Go(func() {
 			hosts, err := s.Select(fmt.Sprintf("concurrent-task-%d", i), 2)
 			assert.NoError(err)
-			assert.Len(hosts, 3)
+			assert.Len(hosts, 2)
 		})
 	}
 	wg.Wait()

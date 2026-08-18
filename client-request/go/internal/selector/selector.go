@@ -122,7 +122,9 @@ func (s *SeedPeerSelector) Close() {
 	s.closeOnce.Do(func() { close(s.done) })
 }
 
-// Select selects seed peers for the given taskID with the number of replicas.
+// Select selects up to replicas distinct seed peers for the given taskID in
+// the consistent hash ring order. The number of replicas is clamped to the
+// number of available seed peers.
 func (s *SeedPeerSelector) Select(taskID string, replicas uint32) ([]*commonv2.Host, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -132,15 +134,35 @@ func (s *SeedPeerSelector) Select(taskID string, replicas uint32) ([]*commonv2.H
 	}
 
 	// The number of replicas cannot exceed the total number of seed peers.
-	expectedReplicas := int(replicas)
-	if expectedReplicas > s.ring.Len() {
-		expectedReplicas = s.ring.Len()
-	}
+	expectedReplicas := min(int(replicas), len(s.hosts))
 
+	// Walk the ring clockwise from the task position collecting distinct seed
+	// peers, growing the window until enough distinct seed peers are found or
+	// the whole ring is covered.
 	var seedPeers []*commonv2.Host
-	for _, vnode := range s.ring.GetWithReplicas(taskID, expectedReplicas) {
-		if host, ok := s.hosts[vnode.Name()]; ok {
+	for window := expectedReplicas * 2; ; window *= 2 {
+		seedPeers = seedPeers[:0]
+		seen := make(map[string]struct{}, expectedReplicas)
+		vnodes := s.ring.GetWithReplicas(taskID, window)
+		for _, vnode := range vnodes {
+			if _, ok := seen[vnode.Name()]; ok {
+				continue
+			}
+			seen[vnode.Name()] = struct{}{}
+
+			host, ok := s.hosts[vnode.Name()]
+			if !ok {
+				continue
+			}
+
 			seedPeers = append(seedPeers, host)
+			if len(seedPeers) == expectedReplicas {
+				break
+			}
+		}
+
+		if len(seedPeers) == expectedReplicas || len(vnodes) >= s.ring.Len() {
+			break
 		}
 	}
 

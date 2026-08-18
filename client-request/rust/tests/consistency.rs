@@ -44,7 +44,7 @@ fn key_hash(key: &str) -> u64 {
 }
 
 #[test]
-fn test_siphash_vectors() {
+fn test_siphash() {
     assert_eq!(vnode_hash(0, "seed-peer-1"), 0x1e5a582b8d945969);
     assert_eq!(vnode_hash(1, "seed-peer-1"), 0xb5db98265419376c);
     assert_eq!(vnode_hash(0, "seed-peer-2"), 0xf36f748c486b09ef);
@@ -59,7 +59,7 @@ fn test_siphash_vectors() {
 }
 
 #[test]
-fn test_hashring_vectors() {
+fn test_hashring() {
     let mut ring = VNodeHashRing::new(3);
     for name in ["seed-peer-1", "seed-peer-2", "seed-peer-3"] {
         ring.add(name.to_string());
@@ -105,7 +105,7 @@ fn test_hashring_vectors() {
 }
 
 #[test]
-fn test_task_id_vectors() {
+fn test_task_id() {
     let generator = IDGenerator::new("127.0.0.1".to_string(), "localhost".to_string(), false);
 
     assert_eq!(

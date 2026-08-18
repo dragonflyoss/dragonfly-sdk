@@ -36,10 +36,16 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 )
 
-// Preheat preheats a file by downloading it to the seed peers via the Dragonfly.
-// It triggers the selected seed peers to download the file by the dfdaemon
-// download task API, without streaming the file content back to the client.
+// Preheat preheats a file by downloading it to the replicas of seed peers via
+// the Dragonfly. It triggers every replica seed peer to download the file by
+// the dfdaemon download task API, without streaming the file content back to
+// the client. It fails when the available seed peers are fewer than the
+// replicas of the request.
 func (p *Proxy) Preheat(ctx context.Context, req *PreheatRequest) error {
+	if err := req.validate(); err != nil {
+		return err
+	}
+
 	ctx, cancel := context.WithTimeout(ctx, req.timeout)
 	defer cancel()
 
@@ -51,9 +57,13 @@ func (p *Proxy) Preheat(ctx context.Context, req *PreheatRequest) error {
 	}
 
 	// Select seed peers for downloading.
-	seedPeers, err := p.seedPeerSelector.Select(id, uint32(p.maxRetries))
+	seedPeers, err := p.seedPeerSelector.Select(id, uint32(req.replicas))
 	if err != nil {
 		return fmt.Errorf("%w: failed to select seed peers from scheduler: %v", ErrInternal, err)
+	}
+
+	if len(seedPeers) < req.replicas {
+		return fmt.Errorf("%w: insufficient seed peers for %d replicas, %d available", ErrInternal, req.replicas, len(seedPeers))
 	}
 
 	priority := commonv2.Priority_LEVEL6
@@ -87,23 +97,16 @@ func (p *Proxy) Preheat(ctx context.Context, req *PreheatRequest) error {
 		download.ContentForCalculatingTaskId = &req.contentForCalculatingTaskID
 	}
 
-	var lastErr error
+	// Trigger every replica seed peer to download the task concurrently and
+	// wait for the download tasks to finish.
+	g, ctx := errgroup.WithContext(ctx)
 	for _, peer := range seedPeers {
-		// Trigger the seed peer to download the task and wait for the download
-		// task to finish, without streaming the file content back to the client.
-		if err := p.downloadTask(ctx, peer, id, download); err != nil {
-			lastErr = err
-			continue
-		}
-
-		return nil
+		g.Go(func() error {
+			return p.downloadTask(ctx, peer, id, download)
+		})
 	}
 
-	if lastErr != nil {
-		return lastErr
-	}
-
-	return fmt.Errorf("%w: failed to download task from any seed peer", ErrInternal)
+	return g.Wait()
 }
 
 // downloadTask triggers the seed peer to download the task and drains the response stream.
@@ -141,11 +144,10 @@ func (p *Proxy) downloadTask(ctx context.Context, peer *commonv2.Host, id string
 // PreheatImage preheats an OCI image by downloading all its blobs via the
 // Dragonfly. It parses the image reference, authenticates with the OCI
 // registry, resolves the image manifest (including multi-platform image
-// indexes), and triggers the seed client to download each blob (config and
-// layers), without streaming the blob content back to the client.
+// indexes), and triggers the seed client to download each blob (config and layers).
 func (p *Proxy) PreheatImage(ctx context.Context, req *PreheatImageRequest) error {
-	if req.concurrentTaskCount <= 0 {
-		return fmt.Errorf("%w: concurrent task count must be positive", ErrInvalidArgument)
+	if err := req.validate(); err != nil {
+		return err
 	}
 
 	ref, err := oci.ParseImage(req.image)
@@ -187,6 +189,7 @@ func (p *Proxy) PreheatImage(ctx context.Context, req *PreheatImageRequest) erro
 				contentForCalculatingTaskID: req.contentForCalculatingTaskID,
 				enableTaskIDBasedBlobDigest: req.enableTaskIDBasedBlobDigest,
 				priority:                    req.priority,
+				replicas:                    req.replicas,
 				timeout:                     req.timeout,
 				certificates:                req.certificates,
 			}

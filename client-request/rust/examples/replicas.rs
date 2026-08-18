@@ -14,12 +14,13 @@
  * limitations under the License.
  */
 
-//! Looks up the endpoints of the seed peers serving the url via the Dragonfly,
-//! then downloads the file from the first endpoint and writes it to stdout.
+//! Preheats the url to three replicas of seed peers via the Dragonfly, then
+//! downloads it with the request scattered across the replicas, writing the
+//! content to stdout. The default replicas is 2 when not set.
 //!
-//! Usage: cargo run --example get_with_endpoint -- <scheduler-endpoint> <url>
+//! Usage: cargo run --example replicas -- <scheduler-endpoint> <url>
 
-use dragonfly_client_request::{GetRequest, Proxy, Request};
+use dragonfly_client_request::{GetRequest, PreheatRequest, Proxy, Request};
 use futures::TryStreamExt;
 use tokio::io::AsyncWriteExt;
 
@@ -36,15 +37,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .await?;
 
-    let request = GetRequest {
-        url: args[2].clone(),
-        ..Default::default()
-    };
+    // Preheat the file to 3 replicas of seed peers.
+    proxy
+        .preheat(&PreheatRequest {
+            url: args[2].clone(),
+            replicas: 3,
+            ..Default::default()
+        })
+        .await?;
 
-    let endpoints = proxy.lookup_endpoints(&request).await?;
-    let endpoint = endpoints.first().ok_or("no available endpoints")?;
-
-    let response = proxy.get_with_endpoint(endpoint, &request).await?;
+    // Download the file with the request scattered across the 3 replicas.
+    let response = proxy
+        .get(&GetRequest {
+            url: args[2].clone(),
+            replicas: 3,
+            ..Default::default()
+        })
+        .await?;
 
     // The body is a stream of zero-copy `Bytes` chunks.
     let mut body = response.body.ok_or("missing response body")?;
