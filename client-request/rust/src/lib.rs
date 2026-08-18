@@ -20,21 +20,18 @@
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use digest::is_blob_url;
 use dragonfly_api::common::v2::{Download, Priority, TaskType};
 use dragonfly_api::dfdaemon::v2::{
     dfdaemon_upload_client::DfdaemonUploadClient as DfdaemonUploadGRPCClient, DownloadTaskRequest,
 };
 use dragonfly_api::scheduler::v2::scheduler_client::SchedulerClient;
-use dragonfly_client_util::digest::is_blob_url;
-use dragonfly_client_util::http::{
-    headermap_to_hashmap, query_params::default_proxy_rule_filtered_query_params,
-};
-use dragonfly_client_util::id_generator::{IDGenerator, TaskIDParameter};
-use dragonfly_client_util::net::format_url;
-use dragonfly_client_util::net::preferred_local_ip;
-use dragonfly_client_util::pool::{Builder as PoolBuilder, Entry, Factory, Pool};
 use errors::{BackendError, DfdaemonError, Error, ProxyError};
 use futures::{Stream, TryStreamExt};
+use http::{default_proxy_rule_filtered_query_params, headermap_to_hashmap};
+use id_generator::{IDGenerator, TaskIDParameter};
+use net::{format_url, preferred_local_ip};
+use pool::{Builder as PoolBuilder, Entry, Factory, Pool};
 use rand::seq::SliceRandom;
 use reqwest::{
     header::{HeaderMap, HeaderValue},
@@ -66,7 +63,15 @@ use tokio::task::JoinSet;
 use tracing::Instrument;
 
 pub mod errors;
+pub mod hashring;
+pub mod id_generator;
+
+mod digest;
+mod http;
+mod net;
+mod pool;
 mod selector;
+mod shutdown;
 
 /// The max idle connections per host.
 const POOL_MAX_IDLE_PER_HOST: usize = 1024;
@@ -2200,7 +2205,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_client_pool_get_or_create() {
-        dragonfly_client_util::tls::install_crypto_provider();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let pool = PoolBuilder::new(HTTPClientFactory {})
             .capacity(10)
             .idle_timeout(Duration::from_secs(600))
@@ -2222,7 +2227,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_client_pool_cleanup() {
-        dragonfly_client_util::tls::install_crypto_provider();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let pool = PoolBuilder::new(HTTPClientFactory {})
             .capacity(10)
             .idle_timeout(Duration::from_millis(10))

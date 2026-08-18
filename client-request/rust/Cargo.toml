@@ -15,13 +15,17 @@ default = []
 preheat = ["dep:oci-client", "dep:oci-spec"]
 
 [dependencies]
-dragonfly-client-core = "1.5.0"
-dragonfly-client-util = "1.5.0"
-dragonfly-api = "=2.2.32"
+dragonfly-api = "2.3.0"
 async-trait = "0.1"
 futures = "0.3.32"
 hostname = "^0.4"
 bytes = "1.11"
+dashmap = "6.1.0"
+hashring = "0.3.6"
+hex = "0.4"
+local-ip-address = "0.6.5"
+regex = "1.12.3"
+sha2 = "0.10"
 oci-client = { version = "0.17.0", default-features = false, features = [
   "rustls-tls"
 ], optional = true }
@@ -54,6 +58,7 @@ rustls = "0.23"
 # TODO(Gaius): Remove the git dependency after the next release of mocktail, refer to https://github.com/IBM/mocktail/issues/65.
 mocktail = { git = "https://github.com/IBM/mocktail", rev = "860e75e171a8eb818083813dbeed4401d1a40b3b", version = "0.3.0" }
 siphasher = "1.0"
+uuid = { version = "1.20", features = ["v4"] }
 
 [[example]]
 name = "preheat"

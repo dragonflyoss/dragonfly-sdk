@@ -19,8 +19,8 @@
 //! change on either side that breaks hashring or task id compatibility fails
 //! the build.
 
-use dragonfly_client_util::hashring::VNodeHashRing;
-use dragonfly_client_util::id_generator::{IDGenerator, TaskIDParameter};
+use dragonfly_client_request::hashring::VNodeHashRing;
+use dragonfly_client_request::id_generator::{IDGenerator, TaskIDParameter};
 use siphasher::sip::SipHasher;
 use std::hash::Hasher;
 
