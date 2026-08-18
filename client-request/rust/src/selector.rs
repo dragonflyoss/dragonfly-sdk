@@ -139,17 +139,34 @@ impl SeedPeerSelector {
         }
 
         let mut hosts = HashMap::with_capacity(seed_peers_length);
-        let mut hashring = VNodeHashRing::new(DEFAULT_VNODES_PER_HOST);
         while let Some(result) = join_set.join_next().await {
             match result {
                 Ok(Ok(peer)) => {
-                    let name = peer.name.to_string();
-                    hashring.add(name.clone());
-                    hosts.insert(name, peer);
+                    hosts.insert(peer.name.to_string(), peer);
                 }
                 Ok(Err(err)) => error!("health check failed: {}", err),
                 Err(err) => error!("task join error: {}", err),
             }
+        }
+
+        // Rebuilding the ring costs vnodes-per-host hashes per host and a full
+        // sort, so reuse the current ring when the healthy host names are
+        // unchanged and only refresh the host records.
+        let unchanged = {
+            let seed_peers = self.seed_peers.read().await;
+            seed_peers.hosts.len() == hosts.len()
+                && hosts.keys().all(|name| seed_peers.hosts.contains_key(name))
+        };
+
+        if unchanged {
+            let mut seed_peers = self.seed_peers.write().await;
+            seed_peers.hosts = hosts;
+            return Ok(());
+        }
+
+        let mut hashring = VNodeHashRing::new(DEFAULT_VNODES_PER_HOST);
+        for name in hosts.keys() {
+            hashring.add(name.clone());
         }
 
         // The write lock is held for a very short time.

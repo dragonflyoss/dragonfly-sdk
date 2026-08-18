@@ -201,14 +201,31 @@ func (s *SeedPeerSelector) refresh(ctx context.Context) error {
 	wg.Wait()
 
 	hosts := make(map[string]*commonv2.Host, len(seedPeers))
-	ring := hashring.New(vnodesPerHost)
 	for _, peer := range healthy {
 		if peer == nil {
 			continue
 		}
 
-		ring.Add(peer.Name)
 		hosts[peer.Name] = peer
+	}
+
+	// Rebuilding the ring costs vnodesPerHost hashes per host and a full sort,
+	// so reuse the current ring when the healthy host names are unchanged and
+	// only refresh the host records.
+	s.mu.RLock()
+	unchanged := hostNamesEqual(hosts, s.hosts)
+	s.mu.RUnlock()
+
+	if unchanged {
+		s.mu.Lock()
+		s.hosts = hosts
+		s.mu.Unlock()
+		return nil
+	}
+
+	ring := hashring.New(vnodesPerHost)
+	for name := range hosts {
+		ring.Add(name)
 	}
 
 	s.mu.Lock()
@@ -216,6 +233,21 @@ func (s *SeedPeerSelector) refresh(ctx context.Context) error {
 	s.ring = ring
 	s.mu.Unlock()
 	return nil
+}
+
+// hostNamesEqual reports whether the two host maps contain the same host names.
+func hostNamesEqual(a, b map[string]*commonv2.Host) bool {
+	if len(a) != len(b) {
+		return false
+	}
+
+	for name := range a {
+		if _, ok := b[name]; !ok {
+			return false
+		}
+	}
+
+	return true
 }
 
 // listSeedPeers lists the seed peers from scheduler.

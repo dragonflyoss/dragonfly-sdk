@@ -48,6 +48,23 @@ const (
 	// keepAliveInterval is the keep alive interval for TCP connection.
 	keepAliveInterval = 60 * time.Second
 
+	// idleConnTimeout is the maximum amount of time an idle connection remains
+	// idle before closing itself.
+	idleConnTimeout = 90 * time.Second
+
+	// dialTimeout is the maximum amount of time a dial waits for a connect to
+	// complete.
+	dialTimeout = 30 * time.Second
+
+	// tlsHandshakeTimeout is the maximum amount of time to wait for a TLS
+	// handshake.
+	tlsHandshakeTimeout = 10 * time.Second
+
+	// expectContinueTimeout is the maximum amount of time to wait for a
+	// server's first response headers after fully writing the request headers
+	// when the request has an "Expect: 100-continue" header.
+	expectContinueTimeout = 1 * time.Second
+
 	// defaultClientPoolIdleTimeout is the default idle timeout(30 minutes) for
 	// clients in the pool.
 	defaultClientPoolIdleTimeout = 30 * time.Minute
@@ -177,7 +194,9 @@ func (p *Proxy) validate(schedulerEndpoint string) (string, error) {
 }
 
 // httpClientFactory creates a new HTTP client configured to use the specified
-// proxy address.
+// proxy address. The transport follows the shape of net/http DefaultTransport
+// with a larger idle connection pool, since each client serves a single seed
+// peer proxy host.
 //
 // TODO(chlins): Support client certificates and set the insecure skip verify
 // based on the certificates.
@@ -191,10 +210,16 @@ func httpClientFactory(proxyAddr string) (*http.Client, error) {
 		Transport: &http.Transport{
 			Proxy: http.ProxyURL(proxyURL),
 			DialContext: (&net.Dialer{
+				Timeout:   dialTimeout,
 				KeepAlive: keepAliveInterval,
 			}).DialContext,
-			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
-			MaxIdleConnsPerHost: poolMaxIdlePerHost,
+			ForceAttemptHTTP2:     true,
+			TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
+			MaxIdleConns:          poolMaxIdlePerHost,
+			MaxIdleConnsPerHost:   poolMaxIdlePerHost,
+			IdleConnTimeout:       idleConnTimeout,
+			TLSHandshakeTimeout:   tlsHandshakeTimeout,
+			ExpectContinueTimeout: expectContinueTimeout,
 		},
 	}, nil
 }

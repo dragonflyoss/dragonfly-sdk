@@ -67,6 +67,13 @@ mod selector;
 /// The max idle connections per host.
 const POOL_MAX_IDLE_PER_HOST: usize = 1024;
 
+/// The maximum amount of time an idle connection remains idle in the pool
+/// before closing itself.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// The maximum amount of time a connect waits to complete.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The keep alive interval for TCP connection.
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -476,7 +483,9 @@ impl Factory<String, ClientWithMiddleware> for HTTPClientFactory {
             .hickory_dns(true)
             .danger_accept_invalid_certs(true)
             .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             .tcp_keepalive(KEEP_ALIVE_INTERVAL)
+            .connect_timeout(CONNECT_TIMEOUT)
             .proxy(reqwest::Proxy::all(proxy_addr).map_err(|err| {
                 Error::Internal(format!("failed to set proxy {proxy_addr}: {err}"))
             })?)
