@@ -23,6 +23,7 @@ package request
 import (
 	"context"
 	"crypto/x509"
+	"fmt"
 	"io"
 	"net/http"
 	"time"
@@ -32,6 +33,12 @@ import (
 
 // defaultRequestTimeout is the default timeout for requests.
 const defaultRequestTimeout = 30 * 60 * time.Second
+
+// defaultConcurrentTaskCount is the default number of blobs to preheat concurrently.
+const defaultConcurrentTaskCount = 4
+
+// defaultReplicas is the default number of seed peers serving a task.
+const defaultReplicas = 2
 
 // Request is the interface for sending requests via the Dragonfly.
 //
@@ -47,8 +54,23 @@ type Request interface {
 	// writes the response body directly into the provided writer.
 	GetInto(ctx context.Context, req *GetRequest, w io.Writer) (*GetResponse, error)
 
-	// Preheat preheats a file by downloading it to the seed peers via the
-	// Dragonfly, without streaming the file content back to the client.
+	// GetWithEndpoints sends a GET request to a remote server via the given
+	// seed peer endpoints of the Dragonfly (e.g., the ones returned by
+	// LookupEndpoints), instead of selecting seed peers by the consistent hash
+	// ring. The request is sent to a randomly picked endpoint and retried on
+	// the others up to the max retries.
+	GetWithEndpoints(ctx context.Context, endpoints []string, req *GetRequest) (*GetResponse, error)
+
+	// GetIntoWithEndpoints sends a GET request to a remote server via the
+	// given seed peer endpoints of the Dragonfly and writes the response body
+	// directly into the provided writer. The request is sent to a randomly
+	// picked endpoint and retried on the others up to the max retries.
+	GetIntoWithEndpoints(ctx context.Context, endpoints []string, req *GetRequest, w io.Writer) (*GetResponse, error)
+
+	// Preheat preheats a file by downloading it to the replicas of seed peers
+	// via the Dragonfly, without streaming the file content back to the
+	// client. It fails when the available seed peers are fewer than the
+	// replicas of the request.
 	Preheat(ctx context.Context, req *PreheatRequest) error
 
 	// PreheatImage preheats an OCI image by downloading all its blobs via the
@@ -58,8 +80,8 @@ type Request interface {
 
 	// LookupEndpoints looks up the endpoints of the seed peers serving the
 	// request, in the consistent hash ring selection order for the request's
-	// task id. The number of endpoints is limited by the max retries, and the
-	// same seed peer may appear multiple times when it is selected for retries.
+	// task id. It returns up to the replicas of the request distinct
+	// endpoints, clamped to the number of available seed peers.
 	LookupEndpoints(ctx context.Context, req *GetRequest) ([]string, error)
 }
 
@@ -93,6 +115,9 @@ type GetRequest struct {
 
 	// priority is the task priority.
 	priority *int32
+
+	// replicas is the number of seed peers serving the task.
+	replicas int
 
 	// timeout is the timeout of the request.
 	timeout time.Duration
@@ -158,6 +183,12 @@ func WithGetRequestPriority(priority int32) GetRequestOption {
 	return func(r *GetRequest) { r.priority = &priority }
 }
 
+// WithGetRequestReplicas sets the number of seed peers serving the task,
+// default is 2. The request is scattered across the replicas.
+func WithGetRequestReplicas(replicas int) GetRequestOption {
+	return func(r *GetRequest) { r.replicas = replicas }
+}
+
 // WithGetRequestTimeout sets the timeout of the request.
 func WithGetRequestTimeout(timeout time.Duration) GetRequestOption {
 	return func(r *GetRequest) { r.timeout = timeout }
@@ -170,14 +201,15 @@ func WithGetRequestCertificates(certs []*x509.Certificate) GetRequestOption {
 }
 
 // NewGetRequest returns a GetRequest for the url with default values: the
-// default filtered query params, blob digest based task id enabled and a 600s
-// timeout.
+// default filtered query params, blob digest based task id enabled and a 30
+// minutes timeout.
 func NewGetRequest(url string, opts ...GetRequestOption) *GetRequest {
 	r := &GetRequest{
 		url:                         url,
 		header:                      make(http.Header),
 		filteredQueryParams:         idgen.DefaultFilteredQueryParams,
 		enableTaskIDBasedBlobDigest: true,
+		replicas:                    defaultReplicas,
 		timeout:                     defaultRequestTimeout,
 	}
 	for _, opt := range opts {
@@ -185,6 +217,15 @@ func NewGetRequest(url string, opts ...GetRequestOption) *GetRequest {
 	}
 
 	return r
+}
+
+// validate validates the request parameters.
+func (r *GetRequest) validate() error {
+	if r.replicas <= 0 {
+		return fmt.Errorf("%w: replicas must be positive", ErrInvalidArgument)
+	}
+
+	return nil
 }
 
 // GetResponse represents a GET response received via the Dragonfly.
@@ -236,6 +277,9 @@ type PreheatRequest struct {
 
 	// priority is the task priority.
 	priority *int32
+
+	// replicas is the number of seed peers serving the task.
+	replicas int
 
 	// timeout is the timeout of the request.
 	timeout time.Duration
@@ -293,6 +337,12 @@ func WithPreheatRequestPriority(priority int32) PreheatRequestOption {
 	return func(r *PreheatRequest) { r.priority = &priority }
 }
 
+// WithPreheatRequestReplicas sets the number of seed peers to preheat the task
+// to, default is 2.
+func WithPreheatRequestReplicas(replicas int) PreheatRequestOption {
+	return func(r *PreheatRequest) { r.replicas = replicas }
+}
+
 // WithPreheatRequestTimeout sets the timeout of the request.
 func WithPreheatRequestTimeout(timeout time.Duration) PreheatRequestOption {
 	return func(r *PreheatRequest) { r.timeout = timeout }
@@ -311,6 +361,7 @@ func NewPreheatRequest(url string, opts ...PreheatRequestOption) *PreheatRequest
 		header:                      make(http.Header),
 		filteredQueryParams:         idgen.DefaultFilteredQueryParams,
 		enableTaskIDBasedBlobDigest: true,
+		replicas:                    defaultReplicas,
 		timeout:                     defaultRequestTimeout,
 	}
 	for _, opt := range opts {
@@ -318,6 +369,15 @@ func NewPreheatRequest(url string, opts ...PreheatRequestOption) *PreheatRequest
 	}
 
 	return r
+}
+
+// validate validates the request parameters.
+func (r *PreheatRequest) validate() error {
+	if r.replicas <= 0 {
+		return fmt.Errorf("%w: replicas must be positive", ErrInvalidArgument)
+	}
+
+	return nil
 }
 
 // PreheatImageRequest represents a request to preheat an OCI image through
@@ -360,8 +420,14 @@ type PreheatImageRequest struct {
 	// priority is the task priority.
 	priority *int32
 
+	// replicas is the number of seed peers serving each blob task.
+	replicas int
+
 	// timeout is the timeout for each blob download request.
 	timeout time.Duration
+
+	// concurrentTaskCount is the number of blobs to preheat concurrently.
+	concurrentTaskCount int
 
 	// certificates is the client certificates for the request.
 	// TODO(chlins): Support client certificates.
@@ -427,9 +493,21 @@ func WithPreheatImageRequestPriority(priority int32) PreheatImageRequestOption {
 	return func(r *PreheatImageRequest) { r.priority = &priority }
 }
 
+// WithPreheatImageRequestReplicas sets the number of seed peers to preheat
+// each blob task to, default is 2.
+func WithPreheatImageRequestReplicas(replicas int) PreheatImageRequestOption {
+	return func(r *PreheatImageRequest) { r.replicas = replicas }
+}
+
 // WithPreheatImageRequestTimeout sets the timeout for each blob download request.
 func WithPreheatImageRequestTimeout(timeout time.Duration) PreheatImageRequestOption {
 	return func(r *PreheatImageRequest) { r.timeout = timeout }
+}
+
+// WithPreheatImageRequestConcurrentTaskCount sets the number of blobs to
+// preheat concurrently, default is 4.
+func WithPreheatImageRequestConcurrentTaskCount(count int) PreheatImageRequestOption {
+	return func(r *PreheatImageRequest) { r.concurrentTaskCount = count }
 }
 
 // WithPreheatImageRequestCertificates sets the client certificates for the request.
@@ -445,11 +523,26 @@ func NewPreheatImageRequest(image string, opts ...PreheatImageRequestOption) *Pr
 		image:                       image,
 		filteredQueryParams:         idgen.DefaultFilteredQueryParams,
 		enableTaskIDBasedBlobDigest: true,
+		replicas:                    defaultReplicas,
 		timeout:                     defaultRequestTimeout,
+		concurrentTaskCount:         defaultConcurrentTaskCount,
 	}
 	for _, opt := range opts {
 		opt(r)
 	}
 
 	return r
+}
+
+// validate validates the request parameters.
+func (r *PreheatImageRequest) validate() error {
+	if r.replicas <= 0 {
+		return fmt.Errorf("%w: replicas must be positive", ErrInvalidArgument)
+	}
+
+	if r.concurrentTaskCount <= 0 {
+		return fmt.Errorf("%w: concurrent task count must be positive", ErrInvalidArgument)
+	}
+
+	return nil
 }

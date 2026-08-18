@@ -21,7 +21,7 @@ use dragonfly_client_core::{Error, Result};
 use dragonfly_client_util::hashring::VNodeHashRing;
 use dragonfly_client_util::net::format_url;
 use dragonfly_client_util::shutdown;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::time::Duration;
@@ -139,17 +139,34 @@ impl SeedPeerSelector {
         }
 
         let mut hosts = HashMap::with_capacity(seed_peers_length);
-        let mut hashring = VNodeHashRing::new(DEFAULT_VNODES_PER_HOST);
         while let Some(result) = join_set.join_next().await {
             match result {
                 Ok(Ok(peer)) => {
-                    let name = peer.name.to_string();
-                    hashring.add(name.clone());
-                    hosts.insert(name, peer);
+                    hosts.insert(peer.name.to_string(), peer);
                 }
                 Ok(Err(err)) => error!("health check failed: {}", err),
                 Err(err) => error!("task join error: {}", err),
             }
+        }
+
+        // Rebuilding the ring costs vnodes-per-host hashes per host and a full
+        // sort, so reuse the current ring when the healthy host names are
+        // unchanged and only refresh the host records.
+        let unchanged = {
+            let seed_peers = self.seed_peers.read().await;
+            seed_peers.hosts.len() == hosts.len()
+                && hosts.keys().all(|name| seed_peers.hosts.contains_key(name))
+        };
+
+        if unchanged {
+            let mut seed_peers = self.seed_peers.write().await;
+            seed_peers.hosts = hosts;
+            return Ok(());
+        }
+
+        let mut hashring = VNodeHashRing::new(DEFAULT_VNODES_PER_HOST);
+        for name in hosts.keys() {
+            hashring.add(name.clone());
         }
 
         // The write lock is held for a very short time.
@@ -198,30 +215,49 @@ impl Selector for SeedPeerSelector {
         }
 
         // The number of replicas cannot exceed the total number of seed peers.
-        let expected_replicas = std::cmp::min(replicas as usize, seed_peers.hashring.len());
+        let expected_replicas = std::cmp::min(replicas as usize, seed_peers.hosts.len());
         debug!("task {} expected replicas: {}", task_id, expected_replicas);
 
-        // Get replica nodes from the hash ring.
-        let vnodes = seed_peers
-            .hashring
-            .get_with_replicas(&task_id, expected_replicas)
-            .unwrap_or_default();
+        // Walk the ring clockwise from the task position collecting distinct
+        // seed peers, growing the window until enough distinct seed peers are
+        // found or the whole ring is covered.
+        let mut selected: Vec<Host> = Vec::with_capacity(expected_replicas);
+        let mut window = expected_replicas * 2;
+        loop {
+            selected.clear();
+            let vnodes = seed_peers
+                .hashring
+                .get_with_replicas(&task_id, window)
+                .unwrap_or_default();
+            let vnodes_len = vnodes.len();
+            let mut seen: HashSet<&str> = HashSet::with_capacity(expected_replicas);
+            for vnode in vnodes.iter() {
+                if !seen.insert(vnode.name()) {
+                    continue;
+                }
 
-        let seed_peers: Vec<Host> = vnodes
-            .into_iter()
-            .filter_map(|vnode| {
-                seed_peers
-                    .hosts
-                    .get(vnode.name().to_string().as_str())
-                    .cloned()
-            })
-            .collect();
+                let Some(host) = seed_peers.hosts.get(vnode.name()) else {
+                    continue;
+                };
 
-        if seed_peers.is_empty() {
+                selected.push(host.clone());
+                if selected.len() == expected_replicas {
+                    break;
+                }
+            }
+
+            if selected.len() == expected_replicas || vnodes_len >= seed_peers.hashring.len() {
+                break;
+            }
+
+            window *= 2;
+        }
+
+        if selected.is_empty() {
             return Err(Error::HostNotFound("selected seed peers".to_string()));
         }
 
-        Ok(seed_peers)
+        Ok(selected)
     }
 }
 
@@ -303,11 +339,9 @@ mod tests {
         assert!(result.is_ok());
 
         let hosts = result.unwrap();
-        assert_eq!(hosts.len(), 2);
+        assert_eq!(hosts.len(), 1);
         assert_eq!(hosts[0].id, "1");
         assert_eq!(hosts[0].ip, "192.168.1.1");
-        assert_eq!(hosts[1].id, "1");
-        assert_eq!(hosts[1].ip, "192.168.1.1");
     }
 
     #[tokio::test]
@@ -323,8 +357,10 @@ mod tests {
         assert!(result.is_ok());
 
         let hosts = result.unwrap();
-        assert!(hosts.len() <= 4);
-        assert!(!hosts.is_empty());
+        assert_eq!(hosts.len(), 3);
+
+        let seen: std::collections::HashSet<_> = hosts.iter().map(|host| &host.id).collect();
+        assert_eq!(seen.len(), 3);
     }
 
     #[tokio::test]
@@ -340,7 +376,7 @@ mod tests {
         assert!(result.is_ok());
 
         let hosts = result.unwrap();
-        assert_eq!(hosts.len(), 3);
+        assert_eq!(hosts.len(), 2);
     }
 
     #[tokio::test]
@@ -393,7 +429,7 @@ mod tests {
             assert!(result.is_ok());
 
             let hosts = result.unwrap();
-            assert_eq!(hosts.len(), 3);
+            assert_eq!(hosts.len(), 2);
         }
     }
 
@@ -410,7 +446,7 @@ mod tests {
         assert!(result.is_ok());
 
         let hosts = result.unwrap();
-        assert_eq!(hosts.len(), 11);
+        assert_eq!(hosts.len(), 10);
 
         let mut seen_ids = std::collections::HashSet::new();
         for host in hosts {

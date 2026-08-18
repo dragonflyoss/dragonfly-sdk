@@ -11,6 +11,7 @@ and preheating files or OCI images through seed peers.
 
 ```rust
 use dragonfly_client_request::{GetRequest, Proxy, Request};
+use futures::TryStreamExt;
 
 let proxy = Proxy::builder()
     .scheduler_endpoint("http://127.0.0.1:8002".to_string())
@@ -23,6 +24,53 @@ let response = proxy
         ..Default::default()
     })
     .await?;
+
+// The body is a stream of zero-copy `Bytes` chunks.
+let mut body = response.body.unwrap();
+while let Some(chunk) = body.try_next().await? {
+    // Consume the chunk...
+}
+```
+
+Preheat with multiple replicas and scatter downloads across them. Preheating
+writes the file to the given number of distinct seed peers, and downloading
+scatters each request across those replicas by picking a random one, retrying
+on the others up to the max retries. Preheating fails when the available seed
+peers are fewer than the replicas, while downloading clamps the replicas to
+the available seed peers. The default replicas is 2:
+
+```rust
+proxy
+    .preheat(&PreheatRequest {
+        url: "https://example.com/file.txt".to_string(),
+        replicas: 3,
+        ..Default::default()
+    })
+    .await?;
+
+let response = proxy
+    .get(&GetRequest {
+        url: "https://example.com/file.txt".to_string(),
+        replicas: 3,
+        ..Default::default()
+    })
+    .await?;
+```
+
+Look up the endpoints of the seed peers serving a request, then download from
+the looked-up endpoints directly, scattering the request across them:
+
+```rust
+let request = GetRequest {
+    url: "https://example.com/file.txt".to_string(),
+    ..Default::default()
+};
+
+let endpoints = proxy.lookup_endpoints(&request).await?;
+let response = proxy.get_with_endpoints(&endpoints, &request).await?;
+
+// Or write the response body directly into a buffer:
+// let response = proxy.get_into_with_endpoints(&endpoints, &request, &mut buf).await?;
 ```
 
 The `preheat` feature enables preheating OCI images by resolving manifests from
@@ -32,6 +80,8 @@ the registry and triggering seed peers to download each blob:
 [dependencies]
 dragonfly-client-request = { version = "1.5.0", features = ["preheat"] }
 ```
+
+See [examples](./examples) for runnable examples.
 
 ## Documentation
 

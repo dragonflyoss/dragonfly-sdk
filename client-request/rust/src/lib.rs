@@ -14,8 +14,12 @@
  * limitations under the License.
  */
 
+//! Request library for the Dragonfly client. It sends requests to remote
+//! servers via the Dragonfly P2P network, supporting streaming and buffered
+//! GET requests and preheating files or OCI images through seed peers.
+
 use async_trait::async_trait;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use dragonfly_api::common::v2::{Download, Priority, TaskType};
 use dragonfly_api::dfdaemon::v2::{
     dfdaemon_upload_client::DfdaemonUploadClient as DfdaemonUploadGRPCClient, DownloadTaskRequest,
@@ -30,7 +34,8 @@ use dragonfly_client_util::net::format_url;
 use dragonfly_client_util::net::preferred_local_ip;
 use dragonfly_client_util::pool::{Builder as PoolBuilder, Entry, Factory, Pool};
 use errors::{BackendError, DfdaemonError, Error, ProxyError};
-use futures::TryStreamExt;
+use futures::{Stream, TryStreamExt};
+use rand::seq::SliceRandom;
 use reqwest::{
     header::{HeaderMap, HeaderValue},
     Client,
@@ -39,15 +44,12 @@ use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_tracing::TracingMiddleware;
 use rustls_pki_types::CertificateDer;
 use selector::{SeedPeerSelector, Selector};
-use std::io::Error as IOError;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncRead;
-use tokio_util::io::StreamReader;
 use tonic::transport::{Channel, Endpoint};
-use tracing::{debug, error};
+use tracing::{debug, warn};
 
 #[cfg(feature = "preheat")]
 use oci_client::{
@@ -58,12 +60,23 @@ use oci_client::{
 use oci_spec::image::{Arch, Os};
 #[cfg(feature = "preheat")]
 use reqwest::header::AUTHORIZATION;
+#[cfg(feature = "preheat")]
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
+use tracing::Instrument;
 
 pub mod errors;
 mod selector;
 
 /// The max idle connections per host.
 const POOL_MAX_IDLE_PER_HOST: usize = 1024;
+
+/// The maximum amount of time an idle connection remains idle in the pool
+/// before closing itself.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// The maximum amount of time a connect waits to complete.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The keep alive interval for TCP connection.
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(60);
@@ -78,11 +91,17 @@ const DEFAULT_CLIENT_POOL_CAPACITY: usize = 128;
 /// scheduler service.
 const DEFAULT_SCHEDULER_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The default timeout(30 minutes) for requests.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// The default number of seed peers serving a task.
+const DEFAULT_REPLICAS: usize = 2;
+
 /// A specialized Result type for the proxy module.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// The type alias for the response body reader.
-pub type Body = Box<dyn AsyncRead + Send + Unpin>;
+/// The type alias for the response body stream of zero-copy `Bytes` chunks.
+pub type Body = Box<dyn Stream<Item = Result<Bytes>> + Send + Unpin>;
 
 /// Defines the interface for sending requests via the Dragonfly.
 ///
@@ -111,6 +130,28 @@ pub trait Request {
     /// and headers) is returned separately.
     async fn get_into(&self, request: &GetRequest, buf: &mut BytesMut) -> Result<GetResponse>;
 
+    /// Sends an GET request to a remote server via the given seed peer endpoints of the
+    /// Dragonfly (e.g., the ones returned by `lookup_endpoints`), instead of selecting
+    /// seed peers by the consistent hash ring. The request is sent to a randomly picked
+    /// endpoint and retried on the others up to the max retries of the proxy, and
+    /// returns a response with a streaming body.
+    async fn get_with_endpoints(
+        &self,
+        endpoints: &[String],
+        request: &GetRequest,
+    ) -> Result<GetResponse<Body>>;
+
+    /// Sends an GET request to a remote server via the given seed peer endpoints of the
+    /// Dragonfly and writes the response body directly into the provided buffer. The
+    /// request is sent to a randomly picked endpoint and retried on the others up to
+    /// the max retries of the proxy.
+    async fn get_into_with_endpoints(
+        &self,
+        endpoints: &[String],
+        request: &GetRequest,
+        buf: &mut BytesMut,
+    ) -> Result<GetResponse>;
+
     /// Preheats an OCI image by downloading all its blobs via the Dragonfly.
     ///
     /// This method is designed for scenarios where OCI image content needs to be pre-cached in
@@ -122,21 +163,20 @@ pub trait Request {
     #[cfg(feature = "preheat")]
     async fn preheat_image(&self, request: &PreheatImageRequest) -> Result<()>;
 
-    /// Preheats a file by downloading it to the seed peers via the Dragonfly.
+    /// Preheats a file by downloading it to the replicas of seed peers via the Dragonfly.
     ///
     /// This method is designed for scenarios where file content needs to be pre-cached in
     /// the seed client before actual consumption, ensuring faster subsequent access across
-    /// the cluster. It triggers the selected seed peers to download the file by the dfdaemon
-    /// download task API, without streaming the file content back to the client.
+    /// the cluster. It triggers every replica seed peer to download the file by the
+    /// dfdaemon download task API.
     async fn preheat(&self, request: &PreheatRequest) -> Result<()>;
 
     /// Looks up the endpoints of the seed peers serving the request, in the consistent
     /// hash ring selection order for the request's task id.
     ///
     /// This method is designed for scenarios where clients need to know which seed peers
-    /// would serve the request without sending it. The number of endpoints is limited by
-    /// the max retries of the proxy, and the same seed peer may appear multiple times
-    /// when it is selected for retries.
+    /// would serve the request without sending it. It returns up to the replicas of the
+    /// request distinct endpoints, clamped to the number of available seed peers.
     async fn lookup_endpoints(&self, request: &GetRequest) -> Result<Vec<String>>;
 }
 
@@ -179,7 +219,10 @@ pub struct GetRequest {
     /// Refer to https://github.com/dragonflyoss/api/blob/main/proto/common.proto#L67
     pub priority: Option<i32>,
 
-    /// The timeout of the request, default is 300s.
+    /// The number of seed peers serving the task, default is 2.
+    pub replicas: usize,
+
+    /// The timeout of the request, default is 30 minutes.
     pub timeout: Duration,
 
     /// The client certificates for the request.
@@ -200,17 +243,29 @@ impl Default for GetRequest {
             content_for_calculating_task_id: None,
             enable_task_id_based_blob_digest: true,
             priority: None,
-            timeout: Duration::from_secs(300),
+            replicas: DEFAULT_REPLICAS,
+            timeout: DEFAULT_REQUEST_TIMEOUT,
             client_cert: None,
         }
     }
 }
 
+/// Implements methods for validating the request.
+impl GetRequest {
+    /// Validates the request parameters.
+    fn validate(&self) -> Result<()> {
+        if self.replicas == 0 {
+            return Err(Error::InvalidArgument(
+                "replicas must be positive".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
 /// Represents a GET response received via the Dragonfly.
-pub struct GetResponse<R = Body>
-where
-    R: AsyncRead + Unpin,
-{
+pub struct GetResponse<R = Body> {
     /// The success of the response.
     pub success: bool,
 
@@ -220,8 +275,8 @@ where
     /// The status code of the response.
     pub status_code: Option<reqwest::StatusCode>,
 
-    /// The content of the response.
-    pub reader: Option<R>,
+    /// The body of the response.
+    pub body: Option<R>,
 }
 
 /// Represents a request to preheat an OCI image through the
@@ -275,8 +330,14 @@ pub struct PreheatImageRequest {
     /// Refer to https://github.com/dragonflyoss/api/blob/main/proto/common.proto#L67
     pub priority: Option<i32>,
 
-    /// The timeout for each blob download request, default is 300s.
+    /// The number of seed peers serving the task, default is 2.
+    pub replicas: usize,
+
+    /// The timeout for each blob download request, default is 30 minutes.
     pub timeout: Duration,
+
+    /// The number of blobs to preheat concurrently, default is 4.
+    pub concurrent_task_count: usize,
 
     /// The optional client certificates for the request.
     pub client_cert: Option<Vec<CertificateDer<'static>>>,
@@ -300,9 +361,32 @@ impl Default for PreheatImageRequest {
             content_for_calculating_task_id: None,
             enable_task_id_based_blob_digest: true,
             priority: None,
-            timeout: Duration::from_secs(300),
+            replicas: DEFAULT_REPLICAS,
+            timeout: DEFAULT_REQUEST_TIMEOUT,
+            concurrent_task_count: 4,
             client_cert: None,
         }
+    }
+}
+
+#[cfg(feature = "preheat")]
+/// Implements methods for validating the request.
+impl PreheatImageRequest {
+    /// Validates the request parameters.
+    fn validate(&self) -> Result<()> {
+        if self.replicas == 0 {
+            return Err(Error::InvalidArgument(
+                "replicas must be positive".to_string(),
+            ));
+        }
+
+        if self.concurrent_task_count == 0 {
+            return Err(Error::InvalidArgument(
+                "concurrent task count must be positive".to_string(),
+            ));
+        }
+
+        Ok(())
     }
 }
 
@@ -347,7 +431,10 @@ pub struct PreheatRequest {
     /// Refer to https://github.com/dragonflyoss/api/blob/main/proto/common.proto#L67
     pub priority: Option<i32>,
 
-    /// The timeout of the request, default is 300s.
+    /// The number of seed peers serving the task, default is 2.
+    pub replicas: usize,
+
+    /// The timeout of the request, default is 30 minutes.
     pub timeout: Duration,
 
     /// The client certificates for the request.
@@ -368,9 +455,24 @@ impl Default for PreheatRequest {
             content_for_calculating_task_id: None,
             enable_task_id_based_blob_digest: true,
             priority: None,
-            timeout: Duration::from_secs(300),
+            replicas: DEFAULT_REPLICAS,
+            timeout: DEFAULT_REQUEST_TIMEOUT,
             client_cert: None,
         }
+    }
+}
+
+/// Implements methods for validating the request.
+impl PreheatRequest {
+    /// Validates the request parameters.
+    fn validate(&self) -> Result<()> {
+        if self.replicas == 0 {
+            return Err(Error::InvalidArgument(
+                "replicas must be positive".to_string(),
+            ));
+        }
+
+        Ok(())
     }
 }
 
@@ -391,7 +493,9 @@ impl Factory<String, ClientWithMiddleware> for HTTPClientFactory {
             .hickory_dns(true)
             .danger_accept_invalid_certs(true)
             .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             .tcp_keepalive(KEEP_ALIVE_INTERVAL)
+            .connect_timeout(CONNECT_TIMEOUT)
             .proxy(reqwest::Proxy::all(proxy_addr).map_err(|err| {
                 Error::Internal(format!("failed to set proxy {proxy_addr}: {err}"))
             })?)
@@ -510,10 +614,12 @@ impl Builder {
         let proxy = Proxy {
             seed_peer_selector,
             max_retries: self.max_retries,
-            client_pool: PoolBuilder::new(HTTPClientFactory::default())
-                .capacity(DEFAULT_CLIENT_POOL_CAPACITY)
-                .idle_timeout(DEFAULT_CLIENT_POOL_IDLE_TIMEOUT)
-                .build(),
+            client_pool: Arc::new(
+                PoolBuilder::new(HTTPClientFactory::default())
+                    .capacity(DEFAULT_CLIENT_POOL_CAPACITY)
+                    .idle_timeout(DEFAULT_CLIENT_POOL_IDLE_TIMEOUT)
+                    .build(),
+            ),
             id_generator: Arc::new(id_generator),
         };
 
@@ -549,6 +655,7 @@ impl Builder {
 }
 
 /// The HTTP proxy client that sends requests via Dragonfly.
+#[derive(Clone)]
 pub struct Proxy {
     /// The selector service for selecting seed peers.
     seed_peer_selector: Arc<SeedPeerSelector>,
@@ -557,7 +664,7 @@ pub struct Proxy {
     max_retries: u8,
 
     /// The pool of clients.
-    client_pool: Pool<String, String, ClientWithMiddleware, HTTPClientFactory>,
+    client_pool: Arc<Pool<String, String, ClientWithMiddleware, HTTPClientFactory>>,
 
     /// The task id generator.
     id_generator: Arc<IDGenerator>,
@@ -586,21 +693,35 @@ impl Request for Proxy {
     ///
     /// This method is designed for scenarios where the response body is expected to be processed as a
     /// stream, allowing efficient handling of large or continuous data. The response includes metadata
-    /// such as status codes and headers, along with a streaming `Body` for accessing the response content.
+    /// such as status codes and headers, along with a streaming `Body` of `Bytes` chunks
+    /// for accessing the response content.
     async fn get(&self, request: &GetRequest) -> Result<GetResponse> {
-        let response = self.try_send(request).await?;
-        let header = response.headers().clone();
-        let status_code = response.status();
-        let reader = Box::new(StreamReader::new(
-            response.bytes_stream().map_err(IOError::other),
-        ));
+        request.validate()?;
 
-        Ok(GetResponse {
-            success: status_code.is_success(),
-            header,
-            status_code: Some(status_code),
-            reader: Some(reader),
-        })
+        let get = async {
+            let response = self.try_send(request).await?;
+            let header = response.headers().clone();
+            let status_code = response.status();
+            let body: Body = Box::new(
+                response
+                    .bytes_stream()
+                    .map_err(|err| Error::Internal(err.to_string())),
+            );
+
+            Ok(GetResponse {
+                success: status_code.is_success(),
+                header,
+                status_code: Some(status_code),
+                body: Some(body),
+            })
+        };
+
+        // The timeout covers sending the request and receiving the response
+        // headers; reading the body stream is covered by the request timeout
+        // set in send.
+        tokio::time::timeout(request.timeout, get)
+            .await
+            .map_err(|err| Error::RequestTimeout(err.to_string()))?
     }
 
     /// Sends an GET request to a remote server via the Dragonfly and writes the response
@@ -611,24 +732,123 @@ impl Request for Proxy {
     /// `BytesMut` buffer is used to store the response content, and the response metadata (e.g., status
     /// and headers) is returned separately.
     async fn get_into(&self, request: &GetRequest, buf: &mut BytesMut) -> Result<GetResponse> {
+        request.validate()?;
+
         let get_into = async {
-            let response = self.try_send(request).await?;
+            let mut response = self.try_send(request).await?;
             let status = response.status();
             let header = response.headers().clone();
 
             if status.is_success() {
-                let bytes = response.bytes().await.map_err(|err| {
-                    Error::Internal(format!("failed to read response body: {err}"))
-                })?;
+                // Reserve the capacity upfront and copy each chunk into the buffer
+                // directly, without aggregating the whole body first.
+                if let Some(content_length) = response.content_length() {
+                    buf.reserve(content_length as usize);
+                }
 
-                buf.extend_from_slice(&bytes);
+                while let Some(chunk) = response.chunk().await.map_err(|err| {
+                    if err.is_timeout() {
+                        return Error::RequestTimeout(err.to_string());
+                    }
+
+                    Error::Internal(format!("failed to read response body: {err}"))
+                })? {
+                    buf.extend_from_slice(&chunk);
+                }
             }
 
             Ok(GetResponse {
                 success: status.is_success(),
                 header,
                 status_code: Some(status),
-                reader: None,
+                body: None,
+            })
+        };
+
+        // Apply timeout which will properly cancel the operation when timeout is reached.
+        tokio::time::timeout(request.timeout, get_into)
+            .await
+            .map_err(|err| Error::RequestTimeout(err.to_string()))?
+    }
+
+    /// Sends an GET request to a remote server via the given seed peer endpoints of the
+    /// Dragonfly (e.g., the ones returned by `lookup_endpoints`), instead of selecting
+    /// seed peers by the consistent hash ring. The request is sent to a randomly picked
+    /// endpoint and retried on the others up to the max retries of the proxy, and
+    /// returns a response with a streaming body.
+    async fn get_with_endpoints(
+        &self,
+        endpoints: &[String],
+        request: &GetRequest,
+    ) -> Result<GetResponse> {
+        request.validate()?;
+
+        let get = async {
+            let response = self.send_with_endpoints(endpoints, request).await?;
+            let header = response.headers().clone();
+            let status_code = response.status();
+            let body: Body = Box::new(
+                response
+                    .bytes_stream()
+                    .map_err(|err| Error::Internal(err.to_string())),
+            );
+
+            Ok(GetResponse {
+                success: status_code.is_success(),
+                header,
+                status_code: Some(status_code),
+                body: Some(body),
+            })
+        };
+
+        // The timeout covers sending the request and receiving the response
+        // headers; reading the body stream is covered by the request timeout
+        // set in send.
+        tokio::time::timeout(request.timeout, get)
+            .await
+            .map_err(|err| Error::RequestTimeout(err.to_string()))?
+    }
+
+    /// Sends an GET request to a remote server via the given seed peer endpoints of the
+    /// Dragonfly and writes the response body directly into the provided buffer. The
+    /// request is sent to a randomly picked endpoint and retried on the others up to
+    /// the max retries of the proxy.
+    async fn get_into_with_endpoints(
+        &self,
+        endpoints: &[String],
+        request: &GetRequest,
+        buf: &mut BytesMut,
+    ) -> Result<GetResponse> {
+        request.validate()?;
+
+        let get_into = async {
+            let mut response = self.send_with_endpoints(endpoints, request).await?;
+            let status = response.status();
+            let header = response.headers().clone();
+
+            if status.is_success() {
+                // Reserve the capacity upfront and copy each chunk into the buffer
+                // directly, without aggregating the whole body first.
+                if let Some(content_length) = response.content_length() {
+                    buf.reserve(content_length as usize);
+                }
+
+                while let Some(chunk) = response.chunk().await.map_err(|err| {
+                    if err.is_timeout() {
+                        return Error::RequestTimeout(err.to_string());
+                    }
+
+                    Error::Internal(format!("failed to read response body: {err}"))
+                })? {
+                    buf.extend_from_slice(&chunk);
+                }
+            }
+
+            Ok(GetResponse {
+                success: status.is_success(),
+                header,
+                status_code: Some(status),
+                body: None,
             })
         };
 
@@ -644,13 +864,13 @@ impl Request for Proxy {
     /// the seed client before actual consumption, ensuring faster subsequent access across the
     /// cluster. It parses the image reference, authenticates with the OCI registry, resolves
     /// the image manifest (including multi-platform image indexes), and triggers the seed
-    /// client to download each blob (config and layers), without streaming the blob content
-    /// back to the client.
+    /// client to download each blob (config and layers).
     #[cfg(feature = "preheat")]
     async fn preheat_image(&self, request: &PreheatImageRequest) -> Result<()> {
-        let oci_client = Self::oci_client(request.platform.clone())?;
+        request.validate()?;
 
         // Parse image reference.
+        let oci_client = Self::oci_client(request.platform.clone())?;
         let reference: Reference = request
             .image
             .parse()
@@ -696,12 +916,17 @@ impl Request for Proxy {
 
         let registry = reference.resolve_registry();
         let repository = reference.repository();
+
+        // Preheat the blobs concurrently, limited by the concurrent task count.
+        let semaphore = Arc::new(Semaphore::new(request.concurrent_task_count));
+        let mut join_set: JoinSet<Result<()>> = JoinSet::new();
         for digest in std::iter::once(&manifest.config.digest)
             .chain(manifest.layers.iter().map(|layer| &layer.digest))
         {
-            let url = Self::build_blob_url(registry, repository, digest);
-            let request = PreheatRequest {
-                url: url.clone(),
+            let semaphore = semaphore.clone();
+            let proxy = self.clone();
+            let preheat_request = PreheatRequest {
+                url: Self::build_blob_url(registry, repository, digest),
                 header: header.clone(),
                 piece_length: request.piece_length,
                 tag: request.tag.clone(),
@@ -710,25 +935,44 @@ impl Request for Proxy {
                 content_for_calculating_task_id: request.content_for_calculating_task_id.clone(),
                 enable_task_id_based_blob_digest: request.enable_task_id_based_blob_digest,
                 priority: request.priority,
+                replicas: request.replicas,
                 timeout: request.timeout,
                 client_cert: request.client_cert.clone(),
             };
 
-            self.preheat(&request).await?;
-            debug!("preheated blob: {}", url);
+            join_set.spawn(
+                async move {
+                    let _permit = semaphore
+                        .acquire()
+                        .await
+                        .map_err(|err| Error::Internal(err.to_string()))?;
+
+                    proxy.preheat(&preheat_request).await?;
+                    debug!("preheated blob: {}", preheat_request.url);
+                    Ok(())
+                }
+                .in_current_span(),
+            );
+        }
+
+        // Wait for the preheats to finish.
+        while let Some(result) = join_set.join_next().await {
+            result.map_err(|err| Error::Internal(err.to_string()))??;
         }
 
         debug!("preheat completed for image: {}", request.image);
         Ok(())
     }
 
-    /// Preheats a file by downloading it to the seed peers via the Dragonfly.
+    /// Preheats a file by downloading it to the replicas of seed peers via the Dragonfly.
     ///
     /// This method is designed for scenarios where file content needs to be pre-cached in
     /// the seed client before actual consumption, ensuring faster subsequent access across
-    /// the cluster. It triggers the selected seed peers to download the file by the dfdaemon
-    /// download task API, without streaming the file content back to the client.
+    /// the cluster. It triggers every replica seed peer to download the file by the
+    /// dfdaemon download task API.
     async fn preheat(&self, request: &PreheatRequest) -> Result<()> {
+        request.validate()?;
+
         // Generate task id for selecting seed peer.
         let task_id = self
             .id_generator
@@ -753,13 +997,21 @@ impl Request for Proxy {
         // Select seed peers for downloading.
         let seed_peers = self
             .seed_peer_selector
-            .select(task_id.clone(), self.max_retries as u32)
+            .select(task_id.clone(), request.replicas as u32)
             .await
             .map_err(|err| {
                 Error::Internal(format!("failed to select seed peers from scheduler: {err}"))
             })?;
 
         debug!("task {} selected seed peers: {:?}", task_id, seed_peers);
+
+        if seed_peers.len() < request.replicas {
+            return Err(Error::Internal(format!(
+                "insufficient seed peers for {} replicas, {} available",
+                request.replicas,
+                seed_peers.len()
+            )));
+        }
 
         // Construct the download task request for preheating.
         let download_task_request = DownloadTaskRequest {
@@ -784,74 +1036,74 @@ impl Request for Proxy {
             }),
         };
 
-        for (index, peer) in seed_peers.iter().enumerate() {
+        // Trigger every replica seed peer to download the task concurrently and
+        // wait for the download tasks to finish, without streaming the file
+        // content back to the client.
+        let mut join_set: JoinSet<Result<()>> = JoinSet::new();
+        for peer in seed_peers.iter() {
             let addr = format_url(
                 "http",
                 IpAddr::from_str(&peer.ip).map_err(|err| Error::Internal(err.to_string()))?,
                 peer.port as u16,
             );
 
-            // Trigger the seed peer to download the task and wait for the download task
-            // to finish, without streaming the file content back to the client.
-            let download_task = async {
-                let channel = Channel::from_shared(addr.clone())
-                    .map_err(|err| Error::InvalidArgument(err.to_string()))?
-                    .connect_timeout(request.timeout)
-                    .timeout(request.timeout)
-                    .connect()
-                    .await
-                    .map_err(|err| {
-                        Error::Internal(format!("failed to connect to seed peer {addr}: {err}"))
-                    })?;
+            let task_id = task_id.clone();
+            let download_task_request = download_task_request.clone();
+            let timeout = request.timeout;
+            join_set.spawn(
+                async move {
+                    let channel = Channel::from_shared(addr.clone())
+                        .map_err(|err| Error::InvalidArgument(err.to_string()))?
+                        .connect_timeout(timeout)
+                        .timeout(timeout)
+                        .connect()
+                        .await
+                        .map_err(|err| {
+                            Error::Internal(format!("failed to connect to seed peer {addr}: {err}"))
+                        })?;
 
-                let mut client = DfdaemonUploadGRPCClient::new(channel)
-                    .max_decoding_message_size(usize::MAX)
-                    .max_encoding_message_size(usize::MAX);
+                    let mut client = DfdaemonUploadGRPCClient::new(channel)
+                        .max_decoding_message_size(usize::MAX)
+                        .max_encoding_message_size(usize::MAX);
 
-                let mut response = client
-                    .download_task(download_task_request.clone())
-                    .await
-                    .map_err(|err| {
-                        Error::Internal(format!("failed to download task {task_id}: {err}"))
-                    })?
-                    .into_inner();
+                    let mut response = client
+                        .download_task(download_task_request)
+                        .await
+                        .map_err(|err| {
+                            Error::Internal(format!("failed to download task {task_id}: {err}"))
+                        })?
+                        .into_inner();
 
-                while response
-                    .message()
-                    .await
-                    .map_err(|err| {
-                        Error::Internal(format!("failed to download task {task_id}: {err}"))
-                    })?
-                    .is_some()
-                {}
+                    while response
+                        .message()
+                        .await
+                        .map_err(|err| {
+                            Error::Internal(format!("failed to download task {task_id}: {err}"))
+                        })?
+                        .is_some()
+                    {}
 
-                Ok(())
-            };
-
-            match download_task.await {
-                Ok(()) => return Ok(()),
-                Err(err) => {
-                    error!(
-                        "failed to download task {} from seed peer {}: {}",
-                        task_id, addr, err
-                    );
-
-                    // If this is the last seed peer, return the error.
-                    if index == seed_peers.len() - 1 {
-                        return Err(err);
-                    }
+                    Ok(())
                 }
-            }
+                .in_current_span(),
+            );
         }
 
-        Err(Error::Internal(
-            "failed to download task from any seed peer".to_string(),
-        ))
+        // Wait for the download tasks on every replica seed peer to finish.
+        while let Some(result) = join_set.join_next().await {
+            result.map_err(|err| Error::Internal(err.to_string()))??;
+        }
+
+        Ok(())
     }
 
     /// Looks up the endpoints of the seed peers serving the request, in the consistent
-    /// hash ring selection order for the request's task id.
+    /// hash ring selection order for the request's task id. It returns up to the
+    /// replicas of the request distinct endpoints, clamped to the number of available
+    /// seed peers.
     async fn lookup_endpoints(&self, request: &GetRequest) -> Result<Vec<String>> {
+        request.validate()?;
+
         // Generate task id for selecting seed peer.
         let task_id = self
             .id_generator
@@ -876,7 +1128,7 @@ impl Request for Proxy {
         // Select seed peers for downloading.
         let seed_peers = self
             .seed_peer_selector
-            .select(task_id.clone(), self.max_retries as u32)
+            .select(task_id.clone(), request.replicas as u32)
             .await
             .map_err(|err| {
                 Error::Internal(format!("failed to select seed peers from scheduler: {err}"))
@@ -898,11 +1150,9 @@ impl Request for Proxy {
 
 /// Implements proxy request logic.
 impl Proxy {
-    /// Creates reqwest clients with proxy configuration for the given request.
-    async fn client_entries(
-        &self,
-        request: &GetRequest,
-    ) -> Result<Vec<Entry<ClientWithMiddleware>>> {
+    /// Looks up the proxy endpoints of the seed peers serving the request, in the
+    /// consistent hash ring selection order.
+    async fn lookup_proxy_endpoints(&self, request: &GetRequest) -> Result<Vec<String>> {
         // Generate task id for selecting seed peer.
         let task_id = self
             .id_generator
@@ -927,7 +1177,7 @@ impl Proxy {
         // Select seed peers for downloading.
         let seed_peers = self
             .seed_peer_selector
-            .select(task_id.clone(), self.max_retries as u32)
+            .select(task_id.clone(), request.replicas as u32)
             .await
             .map_err(|err| {
                 Error::Internal(format!("failed to select seed peers from scheduler: {err}"))
@@ -935,51 +1185,61 @@ impl Proxy {
 
         debug!("task {} selected seed peers: {:?}", task_id, seed_peers);
 
-        let mut client_entries = Vec::with_capacity(seed_peers.len());
+        let mut endpoints = Vec::with_capacity(seed_peers.len());
         for peer in seed_peers.iter() {
             // TODO(chlins): Support client https scheme.
-            let addr = format_url(
+            endpoints.push(format_url(
                 "http",
                 IpAddr::from_str(&peer.ip).map_err(|err| Error::Internal(err.to_string()))?,
                 peer.proxy_port as u16,
-            );
-            let client_entry = self.client_pool.entry(&addr, &addr).await?;
-            client_entries.push(client_entry);
-        }
-
-        Ok(client_entries)
-    }
-
-    /// Private helper to process requests and handle response headers with retries.
-    async fn try_send(&self, request: &GetRequest) -> Result<reqwest::Response> {
-        // Create client and send the request.
-        let entries = self.client_entries(request).await?;
-        if entries.is_empty() {
-            return Err(Error::Internal(
-                "no available client entries to send request".to_string(),
             ));
         }
 
-        for (index, entry) in entries.iter().enumerate() {
-            match self.send(entry, request).await {
+        Ok(endpoints)
+    }
+
+    /// Scatters the request across the given seed peer endpoints: it tries randomly
+    /// picked endpoints one by one, limited by the max retries of the proxy.
+    async fn send_with_endpoints(
+        &self,
+        endpoints: &[String],
+        request: &GetRequest,
+    ) -> Result<reqwest::Response> {
+        if endpoints.is_empty() {
+            return Err(Error::InvalidArgument(
+                "no endpoints to send request".to_string(),
+            ));
+        }
+
+        // Scatter the request across the endpoints: shuffle them and make
+        // 1 + max retries attempts, wrapping around when the endpoints are
+        // fewer than the attempts.
+        let mut shuffled: Vec<&String> = endpoints.iter().collect();
+        shuffled.shuffle(&mut rand::rng());
+
+        let mut last_err = None;
+        for attempt in 0..(self.max_retries as usize + 1) {
+            let endpoint = shuffled[attempt % shuffled.len()];
+            let entry = self.client_pool.entry(endpoint, endpoint).await?;
+            match self.send(&entry, request).await {
                 Ok(response) => return Ok(response),
                 Err(err) => {
-                    error!(
-                        "failed to send request to client entry {:?}: {:?}",
-                        entry.client, err
-                    );
-
-                    // If this is the last entry, return the error.
-                    if index == entries.len() - 1 {
-                        return Err(err);
-                    }
+                    warn!("failed to send request to endpoint {}: {:?}", endpoint, err);
+                    last_err = Some(err);
                 }
             }
         }
 
-        Err(Error::Internal(
-            "failed to send request to any client entry".to_string(),
-        ))
+        Err(last_err.unwrap_or_else(|| {
+            Error::Internal("failed to send request to any endpoint".to_string())
+        }))
+    }
+
+    /// Scatters the request across the seed peers serving it and returns the first
+    /// successful response.
+    async fn try_send(&self, request: &GetRequest) -> Result<reqwest::Response> {
+        let endpoints = self.lookup_proxy_endpoints(request).await?;
+        self.send_with_endpoints(&endpoints, request).await
     }
 
     /// Send a request to the specified URL via client entry with the given headers.
@@ -992,11 +1252,16 @@ impl Proxy {
         let response = entry
             .client
             .get(&request.url)
-            .headers(headers.clone())
+            .headers(headers)
             .timeout(request.timeout)
             .send()
             .await
-            .map_err(|err| Error::Internal(err.to_string()))?;
+            .map_err(|err| match err {
+                reqwest_middleware::Error::Reqwest(err) if err.is_timeout() => {
+                    Error::RequestTimeout(err.to_string())
+                }
+                err => Error::Internal(err.to_string()),
+            })?;
 
         let status = response.status();
         if status.is_success() {
@@ -1166,8 +1431,8 @@ mod tests {
     use tonic_health::pb::health_check_response::ServingStatus;
     use tonic_health::pb::HealthCheckResponse;
 
-    // Mock scheduler service for testing, which returns the given hosts as seed peers.
     async fn setup_mock_scheduler(hosts: Vec<Host>) -> Result<mocktail::server::MockServer> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let mut mocks = MockSet::new();
         mocks.mock(|when, then| {
             when.path("/scheduler.v2.Scheduler/ListHosts");
@@ -1182,8 +1447,6 @@ mod tests {
         Ok(server)
     }
 
-    // Mock seed peer service for testing, which responds to health checks from the
-    // seed peer selector and serves download task requests with the given mocks.
     async fn setup_mock_seed_peer(mut mocks: MockSet) -> Result<mocktail::server::MockServer> {
         mocks.mock(|when, then| {
             when.path("/grpc.health.v1.Health/Check");
@@ -1200,17 +1463,26 @@ mod tests {
         Ok(server)
     }
 
-    // Creates a seed peer host pointing at the mock seed peer server.
-    fn create_seed_peer_host(name: &str, port: u16) -> Host {
+    fn create_seed_peer_host(name: &str, port: u16, proxy_port: u16) -> Host {
         Host {
             id: name.to_string(),
             r#type: 1,
             hostname: name.to_string(),
             ip: "127.0.0.1".to_string(),
             port: port as i32,
+            proxy_port: proxy_port as i32,
             name: name.to_string(),
             ..Default::default()
         }
+    }
+
+    async fn setup_mock_seed_peer_proxy(mocks: MockSet) -> Result<mocktail::server::MockServer> {
+        let server = MockServer::new_http("seed-peer-proxy").with_mocks(mocks);
+        server.start().await.map_err(|err| {
+            Error::Internal(format!("failed to start mock seed peer proxy: {err}"))
+        })?;
+
+        Ok(server)
     }
 
     #[tokio::test]
@@ -1281,6 +1553,7 @@ mod tests {
             url: "http://example.com/payload.txt".to_string(),
             tag: Some("preheat".to_string()),
             application: Some("dfctl".to_string()),
+            replicas: 1,
             ..Default::default()
         };
 
@@ -1292,7 +1565,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_preheat_succeeds_with_seed_peer() {
-        // The seed peer serves the download task request with a streaming response.
         let mut mocks = MockSet::new();
         mocks.mock(|when, then| {
             when.path("/dfdaemon.v2.DfdaemonUpload/DownloadTask");
@@ -1316,6 +1588,7 @@ mod tests {
         let mock_scheduler = setup_mock_scheduler(vec![create_seed_peer_host(
             "seed-peer-1",
             mock_seed_peer.port().unwrap(),
+            0,
         )])
         .await
         .unwrap();
@@ -1331,6 +1604,7 @@ mod tests {
             url: "http://example.com/payload.txt".to_string(),
             tag: Some("preheat".to_string()),
             application: Some("dfctl".to_string()),
+            replicas: 1,
             ..Default::default()
         };
 
@@ -1338,12 +1612,335 @@ mod tests {
         assert!(result.is_ok(), "preheat should succeed: {:?}", result.err());
     }
 
-    // Asserts the fixed endpoint selection vectors shared with the Go test suite
-    // (client-request/go/request_test.go). Both sides must produce the same
-    // outputs; do not change one without the other.
+    #[tokio::test]
+    async fn test_preheat_insufficient_seed_peers() {
+        let mock_seed_peer = setup_mock_seed_peer(MockSet::new()).await.unwrap();
+        let mock_scheduler = setup_mock_scheduler(vec![create_seed_peer_host(
+            "seed-peer-1",
+            mock_seed_peer.port().unwrap(),
+            0,
+        )])
+        .await
+        .unwrap();
+
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let request = PreheatRequest {
+            url: "http://example.com/payload.txt".to_string(),
+            ..Default::default()
+        };
+
+        let result = proxy.preheat(&request).await;
+        assert!(
+            matches!(result, Err(Error::Internal(message)) if message.contains("insufficient seed peers"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get() {
+        let mut mocks = MockSet::new();
+        mocks.mock(|when, then| {
+            when.get().path("/file.txt");
+            then.text("hello dragonfly");
+        });
+        let mock_proxy = setup_mock_seed_peer_proxy(mocks).await.unwrap();
+
+        let mock_seed_peer = setup_mock_seed_peer(MockSet::new()).await.unwrap();
+        let mock_scheduler = setup_mock_scheduler(vec![create_seed_peer_host(
+            "seed-peer-1",
+            mock_seed_peer.port().unwrap(),
+            mock_proxy.port().unwrap(),
+        )])
+        .await
+        .unwrap();
+
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let request = GetRequest {
+            url: "http://example.com/file.txt".to_string(),
+            replicas: 1,
+            ..Default::default()
+        };
+
+        let response = proxy.get(&request).await.unwrap();
+        assert!(response.success);
+        assert_eq!(response.status_code, Some(reqwest::StatusCode::OK));
+
+        let mut body = response.body.unwrap();
+        let mut content = Vec::new();
+        while let Some(chunk) = body.try_next().await.unwrap() {
+            content.extend_from_slice(&chunk);
+        }
+        assert_eq!(content, b"hello dragonfly");
+    }
+
+    #[tokio::test]
+    async fn test_get_into() {
+        let mut mocks = MockSet::new();
+        mocks.mock(|when, then| {
+            when.get().path("/file.txt");
+            then.text("hello dragonfly");
+        });
+        let mock_proxy = setup_mock_seed_peer_proxy(mocks).await.unwrap();
+
+        let mock_seed_peer = setup_mock_seed_peer(MockSet::new()).await.unwrap();
+        let mock_scheduler = setup_mock_scheduler(vec![create_seed_peer_host(
+            "seed-peer-1",
+            mock_seed_peer.port().unwrap(),
+            mock_proxy.port().unwrap(),
+        )])
+        .await
+        .unwrap();
+
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let request = GetRequest {
+            url: "http://example.com/file.txt".to_string(),
+            replicas: 1,
+            ..Default::default()
+        };
+
+        let mut buf = BytesMut::new();
+        let response = proxy.get_into(&request, &mut buf).await.unwrap();
+        assert!(response.success);
+        assert_eq!(response.status_code, Some(reqwest::StatusCode::OK));
+        assert!(response.body.is_none());
+        assert_eq!(&buf[..], b"hello dragonfly");
+    }
+
+    #[tokio::test]
+    async fn test_get_scatters_across_replicas() {
+        let mut bad_mocks = MockSet::new();
+        bad_mocks.mock(|when, then| {
+            when.get().path("/file.txt");
+            then.status(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+                .text("boom");
+        });
+        let bad_proxy = setup_mock_seed_peer_proxy(bad_mocks).await.unwrap();
+
+        let mut good_mocks = MockSet::new();
+        good_mocks.mock(|when, then| {
+            when.get().path("/file.txt");
+            then.text("ok");
+        });
+        let good_proxy = setup_mock_seed_peer_proxy(good_mocks).await.unwrap();
+
+        let seed_peer_1 = setup_mock_seed_peer(MockSet::new()).await.unwrap();
+        let seed_peer_2 = setup_mock_seed_peer(MockSet::new()).await.unwrap();
+        let mock_scheduler = setup_mock_scheduler(vec![
+            create_seed_peer_host(
+                "seed-peer-1",
+                seed_peer_1.port().unwrap(),
+                bad_proxy.port().unwrap(),
+            ),
+            create_seed_peer_host(
+                "seed-peer-2",
+                seed_peer_2.port().unwrap(),
+                good_proxy.port().unwrap(),
+            ),
+        ])
+        .await
+        .unwrap();
+
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let request = GetRequest {
+            url: "http://example.com/file.txt".to_string(),
+            ..Default::default()
+        };
+
+        let mut buf = BytesMut::new();
+        let response = proxy.get_into(&request, &mut buf).await.unwrap();
+        assert!(response.success);
+        assert_eq!(&buf[..], b"ok");
+    }
+
+    #[tokio::test]
+    async fn test_get_error_type_backend() {
+        let mut mocks = MockSet::new();
+        mocks.mock(|when, then| {
+            when.get().path("/file.txt");
+            then.status(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+                .headers([("X-Dragonfly-Error-Type", "backend")])
+                .text("boom");
+        });
+        let mock_proxy = setup_mock_seed_peer_proxy(mocks).await.unwrap();
+
+        let mock_seed_peer = setup_mock_seed_peer(MockSet::new()).await.unwrap();
+        let mock_scheduler = setup_mock_scheduler(vec![create_seed_peer_host(
+            "seed-peer-1",
+            mock_seed_peer.port().unwrap(),
+            mock_proxy.port().unwrap(),
+        )])
+        .await
+        .unwrap();
+
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let request = GetRequest {
+            url: "http://example.com/file.txt".to_string(),
+            replicas: 1,
+            ..Default::default()
+        };
+
+        let result = proxy.get(&request).await;
+        assert!(
+            matches!(result, Err(Error::BackendError(err)) if err.message.as_deref() == Some("boom"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_with_endpoints_empty() {
+        let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let request = GetRequest {
+            url: "http://example.com/file.txt".to_string(),
+            ..Default::default()
+        };
+
+        let result = proxy.get_with_endpoints(&[], &request).await;
+        assert!(matches!(result, Err(Error::InvalidArgument(_))));
+    }
+
+    #[tokio::test]
+    async fn test_get_invalid_replicas() {
+        let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let request = GetRequest {
+            url: "http://example.com/file.txt".to_string(),
+            replicas: 0,
+            ..Default::default()
+        };
+
+        let result = proxy.get(&request).await;
+        assert!(matches!(result, Err(Error::InvalidArgument(_))));
+    }
+
+    #[tokio::test]
+    async fn test_preheat_and_get_hit_same_seed_peers() {
+        let cases = [
+            ("http://example.com/replicas-1.txt", 1, vec!["seed-peer-1"]),
+            (
+                "http://example.com/replicas-2.txt",
+                2,
+                vec!["seed-peer-1", "seed-peer-2"],
+            ),
+            (
+                "http://example.com/replicas-3.txt",
+                3,
+                vec!["seed-peer-1", "seed-peer-2", "seed-peer-3"],
+            ),
+        ];
+
+        for (url, replicas, expected) in cases {
+            let path = url.strip_prefix("http://example.com").unwrap();
+            let mut hosts = Vec::new();
+            let mut servers = Vec::new();
+            for name in ["seed-peer-1", "seed-peer-2", "seed-peer-3"] {
+                let mut mocks = MockSet::new();
+                if expected.contains(&name) {
+                    mocks.mock(|when, then| {
+                        when.path("/dfdaemon.v2.DfdaemonUpload/DownloadTask");
+                        then.pb_stream(vec![DownloadTaskResponse {
+                            host_id: name.to_string(),
+                            task_id: "task-1".to_string(),
+                            peer_id: "peer-1".to_string(),
+                            ..Default::default()
+                        }]);
+                    });
+                }
+                let seed_peer = setup_mock_seed_peer(mocks).await.unwrap();
+
+                let mut proxy_mocks = MockSet::new();
+                proxy_mocks.mock(|when, then| {
+                    when.get().path(path);
+                    then.text(name);
+                });
+                let seed_peer_proxy = setup_mock_seed_peer_proxy(proxy_mocks).await.unwrap();
+
+                hosts.push(create_seed_peer_host(
+                    name,
+                    seed_peer.port().unwrap(),
+                    seed_peer_proxy.port().unwrap(),
+                ));
+                servers.push(seed_peer);
+                servers.push(seed_peer_proxy);
+            }
+
+            let mock_scheduler = setup_mock_scheduler(hosts).await.unwrap();
+            let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+            let proxy = Proxy::builder()
+                .scheduler_endpoint(scheduler_endpoint)
+                .build()
+                .await
+                .unwrap();
+
+            let preheat_request = PreheatRequest {
+                url: url.to_string(),
+                replicas,
+                ..Default::default()
+            };
+            proxy.preheat(&preheat_request).await.unwrap();
+
+            let mut served = std::collections::HashSet::new();
+            for _ in 0..10 {
+                let request = GetRequest {
+                    url: url.to_string(),
+                    replicas,
+                    ..Default::default()
+                };
+
+                let mut buf = BytesMut::new();
+                let response = proxy.get_into(&request, &mut buf).await.unwrap();
+                assert!(response.success);
+                served.insert(String::from_utf8(buf.to_vec()).unwrap());
+            }
+
+            let expected: std::collections::HashSet<String> =
+                expected.iter().map(|name| name.to_string()).collect();
+            assert_eq!(served, expected);
+        }
+    }
+
     #[tokio::test]
     async fn test_lookup_endpoints() {
-        // Start a mock seed peer for each name and record its endpoint.
         let mut servers = Vec::new();
         let mut endpoints = std::collections::HashMap::new();
         let mut hosts = Vec::new();
@@ -1351,7 +1948,7 @@ mod tests {
             let server = setup_mock_seed_peer(MockSet::new()).await.unwrap();
             let port = server.port().unwrap();
             endpoints.insert(name, format!("http://127.0.0.1:{port}"));
-            hosts.push(create_seed_peer_host(name, port));
+            hosts.push(create_seed_peer_host(name, port, 0));
             servers.push(server);
         }
 
@@ -1359,45 +1956,99 @@ mod tests {
         let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
         let proxy = Proxy::builder()
             .scheduler_endpoint(scheduler_endpoint)
-            .max_retries(3)
             .build()
             .await
             .unwrap();
 
+        let blob_url = "http://registry.example.com/v2/library/ubuntu/blobs/sha256:b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e";
         let cases = [
             (
                 GetRequest {
-                    url: "https://example.com/file.txt?Expires=e1&Signature=s1&foo=bar"
-                        .to_string(),
+                    url: "https://example.com/file.txt?Expires=e1&Signature=s1&foo=bar".to_string(),
                     piece_length: Some(4194304),
-                    tag: Some("tag1".to_string()),
-                    application: Some("app1".to_string()),
+                    tag: Some("tag-a".to_string()),
+                    application: Some("app-a".to_string()),
                     filtered_query_params: vec!["Expires".to_string(), "Signature".to_string()],
+                    replicas: 3,
                     ..Default::default()
                 },
-                vec!["seed-peer-1", "seed-peer-3", "seed-peer-1", "seed-peer-2"],
+                vec!["seed-peer-3", "seed-peer-2", "seed-peer-1"],
+            ),
+            (
+                GetRequest {
+                    url: "https://example.com/file.txt?Expires=e2&Signature=s2&foo=bar".to_string(),
+                    piece_length: Some(4194304),
+                    tag: Some("tag-a".to_string()),
+                    application: Some("app-a".to_string()),
+                    filtered_query_params: vec!["Expires".to_string(), "Signature".to_string()],
+                    replicas: 3,
+                    ..Default::default()
+                },
+                vec!["seed-peer-3", "seed-peer-2", "seed-peer-1"],
             ),
             (
                 GetRequest {
                     url: "https://example.com/file.txt".to_string(),
                     ..Default::default()
                 },
-                vec!["seed-peer-1", "seed-peer-2", "seed-peer-2", "seed-peer-1"],
+                vec!["seed-peer-1", "seed-peer-2"],
+            ),
+            (
+                GetRequest {
+                    url: "https://example.com/file.txt".to_string(),
+                    replicas: 1,
+                    ..Default::default()
+                },
+                vec!["seed-peer-1"],
+            ),
+            (
+                GetRequest {
+                    url: "https://example.com/file.txt".to_string(),
+                    tag: Some("tag-a".to_string()),
+                    ..Default::default()
+                },
+                vec!["seed-peer-3", "seed-peer-2"],
+            ),
+            (
+                GetRequest {
+                    url: "https://example.com/file.txt".to_string(),
+                    tag: Some("tag-b".to_string()),
+                    ..Default::default()
+                },
+                vec!["seed-peer-2", "seed-peer-1"],
+            ),
+            (
+                GetRequest {
+                    url: "https://example.com/file.txt".to_string(),
+                    application: Some("app-a".to_string()),
+                    ..Default::default()
+                },
+                vec!["seed-peer-1", "seed-peer-3"],
             ),
             (
                 GetRequest {
                     url: "https://example.com/file.txt".to_string(),
                     content_for_calculating_task_id: Some("This is a test file".to_string()),
+                    replicas: 3,
                     ..Default::default()
                 },
-                vec!["seed-peer-2", "seed-peer-3", "seed-peer-3", "seed-peer-1"],
+                vec!["seed-peer-2", "seed-peer-3", "seed-peer-1"],
             ),
             (
                 GetRequest {
-                    url: "http://registry.example.com/v2/library/ubuntu/blobs/sha256:b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e".to_string(),
+                    url: blob_url.to_string(),
+                    replicas: 3,
                     ..Default::default()
                 },
-                vec!["seed-peer-3", "seed-peer-2", "seed-peer-1", "seed-peer-2"],
+                vec!["seed-peer-3", "seed-peer-2", "seed-peer-1"],
+            ),
+            (
+                GetRequest {
+                    url: blob_url.to_string(),
+                    enable_task_id_based_blob_digest: false,
+                    ..Default::default()
+                },
+                vec!["seed-peer-3", "seed-peer-1"],
             ),
         ];
 
@@ -1433,7 +2084,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_preheat_fails_when_seed_peer_download_fails() {
-        // The seed peer is healthy but fails to serve the download task request.
         let mut mocks = MockSet::new();
         mocks.mock(|when, then| {
             when.path("/dfdaemon.v2.DfdaemonUpload/DownloadTask");
@@ -1444,6 +2094,7 @@ mod tests {
         let mock_scheduler = setup_mock_scheduler(vec![create_seed_peer_host(
             "seed-peer-1",
             mock_seed_peer.port().unwrap(),
+            0,
         )])
         .await
         .unwrap();
@@ -1459,6 +2110,7 @@ mod tests {
             url: "http://example.com/payload.txt".to_string(),
             tag: Some("preheat".to_string()),
             application: Some("dfctl".to_string()),
+            replicas: 1,
             ..Default::default()
         };
 
@@ -1501,7 +2153,6 @@ mod tests {
             .await
             .unwrap();
 
-        // The platform must be in the format "os/arch" (e.g., "linux/amd64").
         let request = PreheatImageRequest {
             image: "docker.io/library/nginx:latest".to_string(),
             platform: Some("linux-amd64".to_string()),
@@ -1525,7 +2176,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Port 1 is reserved and refuses connections, so pulling the manifest fails.
         let request = PreheatImageRequest {
             image: "127.0.0.1:1/library/nginx:latest".to_string(),
             ..Default::default()
@@ -1556,19 +2206,15 @@ mod tests {
             .idle_timeout(Duration::from_secs(600))
             .build();
 
-        // Initially, the pool is empty.
         assert_eq!(pool.size().await, 0);
 
-        // Get a client for the first time. A new client should be created.
         let addr = "http://proxy1.com".to_string();
         let _ = pool.entry(&addr, &addr).await.unwrap();
         assert_eq!(pool.size().await, 1);
 
-        // Get a client for the same proxy again. It should be reused, so the count remains 1.
         let _ = pool.entry(&addr, &addr).await.unwrap();
         assert_eq!(pool.size().await, 1);
 
-        // Get a client for a different proxy. A new client should be created, so the count becomes 2.
         let addr = "http://proxy2.com".to_string();
         let _ = pool.entry(&addr, &addr).await.unwrap();
         assert_eq!(pool.size().await, 2);
@@ -1582,19 +2228,13 @@ mod tests {
             .idle_timeout(Duration::from_millis(10))
             .build();
 
-        // Create a client.
         let addr = "http://proxy1.com".to_string();
         let _ = pool.entry(&addr, &addr).await.unwrap();
         assert_eq!(pool.size().await, 1);
-
-        // Wait for cleanup above client.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Create another client.
         let addr = "http://proxy2.com".to_string();
         let _ = pool.entry(&addr, &addr).await.unwrap();
-
-        // Still should be 1 because the proxy1 client should have been cleaned up.
         assert_eq!(pool.size().await, 1);
     }
 }
