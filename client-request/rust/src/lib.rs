@@ -14,6 +14,10 @@
  * limitations under the License.
  */
 
+//! Request library for the Dragonfly client. It sends requests to remote
+//! servers via the Dragonfly P2P network, supporting streaming and buffered
+//! GET requests and preheating files or OCI images through seed peers.
+
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use dragonfly_api::common::v2::{Download, Priority, TaskType};
