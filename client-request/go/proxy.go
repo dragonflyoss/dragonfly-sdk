@@ -328,12 +328,14 @@ func (p *Proxy) sendWithEndpoints(ctx context.Context, endpoints []string, req *
 	var lastErr error
 	for attempt := range int(p.maxRetries) + 1 {
 		endpoint := shuffled[attempt%len(shuffled)]
-		client, err := p.clientPool.Entry(endpoint, endpoint)
+		entry, err := p.clientPool.Entry(endpoint, endpoint)
 		if err != nil {
 			return nil, err
 		}
 
-		resp, err := p.send(ctx, client, req)
+		guard := entry.RequestGuard()
+		resp, err := p.send(ctx, entry.Client, req)
+		guard.Done()
 		if err != nil {
 			slog.Warn("failed to send request to endpoint", "endpoint", endpoint, "error", err)
 			lastErr = err

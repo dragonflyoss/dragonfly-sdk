@@ -87,6 +87,12 @@ const DEFAULT_CLIENT_POOL_CAPACITY: usize = 128;
 /// scheduler service.
 const DEFAULT_SCHEDULER_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The default timeout(30 minutes) for requests.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// The default number of seed peers serving a task.
+const DEFAULT_REPLICAS: usize = 2;
+
 /// A specialized Result type for the proxy module.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -212,7 +218,7 @@ pub struct GetRequest {
     /// The number of seed peers serving the task, default is 2.
     pub replicas: usize,
 
-    /// The timeout of the request, default is 300s.
+    /// The timeout of the request, default is 30 minutes.
     pub timeout: Duration,
 
     /// The client certificates for the request.
@@ -233,8 +239,8 @@ impl Default for GetRequest {
             content_for_calculating_task_id: None,
             enable_task_id_based_blob_digest: true,
             priority: None,
-            replicas: 2,
-            timeout: Duration::from_secs(300),
+            replicas: DEFAULT_REPLICAS,
+            timeout: DEFAULT_REQUEST_TIMEOUT,
             client_cert: None,
         }
     }
@@ -323,7 +329,7 @@ pub struct PreheatImageRequest {
     /// The number of seed peers serving the task, default is 2.
     pub replicas: usize,
 
-    /// The timeout for each blob download request, default is 300s.
+    /// The timeout for each blob download request, default is 30 minutes.
     pub timeout: Duration,
 
     /// The number of blobs to preheat concurrently, default is 4.
@@ -351,8 +357,8 @@ impl Default for PreheatImageRequest {
             content_for_calculating_task_id: None,
             enable_task_id_based_blob_digest: true,
             priority: None,
-            replicas: 2,
-            timeout: Duration::from_secs(300),
+            replicas: DEFAULT_REPLICAS,
+            timeout: DEFAULT_REQUEST_TIMEOUT,
             concurrent_task_count: 4,
             client_cert: None,
         }
@@ -424,7 +430,7 @@ pub struct PreheatRequest {
     /// The number of seed peers serving the task, default is 2.
     pub replicas: usize,
 
-    /// The timeout of the request, default is 300s.
+    /// The timeout of the request, default is 30 minutes.
     pub timeout: Duration,
 
     /// The client certificates for the request.
@@ -445,8 +451,8 @@ impl Default for PreheatRequest {
             content_for_calculating_task_id: None,
             enable_task_id_based_blob_digest: true,
             priority: None,
-            replicas: 2,
-            timeout: Duration::from_secs(300),
+            replicas: DEFAULT_REPLICAS,
+            timeout: DEFAULT_REQUEST_TIMEOUT,
             client_cert: None,
         }
     }

@@ -201,8 +201,8 @@ func WithGetRequestCertificates(certs []*x509.Certificate) GetRequestOption {
 }
 
 // NewGetRequest returns a GetRequest for the url with default values: the
-// default filtered query params, blob digest based task id enabled and a 600s
-// timeout.
+// default filtered query params, blob digest based task id enabled and a 30
+// minutes timeout.
 func NewGetRequest(url string, opts ...GetRequestOption) *GetRequest {
 	r := &GetRequest{
 		url:                         url,
