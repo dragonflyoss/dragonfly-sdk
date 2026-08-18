@@ -58,19 +58,26 @@ let response = client
 ```
 
 Look up the endpoints of the seed peers serving a request, then download from
-the looked-up endpoints directly, scattering the request across them:
+the looked-up endpoints directly with a `ClientWithEndpoints`, scattering each
+request across them. The client with endpoints never connects to the
+scheduler, so the endpoints can also be provided by an external system:
 
 ```rust
+use dragonfly_client_request::{BuilderWithEndpoints, ClientWithEndpoints};
+
 let request = GetRequest {
     url: "https://example.com/file.txt".to_string(),
     ..Default::default()
 };
 
 let endpoints = client.lookup_endpoints(&request).await?;
-let response = client.get_with_endpoints(&endpoints, &request).await?;
+let client_with_endpoints = BuilderWithEndpoints::default()
+    .endpoints(endpoints)
+    .build()?;
+let response = client_with_endpoints.get(&request).await?;
 
 // Or write the response body directly into a buffer:
-// let response = client.get_into_with_endpoints(&endpoints, &request, &mut buf).await?;
+// let response = client_with_endpoints.get_into(&request, &mut buf).await?;
 ```
 
 The `preheat` feature enables preheating OCI images by resolving manifests from
@@ -78,7 +85,7 @@ the registry and triggering seed peers to download each blob:
 
 ```toml
 [dependencies]
-dragonfly-client-request = { version = "1.5.0", features = ["preheat"] }
+dragonfly-client-request = { version = "1.5.1", features = ["preheat"] }
 ```
 
 See [examples](./examples) for runnable examples.

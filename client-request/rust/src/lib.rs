@@ -38,6 +38,7 @@ use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_tracing::TracingMiddleware;
 use rustls_pki_types::CertificateDer;
 use selector::{SeedPeerSelector, Selector};
+use std::future::Future;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -132,28 +133,6 @@ pub trait Client {
     /// and headers) is returned separately.
     async fn get_into(&self, request: &GetRequest, buf: &mut BytesMut) -> Result<GetResponse>;
 
-    /// Sends an GET request to a remote server via the given seed peer endpoints of the
-    /// Dragonfly (e.g., the ones returned by `lookup_endpoints`), instead of selecting
-    /// seed peers by the consistent hash ring. The request is sent to a randomly picked
-    /// endpoint and retried on the others up to the max retries of the client, and
-    /// returns a response with a streaming body.
-    async fn get_with_endpoints(
-        &self,
-        endpoints: &[String],
-        request: &GetRequest,
-    ) -> Result<GetResponse<Body>>;
-
-    /// Sends an GET request to a remote server via the given seed peer endpoints of the
-    /// Dragonfly and writes the response body directly into the provided buffer. The
-    /// request is sent to a randomly picked endpoint and retried on the others up to
-    /// the max retries of the client.
-    async fn get_into_with_endpoints(
-        &self,
-        endpoints: &[String],
-        request: &GetRequest,
-        buf: &mut BytesMut,
-    ) -> Result<GetResponse>;
-
     /// Preheats an OCI image by downloading all its blobs via the Dragonfly.
     ///
     /// This method is designed for scenarios where OCI image content needs to be pre-cached in
@@ -180,6 +159,29 @@ pub trait Client {
     /// would serve the request without sending it. It returns up to the replicas of the
     /// request distinct endpoints, clamped to the number of available seed peers.
     async fn lookup_endpoints(&self, request: &GetRequest) -> Result<Vec<String>>;
+}
+
+/// Defines the interface for sending requests via the given seed peer endpoints of
+/// the Dragonfly.
+///
+/// This trait enables interaction with remote servers through the seed peer endpoints
+/// given at construction (e.g., the ones returned by `Client::lookup_endpoints`),
+/// instead of selecting seed peers by the consistent hash ring, and never connects to
+/// the scheduler. It is designed for clients whose endpoints are provided by an
+/// external system.
+#[async_trait]
+pub trait ClientWithEndpoints {
+    /// Sends an GET request to a remote server via the seed peer endpoints of the
+    /// client. The request is sent to a randomly picked endpoint and retried on the
+    /// others up to the max retries of the client, and returns a response with a
+    /// streaming body.
+    async fn get(&self, request: &GetRequest) -> Result<GetResponse<Body>>;
+
+    /// Sends an GET request to a remote server via the seed peer endpoints of the
+    /// client and writes the response body directly into the provided buffer. The
+    /// request is sent to a randomly picked endpoint and retried on the others up
+    /// to the max retries of the client.
+    async fn get_into(&self, request: &GetRequest, buf: &mut BytesMut) -> Result<GetResponse>;
 }
 
 /// Represents a GET request to be sent via the Dragonfly.
@@ -601,28 +603,9 @@ impl Builder {
             seed_peer_selector_clone.run().await;
         });
 
-        // Get local IP address and hostname.
-        // In IPv6-only environments, IPv4 detection may fail, so we use a best-effort IPv4->IPv6 fallback.
-        let local_ip = preferred_local_ip()
-            .ok_or_else(|| {
-                Error::Internal("failed to detect a preferred local IP address".to_string())
-            })?
-            .to_string();
-        let hostname = hostname::get()
-            .map_err(|err| Error::Internal(format!("failed to get hostname: {err}")))?
-            .to_string_lossy()
-            .to_string();
-        let id_generator = IDGenerator::new(local_ip, hostname, true);
         Ok(client {
             seed_peer_selector,
-            max_retries: self.max_retries,
-            client_pool: Arc::new(
-                PoolBuilder::new(HTTPClientFactory::default())
-                    .capacity(DEFAULT_CLIENT_POOL_CAPACITY)
-                    .idle_timeout(DEFAULT_CLIENT_POOL_IDLE_TIMEOUT)
-                    .build(),
-            ),
-            id_generator: Arc::new(id_generator),
+            sender: Sender::new(self.max_retries)?,
         })
     }
 
@@ -654,6 +637,69 @@ impl Builder {
     }
 }
 
+/// The builder for the client that sends requests via the given seed peer
+/// endpoints.
+pub struct BuilderWithEndpoints {
+    /// The seed peer endpoints to send requests to.
+    endpoints: Vec<String>,
+
+    /// The number of times to retry a request.
+    max_retries: u8,
+}
+
+/// Implements Default trait.
+impl Default for BuilderWithEndpoints {
+    /// Returns a default BuilderWithEndpoints.
+    fn default() -> Self {
+        Self {
+            endpoints: Vec::new(),
+            max_retries: 1,
+        }
+    }
+}
+
+/// Implements the builder pattern for the client with endpoints.
+impl BuilderWithEndpoints {
+    /// Sets the seed peer endpoints to send requests to.
+    pub fn endpoints(mut self, endpoints: Vec<String>) -> Self {
+        self.endpoints = endpoints;
+        self
+    }
+
+    /// Sets the maximum number of retries.
+    pub fn max_retries(mut self, retries: u8) -> Self {
+        self.max_retries = retries;
+        self
+    }
+
+    /// Builds and returns a client that implements the `ClientWithEndpoints` trait.
+    pub fn build(self) -> Result<impl ClientWithEndpoints> {
+        self.validate()?;
+
+        Ok(clientWithEndpoints {
+            endpoints: self.endpoints,
+            sender: Sender::new(self.max_retries)?,
+        })
+    }
+
+    /// Validates the input parameters.
+    fn validate(&self) -> Result<()> {
+        if self.endpoints.is_empty() {
+            return Err(Error::InvalidArgument(
+                "endpoints must not be empty".to_string(),
+            ));
+        }
+
+        if self.max_retries > 10 {
+            return Err(Error::InvalidArgument(
+                "max retries must be between 0 and 10".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
 /// The HTTP client that sends requests via Dragonfly, implementing the `Client`
 /// trait. The lowercase name intentionally mirrors the unexported `client` struct
 /// of the Go implementation, distinguished from the `Client` trait by case.
@@ -663,14 +709,23 @@ struct client {
     /// The selector service for selecting seed peers.
     seed_peer_selector: Arc<SeedPeerSelector>,
 
-    /// The number of times to retry a request.
-    max_retries: u8,
+    /// The sender that scatters requests across seed peer endpoints.
+    sender: Sender,
+}
 
-    /// The pool of clients.
-    client_pool: Arc<Pool<String, String, ClientWithMiddleware, HTTPClientFactory>>,
+/// The HTTP client that sends requests via the given seed peer endpoints of the
+/// Dragonfly, implementing the `ClientWithEndpoints` trait, without connecting to
+/// the scheduler. The lowercase name intentionally mirrors the unexported
+/// `clientWithEndpoints` struct of the Go implementation, distinguished from the
+/// `ClientWithEndpoints` trait by case.
+#[allow(non_camel_case_types)]
+#[derive(Clone)]
+struct clientWithEndpoints {
+    /// The seed peer endpoints to send requests to.
+    endpoints: Vec<String>,
 
-    /// The task id generator.
-    id_generator: Arc<IDGenerator>,
+    /// The sender that scatters requests across seed peer endpoints.
+    sender: Sender,
 }
 
 /// Implements the interface for sending requests via the Dragonfly.
@@ -692,31 +747,7 @@ impl Client for client {
     /// for accessing the response content.
     async fn get(&self, request: &GetRequest) -> Result<GetResponse> {
         request.validate()?;
-
-        let get = async {
-            let response = self.try_send(request).await?;
-            let header = response.headers().clone();
-            let status_code = response.status();
-            let body: Body = Box::new(
-                response
-                    .bytes_stream()
-                    .map_err(|err| Error::Internal(err.to_string())),
-            );
-
-            Ok(GetResponse {
-                success: status_code.is_success(),
-                header,
-                status_code: Some(status_code),
-                body: Some(body),
-            })
-        };
-
-        // The timeout covers sending the request and receiving the response
-        // headers; reading the body stream is covered by the request timeout
-        // set in send.
-        tokio::time::timeout(request.timeout, get)
-            .await
-            .map_err(|err| Error::RequestTimeout(err.to_string()))?
+        stream_response(self.try_send(request), request.timeout).await
     }
 
     /// Sends an GET request to a remote server via the Dragonfly and writes the response
@@ -728,129 +759,7 @@ impl Client for client {
     /// and headers) is returned separately.
     async fn get_into(&self, request: &GetRequest, buf: &mut BytesMut) -> Result<GetResponse> {
         request.validate()?;
-
-        let get_into = async {
-            let mut response = self.try_send(request).await?;
-            let status = response.status();
-            let header = response.headers().clone();
-
-            if status.is_success() {
-                // Reserve the capacity upfront and copy each chunk into the buffer
-                // directly, without aggregating the whole body first.
-                if let Some(content_length) = response.content_length() {
-                    buf.reserve(content_length as usize);
-                }
-
-                while let Some(chunk) = response.chunk().await.map_err(|err| {
-                    if err.is_timeout() {
-                        return Error::RequestTimeout(err.to_string());
-                    }
-
-                    Error::Internal(format!("failed to read response body: {err}"))
-                })? {
-                    buf.extend_from_slice(&chunk);
-                }
-            }
-
-            Ok(GetResponse {
-                success: status.is_success(),
-                header,
-                status_code: Some(status),
-                body: None,
-            })
-        };
-
-        // Apply timeout which will properly cancel the operation when timeout is reached.
-        tokio::time::timeout(request.timeout, get_into)
-            .await
-            .map_err(|err| Error::RequestTimeout(err.to_string()))?
-    }
-
-    /// Sends an GET request to a remote server via the given seed peer endpoints of the
-    /// Dragonfly (e.g., the ones returned by `lookup_endpoints`), instead of selecting
-    /// seed peers by the consistent hash ring. The request is sent to a randomly picked
-    /// endpoint and retried on the others up to the max retries of the client, and
-    /// returns a response with a streaming body.
-    async fn get_with_endpoints(
-        &self,
-        endpoints: &[String],
-        request: &GetRequest,
-    ) -> Result<GetResponse> {
-        request.validate()?;
-
-        let get = async {
-            let response = self.send_with_endpoints(endpoints, request).await?;
-            let header = response.headers().clone();
-            let status_code = response.status();
-            let body: Body = Box::new(
-                response
-                    .bytes_stream()
-                    .map_err(|err| Error::Internal(err.to_string())),
-            );
-
-            Ok(GetResponse {
-                success: status_code.is_success(),
-                header,
-                status_code: Some(status_code),
-                body: Some(body),
-            })
-        };
-
-        // The timeout covers sending the request and receiving the response
-        // headers; reading the body stream is covered by the request timeout
-        // set in send.
-        tokio::time::timeout(request.timeout, get)
-            .await
-            .map_err(|err| Error::RequestTimeout(err.to_string()))?
-    }
-
-    /// Sends an GET request to a remote server via the given seed peer endpoints of the
-    /// Dragonfly and writes the response body directly into the provided buffer. The
-    /// request is sent to a randomly picked endpoint and retried on the others up to
-    /// the max retries of the client.
-    async fn get_into_with_endpoints(
-        &self,
-        endpoints: &[String],
-        request: &GetRequest,
-        buf: &mut BytesMut,
-    ) -> Result<GetResponse> {
-        request.validate()?;
-
-        let get_into = async {
-            let mut response = self.send_with_endpoints(endpoints, request).await?;
-            let status = response.status();
-            let header = response.headers().clone();
-
-            if status.is_success() {
-                // Reserve the capacity upfront and copy each chunk into the buffer
-                // directly, without aggregating the whole body first.
-                if let Some(content_length) = response.content_length() {
-                    buf.reserve(content_length as usize);
-                }
-
-                while let Some(chunk) = response.chunk().await.map_err(|err| {
-                    if err.is_timeout() {
-                        return Error::RequestTimeout(err.to_string());
-                    }
-
-                    Error::Internal(format!("failed to read response body: {err}"))
-                })? {
-                    buf.extend_from_slice(&chunk);
-                }
-            }
-
-            Ok(GetResponse {
-                success: status.is_success(),
-                header,
-                status_code: Some(status),
-                body: None,
-            })
-        };
-
-        // Apply timeout which will properly cancel the operation when timeout is reached.
-        tokio::time::timeout(request.timeout, get_into)
-            .await
-            .map_err(|err| Error::RequestTimeout(err.to_string()))?
+        copy_response(self.try_send(request), request.timeout, buf).await
     }
 
     /// Preheats an OCI image by downloading all its blobs via the Dragonfly.
@@ -970,6 +879,7 @@ impl Client for client {
 
         // Generate task id for selecting seed peer.
         let task_id = self
+            .sender
             .id_generator
             .task_id(
                 if let Some(content) = request.content_for_calculating_task_id.clone() {
@@ -1101,6 +1011,7 @@ impl Client for client {
 
         // Generate task id for selecting seed peer.
         let task_id = self
+            .sender
             .id_generator
             .task_id(
                 if let Some(content) = request.content_for_calculating_task_id.clone() {
@@ -1150,6 +1061,7 @@ impl client {
     async fn lookup_proxy_endpoints(&self, request: &GetRequest) -> Result<Vec<String>> {
         // Generate task id for selecting seed peer.
         let task_id = self
+            .sender
             .id_generator
             .task_id(
                 if let Some(content) = request.content_for_calculating_task_id.clone() {
@@ -1193,6 +1105,91 @@ impl client {
         Ok(endpoints)
     }
 
+    /// Scatters the request across the seed peers serving it and returns the first
+    /// successful response.
+    async fn try_send(&self, request: &GetRequest) -> Result<reqwest::Response> {
+        let endpoints = self.lookup_proxy_endpoints(request).await?;
+        self.sender.send_with_endpoints(&endpoints, request).await
+    }
+
+    /// Helper function to check if a URL is an OCI blob URL (e.g., /v2/<name>/blobs/sha256:
+    /// <digest>).
+    #[cfg(feature = "preheat")]
+    fn build_blob_url(registry: &str, repository: &str, digest: &str) -> String {
+        format!("https://{registry}/v2/{repository}/blobs/{digest}")
+    }
+
+    /// Builds an OCI client with a platform resolver that matches the requested os/arch.
+    #[cfg(feature = "preheat")]
+    fn oci_client(platform: Option<String>) -> Result<OciClient> {
+        let mut oci_config = ClientConfig::default();
+        if let Some(platform) = platform {
+            let (os, arch) = platform
+                .split_once('/')
+                .map(|(os, arch)| (Os::from(os), Arch::from(arch)))
+                .ok_or_else(|| {
+                    Error::InvalidArgument(format!("invalid platform format '{platform}', expected 'os/arch' (e.g., 'linux/amd64')"))
+                })?;
+
+            oci_config.platform_resolver = Some(Box::new(move |manifests: &[ImageIndexEntry]| {
+                manifests
+                    .iter()
+                    .find(|entry| {
+                        entry.platform.as_ref().is_some_and(|platform| {
+                            platform.os == os && platform.architecture == arch
+                        })
+                    })
+                    .map(|entry| entry.digest.clone())
+            }))
+        };
+
+        Ok(OciClient::new(oci_config))
+    }
+}
+
+/// The sender that scatters requests across seed peer endpoints, composed by the
+/// clients to share the request logic, the per-endpoint client pool and the task
+/// id generator.
+#[derive(Clone)]
+struct Sender {
+    /// The number of times to retry a request.
+    max_retries: u8,
+
+    /// The pool of clients.
+    client_pool: Arc<Pool<String, String, ClientWithMiddleware, HTTPClientFactory>>,
+
+    /// The task id generator.
+    id_generator: Arc<IDGenerator>,
+}
+
+/// Implements the sender that scatters requests across seed peer endpoints.
+impl Sender {
+    /// Creates a new Sender with the given max retries.
+    fn new(max_retries: u8) -> Result<Self> {
+        // Get local IP address and hostname.
+        // In IPv6-only environments, IPv4 detection may fail, so we use a best-effort IPv4->IPv6 fallback.
+        let local_ip = preferred_local_ip()
+            .ok_or_else(|| {
+                Error::Internal("failed to detect a preferred local IP address".to_string())
+            })?
+            .to_string();
+        let hostname = hostname::get()
+            .map_err(|err| Error::Internal(format!("failed to get hostname: {err}")))?
+            .to_string_lossy()
+            .to_string();
+
+        Ok(Self {
+            max_retries,
+            client_pool: Arc::new(
+                PoolBuilder::new(HTTPClientFactory::default())
+                    .capacity(DEFAULT_CLIENT_POOL_CAPACITY)
+                    .idle_timeout(DEFAULT_CLIENT_POOL_IDLE_TIMEOUT)
+                    .build(),
+            ),
+            id_generator: Arc::new(IDGenerator::new(local_ip, hostname, true)),
+        })
+    }
+
     /// Scatters the request across the given seed peer endpoints: it tries randomly
     /// picked endpoints one by one, limited by the max retries of the client.
     async fn send_with_endpoints(
@@ -1228,13 +1225,6 @@ impl client {
         Err(last_err.unwrap_or_else(|| {
             Error::Internal("failed to send request to any endpoint".to_string())
         }))
-    }
-
-    /// Scatters the request across the seed peers serving it and returns the first
-    /// successful response.
-    async fn try_send(&self, request: &GetRequest) -> Result<reqwest::Response> {
-        let endpoints = self.lookup_proxy_endpoints(request).await?;
-        self.send_with_endpoints(&endpoints, request).await
     }
 
     /// Send a request to the specified URL via client entry with the given headers.
@@ -1378,39 +1368,108 @@ impl client {
         headers.insert("X-Dragonfly-Use-P2P", HeaderValue::from_static("true"));
         Ok(headers)
     }
+}
 
-    /// Helper function to check if a URL is an OCI blob URL (e.g., /v2/<name>/blobs/sha256:
-    /// <digest>).
-    #[cfg(feature = "preheat")]
-    fn build_blob_url(registry: &str, repository: &str, digest: &str) -> String {
-        format!("https://{registry}/v2/{repository}/blobs/{digest}")
+/// Assembles a GET response with a streaming body from the response future, wrapped
+/// in the request timeout. The timeout covers sending the request and receiving the
+/// response headers; reading the body stream is covered by the request timeout set
+/// in send.
+async fn stream_response(
+    response: impl Future<Output = Result<reqwest::Response>>,
+    timeout: Duration,
+) -> Result<GetResponse> {
+    let get = async {
+        let response = response.await?;
+        let header = response.headers().clone();
+        let status_code = response.status();
+        let body: Body = Box::new(
+            response
+                .bytes_stream()
+                .map_err(|err| Error::Internal(err.to_string())),
+        );
+
+        Ok(GetResponse {
+            success: status_code.is_success(),
+            header,
+            status_code: Some(status_code),
+            body: Some(body),
+        })
+    };
+
+    tokio::time::timeout(timeout, get)
+        .await
+        .map_err(|err| Error::RequestTimeout(err.to_string()))?
+}
+
+/// Assembles a GET response from the response future, copying the response body into
+/// the provided buffer, wrapped in the request timeout which will properly cancel
+/// the operation when the timeout is reached.
+async fn copy_response(
+    response: impl Future<Output = Result<reqwest::Response>>,
+    timeout: Duration,
+    buf: &mut BytesMut,
+) -> Result<GetResponse> {
+    let get_into = async {
+        let mut response = response.await?;
+        let status = response.status();
+        let header = response.headers().clone();
+
+        if status.is_success() {
+            // Reserve the capacity upfront and copy each chunk into the buffer
+            // directly, without aggregating the whole body first.
+            if let Some(content_length) = response.content_length() {
+                buf.reserve(content_length as usize);
+            }
+
+            while let Some(chunk) = response.chunk().await.map_err(|err| {
+                if err.is_timeout() {
+                    return Error::RequestTimeout(err.to_string());
+                }
+
+                Error::Internal(format!("failed to read response body: {err}"))
+            })? {
+                buf.extend_from_slice(&chunk);
+            }
+        }
+
+        Ok(GetResponse {
+            success: status.is_success(),
+            header,
+            status_code: Some(status),
+            body: None,
+        })
+    };
+
+    tokio::time::timeout(timeout, get_into)
+        .await
+        .map_err(|err| Error::RequestTimeout(err.to_string()))?
+}
+
+/// Implements the interface for sending requests via the given seed peer endpoints
+/// of the Dragonfly.
+#[async_trait]
+impl ClientWithEndpoints for clientWithEndpoints {
+    /// Sends an GET request to a remote server via the seed peer endpoints of the
+    /// client and returns a response with a streaming body.
+    async fn get(&self, request: &GetRequest) -> Result<GetResponse> {
+        request.validate()?;
+        stream_response(
+            self.sender.send_with_endpoints(&self.endpoints, request),
+            request.timeout,
+        )
+        .await
     }
 
-    /// Builds an OCI client with a platform resolver that matches the requested os/arch.
-    #[cfg(feature = "preheat")]
-    fn oci_client(platform: Option<String>) -> Result<OciClient> {
-        let mut oci_config = ClientConfig::default();
-        if let Some(platform) = platform {
-            let (os, arch) = platform
-                .split_once('/')
-                .map(|(os, arch)| (Os::from(os), Arch::from(arch)))
-                .ok_or_else(|| {
-                    Error::InvalidArgument(format!("invalid platform format '{platform}', expected 'os/arch' (e.g., 'linux/amd64')"))
-                })?;
-
-            oci_config.platform_resolver = Some(Box::new(move |manifests: &[ImageIndexEntry]| {
-                manifests
-                    .iter()
-                    .find(|entry| {
-                        entry.platform.as_ref().is_some_and(|platform| {
-                            platform.os == os && platform.architecture == arch
-                        })
-                    })
-                    .map(|entry| entry.digest.clone())
-            }))
-        };
-
-        Ok(OciClient::new(oci_config))
+    /// Sends an GET request to a remote server via the seed peer endpoints of the
+    /// client and writes the response body directly into the provided buffer.
+    async fn get_into(&self, request: &GetRequest, buf: &mut BytesMut) -> Result<GetResponse> {
+        request.validate()?;
+        copy_response(
+            self.sender.send_with_endpoints(&self.endpoints, request),
+            request.timeout,
+            buf,
+        )
+        .await
     }
 }
 
@@ -1807,14 +1866,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_client_with_endpoints_new_empty_endpoints() {
+        let result = BuilderWithEndpoints::default().build();
+        assert!(matches!(result, Err(Error::InvalidArgument(_))));
+    }
+
+    #[test]
+    fn test_client_with_endpoints_new_invalid_retry_times() {
+        let result = BuilderWithEndpoints::default()
+            .endpoints(vec!["http://127.0.0.1:4001".to_string()])
+            .max_retries(11)
+            .build();
+        assert!(matches!(result, Err(Error::InvalidArgument(_))));
+    }
+
     #[tokio::test]
-    async fn test_get_with_endpoints_empty() {
-        let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
-        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
-        let client = Builder::default()
-            .scheduler_endpoint(scheduler_endpoint)
+    async fn test_get_with_endpoints() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut mocks = MockSet::new();
+        mocks.mock(|when, then| {
+            when.get().path("/file.txt");
+            then.text("hello dragonfly");
+        });
+        let mock_proxy = setup_mock_seed_peer_proxy(mocks).await.unwrap();
+
+        let client = BuilderWithEndpoints::default()
+            .endpoints(vec![format!(
+                "http://127.0.0.1:{}",
+                mock_proxy.port().unwrap()
+            )])
             .build()
-            .await
             .unwrap();
 
         let request = GetRequest {
@@ -1822,8 +1904,11 @@ mod tests {
             ..Default::default()
         };
 
-        let result = client.get_with_endpoints(&[], &request).await;
-        assert!(matches!(result, Err(Error::InvalidArgument(_))));
+        let mut buf = BytesMut::new();
+        let response = client.get_into(&request, &mut buf).await.unwrap();
+        assert!(response.success);
+        assert_eq!(response.status_code, Some(reqwest::StatusCode::OK));
+        assert_eq!(&buf[..], b"hello dragonfly");
     }
 
     #[tokio::test]

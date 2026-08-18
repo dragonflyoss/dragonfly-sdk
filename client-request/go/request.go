@@ -54,19 +54,6 @@ type Client interface {
 	// writes the response body directly into the provided writer.
 	GetInto(ctx context.Context, req *GetRequest, w io.Writer) (*GetResponse, error)
 
-	// GetWithEndpoints sends a GET request to a remote server via the given
-	// seed peer endpoints of the Dragonfly (e.g., the ones returned by
-	// LookupEndpoints), instead of selecting seed peers by the consistent hash
-	// ring. The request is sent to a randomly picked endpoint and retried on
-	// the others up to the max retries.
-	GetWithEndpoints(ctx context.Context, endpoints []string, req *GetRequest) (*GetResponse, error)
-
-	// GetIntoWithEndpoints sends a GET request to a remote server via the
-	// given seed peer endpoints of the Dragonfly and writes the response body
-	// directly into the provided writer. The request is sent to a randomly
-	// picked endpoint and retried on the others up to the max retries.
-	GetIntoWithEndpoints(ctx context.Context, endpoints []string, req *GetRequest, w io.Writer) (*GetResponse, error)
-
 	// Preheat preheats a file by downloading it to the replicas of seed peers
 	// via the Dragonfly, without streaming the file content back to the
 	// client. It fails when the available seed peers are fewer than the
@@ -87,6 +74,28 @@ type Client interface {
 	// Close stops the background seed peer refresh and closes the scheduler
 	// connection.
 	Close() error
+}
+
+// ClientWithEndpoints is the interface for sending requests via the given
+// seed peer endpoints of the Dragonfly.
+//
+// It enables interaction with remote servers through the seed peer endpoints
+// given at construction (e.g., the ones returned by Client.LookupEndpoints),
+// instead of selecting seed peers by the consistent hash ring, and never
+// connects to the scheduler. It is designed for clients whose endpoints are
+// provided by an external system.
+type ClientWithEndpoints interface {
+	// Get sends a GET request to a remote server via the seed peer endpoints
+	// of the client. The request is sent to a randomly picked endpoint and
+	// retried on the others up to the max retries. The caller must close the
+	// body.
+	Get(ctx context.Context, req *GetRequest) (*GetResponse, error)
+
+	// GetInto sends a GET request to a remote server via the seed peer
+	// endpoints of the client and writes the response body directly into the
+	// provided writer. The request is sent to a randomly picked endpoint and
+	// retried on the others up to the max retries.
+	GetInto(ctx context.Context, req *GetRequest, w io.Writer) (*GetResponse, error)
 }
 
 // GetRequest represents a GET request to be sent via the Dragonfly. Construct

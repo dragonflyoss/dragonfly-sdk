@@ -14,36 +14,35 @@
  * limitations under the License.
  */
 
-//! Looks up the endpoints of the seed peers serving the url via the Dragonfly,
-//! then downloads the file from a randomly picked endpoint and writes it to
-//! stdout.
+//! Downloads the file from the given seed peer endpoints of the Dragonfly and
+//! writes it to stdout, without connecting to the scheduler. The endpoints are
+//! provided by an external system (e.g., a client built with a scheduler
+//! endpoint doing `lookup_endpoints`).
 //!
-//! Usage: cargo run --example get_with_endpoints -- <scheduler-endpoint> <url>
+//! Usage: cargo run --example get_with_endpoints -- <url> <endpoint>...
 
-use dragonfly_client_request::{Builder, Client, GetRequest};
+use dragonfly_client_request::{BuilderWithEndpoints, ClientWithEndpoints, GetRequest};
 use futures::TryStreamExt;
 use tokio::io::AsyncWriteExt;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 3 {
-        eprintln!("usage: {} <scheduler-endpoint> <url>", args[0]);
+    if args.len() < 3 {
+        eprintln!("usage: {} <url> <endpoint>...", args[0]);
         std::process::exit(1);
     }
 
-    let client = Builder::default()
-        .scheduler_endpoint(args[1].clone())
-        .build()
-        .await?;
+    let client = BuilderWithEndpoints::default()
+        .endpoints(args[2..].to_vec())
+        .build()?;
 
     let request = GetRequest {
-        url: args[2].clone(),
+        url: args[1].clone(),
         ..Default::default()
     };
 
-    let endpoints = client.lookup_endpoints(&request).await?;
-    let response = client.get_with_endpoints(&endpoints, &request).await?;
+    let response = client.get(&request).await?;
 
     // The body is a stream of zero-copy `Bytes` chunks.
     let mut body = response.body.ok_or("missing response body")?;

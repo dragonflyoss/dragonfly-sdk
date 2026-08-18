@@ -107,8 +107,8 @@ func WithClientHealthCheckInterval(interval time.Duration) ClientOption {
 // client is the HTTP client that sends requests via Dragonfly, implementing
 // the Client interface.
 type client struct {
-	// maxRetries is the number of times to retry a request.
-	maxRetries uint8
+	// sender scatters requests across the seed peer proxy endpoints.
+	sender
 
 	// schedulerRequestTimeout is the timeout of requests to the scheduler
 	// service.
@@ -120,9 +120,6 @@ type client struct {
 	// seedPeerSelector is the selector service for selecting seed peers.
 	seedPeerSelector *selector.SeedPeerSelector
 
-	// clientPool is the pool of clients.
-	clientPool *pool.Pool
-
 	// schedulerConn is the connection to the scheduler service.
 	schedulerConn *grpc.ClientConn
 }
@@ -131,10 +128,9 @@ type client struct {
 // e.g. "http://scheduler-service:8002".
 func New(ctx context.Context, schedulerEndpoint string, opts ...ClientOption) (Client, error) {
 	c := &client{
-		maxRetries:              defaultMaxRetries,
+		sender:                  newSender(),
 		schedulerRequestTimeout: defaultSchedulerRequestTimeout,
 		healthCheckInterval:     defaultHealthCheckInterval,
-		clientPool:              pool.New(httpClientFactory, defaultClientPoolCapacity, defaultClientPoolIdleTimeout),
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -187,11 +183,39 @@ func (c *client) validate(schedulerEndpoint string) (string, error) {
 		return "", fmt.Errorf("%w: health check interval must be between 1 and 600 seconds", ErrInvalidArgument)
 	}
 
-	if c.maxRetries > 10 {
-		return "", fmt.Errorf("%w: max retries must be between 0 and 10", ErrInvalidArgument)
+	if err := c.sender.validate(); err != nil {
+		return "", err
 	}
 
 	return u.Host, nil
+}
+
+// sender scatters requests across seed peer endpoints. It is composed by
+// client and clientWithEndpoints to share the request logic and the
+// per-endpoint client pool.
+type sender struct {
+	// maxRetries is the number of times to retry a request.
+	maxRetries uint8
+
+	// clientPool is the pool of clients.
+	clientPool *pool.Pool
+}
+
+// newSender returns a sender with the default max retries and client pool.
+func newSender() sender {
+	return sender{
+		maxRetries: defaultMaxRetries,
+		clientPool: pool.New(httpClientFactory, defaultClientPoolCapacity, defaultClientPoolIdleTimeout),
+	}
+}
+
+// validate validates the input parameters.
+func (s *sender) validate() error {
+	if s.maxRetries > 10 {
+		return fmt.Errorf("%w: max retries must be between 0 and 10", ErrInvalidArgument)
+	}
+
+	return nil
 }
 
 // httpClientFactory creates a new HTTP client configured to use the specified
@@ -223,6 +247,48 @@ func httpClientFactory(proxyAddr string) (*http.Client, error) {
 			ExpectContinueTimeout: expectContinueTimeout,
 		},
 	}, nil
+}
+
+// ClientWithEndpointsOption configures the client with endpoints.
+type ClientWithEndpointsOption func(c *clientWithEndpoints)
+
+// WithClientWithEndpointsMaxRetries sets the maximum number of retries.
+func WithClientWithEndpointsMaxRetries(retries uint8) ClientWithEndpointsOption {
+	return func(c *clientWithEndpoints) { c.maxRetries = retries }
+}
+
+// clientWithEndpoints is the HTTP client that sends requests via the given
+// seed peer endpoints of the Dragonfly, implementing the ClientWithEndpoints
+// interface, without connecting to the scheduler.
+type clientWithEndpoints struct {
+	// sender scatters requests across the seed peer endpoints.
+	sender
+
+	// endpoints is the seed peer endpoints to send requests to.
+	endpoints []string
+}
+
+// NewWithEndpoints creates a ClientWithEndpoints that sends requests via the
+// given seed peer endpoints (e.g., the ones returned by
+// Client.LookupEndpoints), without connecting to the scheduler.
+func NewWithEndpoints(ctx context.Context, endpoints []string, opts ...ClientWithEndpointsOption) (ClientWithEndpoints, error) {
+	c := &clientWithEndpoints{
+		sender:    newSender(),
+		endpoints: slices.Clone(endpoints),
+	}
+	for _, opt := range opts {
+		opt(c)
+	}
+
+	if len(c.endpoints) == 0 {
+		return nil, fmt.Errorf("%w: endpoints must not be empty", ErrInvalidArgument)
+	}
+
+	if err := c.validate(); err != nil {
+		return nil, err
+	}
+
+	return c, nil
 }
 
 // Get sends a GET request to a remote server via the Dragonfly and returns a
@@ -266,12 +332,12 @@ func (c *client) GetInto(ctx context.Context, req *GetRequest, w io.Writer) (*Ge
 	return copyResponse(resp, w)
 }
 
-// GetWithEndpoints sends a GET request to a remote server via the given seed
-// peer endpoints of the Dragonfly (e.g., the ones returned by
-// LookupEndpoints), instead of selecting seed peers by the consistent hash
-// ring. The request is sent to a randomly picked endpoint and retried on the
-// others up to the max retries of the client.
-func (c *client) GetWithEndpoints(ctx context.Context, endpoints []string, req *GetRequest) (*GetResponse, error) {
+// Get sends a GET request to a remote server via the seed peer endpoints of
+// the client, instead of selecting seed peers by the consistent hash ring.
+// The request is sent to a randomly picked endpoint and retried on the others
+// up to the max retries of the client, and returns a response with a
+// streaming body. The caller must close the body.
+func (c *clientWithEndpoints) Get(ctx context.Context, req *GetRequest) (*GetResponse, error) {
 	if err := req.validate(); err != nil {
 		return nil, err
 	}
@@ -279,7 +345,7 @@ func (c *client) GetWithEndpoints(ctx context.Context, endpoints []string, req *
 	// The timeout covers the whole request including the body read, so the
 	// cancel function is called when the body is closed.
 	ctx, cancel := context.WithTimeout(ctx, req.timeout)
-	resp, err := c.sendWithEndpoints(ctx, endpoints, req)
+	resp, err := c.sendWithEndpoints(ctx, c.endpoints, req)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -288,11 +354,11 @@ func (c *client) GetWithEndpoints(ctx context.Context, endpoints []string, req *
 	return streamResponse(resp, cancel), nil
 }
 
-// GetIntoWithEndpoints sends a GET request to a remote server via the given
-// seed peer endpoints of the Dragonfly and writes the response body directly
-// into the provided writer. The request is sent to a randomly picked endpoint
-// and retried on the others up to the max retries of the client.
-func (c *client) GetIntoWithEndpoints(ctx context.Context, endpoints []string, req *GetRequest, w io.Writer) (*GetResponse, error) {
+// GetInto sends a GET request to a remote server via the seed peer endpoints
+// of the client and writes the response body directly into the provided
+// writer. The request is sent to a randomly picked endpoint and retried on
+// the others up to the max retries of the client.
+func (c *clientWithEndpoints) GetInto(ctx context.Context, req *GetRequest, w io.Writer) (*GetResponse, error) {
 	if err := req.validate(); err != nil {
 		return nil, err
 	}
@@ -300,7 +366,7 @@ func (c *client) GetIntoWithEndpoints(ctx context.Context, endpoints []string, r
 	ctx, cancel := context.WithTimeout(ctx, req.timeout)
 	defer cancel()
 
-	resp, err := c.sendWithEndpoints(ctx, endpoints, req)
+	resp, err := c.sendWithEndpoints(ctx, c.endpoints, req)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			return nil, fmt.Errorf("%w: %v", ErrRequestTimeout, err)
@@ -315,7 +381,7 @@ func (c *client) GetIntoWithEndpoints(ctx context.Context, endpoints []string, r
 // sendWithEndpoints scatters the request across the given seed peer endpoints:
 // it tries randomly picked endpoints one by one, limited by the max retries of
 // the client.
-func (c *client) sendWithEndpoints(ctx context.Context, endpoints []string, req *GetRequest) (*http.Response, error) {
+func (s *sender) sendWithEndpoints(ctx context.Context, endpoints []string, req *GetRequest) (*http.Response, error) {
 	if len(endpoints) == 0 {
 		return nil, fmt.Errorf("%w: no endpoints to send request", ErrInvalidArgument)
 	}
@@ -327,15 +393,15 @@ func (c *client) sendWithEndpoints(ctx context.Context, endpoints []string, req 
 	rand.Shuffle(len(shuffled), func(i, j int) { shuffled[i], shuffled[j] = shuffled[j], shuffled[i] })
 
 	var lastErr error
-	for attempt := range int(c.maxRetries) + 1 {
+	for attempt := range int(s.maxRetries) + 1 {
 		endpoint := shuffled[attempt%len(shuffled)]
-		entry, err := c.clientPool.Entry(endpoint, endpoint)
+		entry, err := s.clientPool.Entry(endpoint, endpoint)
 		if err != nil {
 			return nil, err
 		}
 
 		guard := entry.RequestGuard()
-		resp, err := c.send(ctx, entry.Client, req)
+		resp, err := s.send(ctx, entry.Client, req)
 		guard.Done()
 		if err != nil {
 			slog.Warn("failed to send request to endpoint", "endpoint", endpoint, "error", err)
@@ -456,7 +522,7 @@ func (c *client) trySend(ctx context.Context, req *GetRequest) (*http.Response, 
 
 // send sends a request to the specified URL via the client with the given
 // headers.
-func (c *client) send(ctx context.Context, httpClient *http.Client, req *GetRequest) (*http.Response, error) {
+func (s *sender) send(ctx context.Context, httpClient *http.Client, req *GetRequest) (*http.Response, error) {
 	headers, err := makeRequestHeaders(req)
 	if err != nil {
 		return nil, err

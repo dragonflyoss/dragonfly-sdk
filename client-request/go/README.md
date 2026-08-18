@@ -86,7 +86,9 @@ defer resp.Body.Close()
 ```
 
 Look up the endpoints of the seed peers serving a request, then download from
-the looked-up endpoints directly, scattering the request across them:
+the looked-up endpoints directly with a `ClientWithEndpoints`, scattering each
+request across them. The client with endpoints never connects to the
+scheduler, so the endpoints can also be provided by an external system:
 
 ```go
 req := request.NewGetRequest("https://example.com/file.txt")
@@ -95,14 +97,19 @@ if err != nil {
     panic(err)
 }
 
-resp, err := client.GetWithEndpoints(ctx, endpoints, req)
+clientWithEndpoints, err := request.NewWithEndpoints(ctx, endpoints)
+if err != nil {
+    panic(err)
+}
+
+resp, err := clientWithEndpoints.Get(ctx, req)
 if err != nil {
     panic(err)
 }
 defer resp.Body.Close()
 
 // Or write the response body directly into a writer:
-// resp, err := client.GetIntoWithEndpoints(ctx, endpoints, req, w)
+// resp, err := clientWithEndpoints.GetInto(ctx, req, w)
 ```
 
 See [examples](./examples) for runnable examples.

@@ -14,9 +14,10 @@
  * limitations under the License.
  */
 
-// Command get-with-endpoints looks up the endpoints of the seed peers serving
-// the url via the Dragonfly, then downloads the file from a randomly picked
-// endpoint and writes it to stdout.
+// Command get-with-endpoints downloads the file from the given seed peer
+// endpoints of the Dragonfly and writes it to stdout, without connecting to
+// the scheduler. The endpoints are provided by an external system (e.g., a
+// client built with a scheduler endpoint doing LookupEndpoints).
 package main
 
 import (
@@ -31,29 +32,21 @@ import (
 )
 
 func main() {
-	if len(os.Args) != 3 {
-		fmt.Fprintf(os.Stderr, "usage: %s <scheduler-endpoint> <url>\n", os.Args[0])
+	if len(os.Args) < 3 {
+		fmt.Fprintf(os.Stderr, "usage: %s <url> <endpoint>...\n", os.Args[0])
 		os.Exit(1)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	client, err := request.New(ctx, os.Args[1])
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-	defer client.Close()
-
-	req := request.NewGetRequest(os.Args[2])
-	endpoints, err := client.LookupEndpoints(ctx, req)
+	client, err := request.NewWithEndpoints(ctx, os.Args[2:])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 
-	resp, err := client.GetWithEndpoints(ctx, endpoints, req)
+	resp, err := client.Get(ctx, request.NewGetRequest(os.Args[1]))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

@@ -162,7 +162,7 @@ func TestNewRequestDefaults(t *testing.T) {
 	assert.Equal(30*time.Minute, image.timeout)
 }
 
-func setupBenchClient(b *testing.B, body []byte) (Client, string) {
+func setupBenchClient(b *testing.B, body []byte) Client {
 	b.Helper()
 
 	proxyPort := setupMockSeedPeerProxy(b, func(w http.ResponseWriter, r *http.Request) {
@@ -177,11 +177,11 @@ func setupBenchClient(b *testing.B, body []byte) (Client, string) {
 	}
 	b.Cleanup(func() { client.Close() })
 
-	return client, fmt.Sprintf("http://127.0.0.1:%d", proxyPort)
+	return client
 }
 
 func BenchmarkGet(b *testing.B) {
-	client, _ := setupBenchClient(b, make([]byte, 64*1024))
+	client := setupBenchClient(b, make([]byte, 64*1024))
 	req := NewGetRequest("http://example.com/file.txt", WithGetRequestReplicas(1))
 
 	b.ReportAllocs()
@@ -199,7 +199,7 @@ func BenchmarkGet(b *testing.B) {
 }
 
 func BenchmarkGetInto(b *testing.B) {
-	client, _ := setupBenchClient(b, make([]byte, 64*1024))
+	client := setupBenchClient(b, make([]byte, 64*1024))
 	req := NewGetRequest("http://example.com/file.txt", WithGetRequestReplicas(1))
 
 	b.ReportAllocs()
@@ -211,13 +211,20 @@ func BenchmarkGetInto(b *testing.B) {
 }
 
 func BenchmarkGetWithEndpoints(b *testing.B) {
-	client, endpoint := setupBenchClient(b, make([]byte, 64*1024))
-	endpoints := []string{endpoint}
+	body := make([]byte, 64*1024)
+	proxyPort := setupMockSeedPeerProxy(b, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(body)
+	})
+
+	client, err := NewWithEndpoints(context.Background(), []string{fmt.Sprintf("http://127.0.0.1:%d", proxyPort)})
+	if err != nil {
+		b.Fatal(err)
+	}
 	req := NewGetRequest("http://example.com/file.txt", WithGetRequestReplicas(1))
 
 	b.ReportAllocs()
 	for b.Loop() {
-		resp, err := client.GetWithEndpoints(context.Background(), endpoints, req)
+		resp, err := client.Get(context.Background(), req)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -230,7 +237,7 @@ func BenchmarkGetWithEndpoints(b *testing.B) {
 }
 
 func BenchmarkLookupEndpoints(b *testing.B) {
-	client, _ := setupBenchClient(b, nil)
+	client := setupBenchClient(b, nil)
 	req := NewGetRequest("http://example.com/file.txt")
 
 	b.ReportAllocs()
@@ -242,7 +249,7 @@ func BenchmarkLookupEndpoints(b *testing.B) {
 }
 
 func BenchmarkPreheat(b *testing.B) {
-	client, _ := setupBenchClient(b, nil)
+	client := setupBenchClient(b, nil)
 	req := NewPreheatRequest("http://example.com/file.txt", WithPreheatRequestReplicas(1))
 
 	b.ReportAllocs()

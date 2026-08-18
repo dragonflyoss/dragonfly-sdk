@@ -211,14 +211,12 @@ func TestGetWithEndpoints(t *testing.T) {
 	goodProxyPort := setupMockSeedPeerProxy(t, func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "ok")
 	})
-	endpoint := setupMockScheduler(t, nil)
-
-	client, err := New(context.Background(), endpoint)
-	assert.NoError(err)
-	defer client.Close()
 
 	endpoints := []string{"http://127.0.0.1:1", fmt.Sprintf("http://127.0.0.1:%d", goodProxyPort)}
-	resp, err := client.GetWithEndpoints(context.Background(), endpoints, NewGetRequest("http://example.com/file.txt"))
+	client, err := NewWithEndpoints(context.Background(), endpoints)
+	assert.NoError(err)
+
+	resp, err := client.Get(context.Background(), NewGetRequest("http://example.com/file.txt"))
 	assert.NoError(err)
 	defer resp.Body.Close()
 
@@ -227,15 +225,17 @@ func TestGetWithEndpoints(t *testing.T) {
 	assert.Equal("ok", string(body))
 }
 
-func TestGetWithEndpointsEmpty(t *testing.T) {
+func TestNewWithEndpointsEmptyEndpoints(t *testing.T) {
 	assert := assert.New(t)
-	endpoint := setupMockScheduler(t, nil)
 
-	client, err := New(context.Background(), endpoint)
-	assert.NoError(err)
-	defer client.Close()
+	_, err := NewWithEndpoints(context.Background(), nil)
+	assert.ErrorIs(err, ErrInvalidArgument)
+}
 
-	_, err = client.GetWithEndpoints(context.Background(), nil, NewGetRequest("http://example.com/file.txt"))
+func TestNewWithEndpointsInvalidRetryTimes(t *testing.T) {
+	assert := assert.New(t)
+
+	_, err := NewWithEndpoints(context.Background(), []string{"http://127.0.0.1:1"}, WithClientWithEndpointsMaxRetries(11))
 	assert.ErrorIs(err, ErrInvalidArgument)
 }
 
