@@ -1,5 +1,5 @@
-d7y.io/api/v2 v2.3.0 h1:4jtefp4y7Ckyv8kZjyb+E6B1zYSclaUpeh7JVagupEg=
-d7y.io/api/v2 v2.3.0/go.mod h1:dEZydwgMnLfmiwRUoFqjmYrpDnjsWth2NS8YPBsRb68=
+d7y.io/api/v2 v2.3.1 h1:Er2Ar+ku7wWO5tVyut2Em1Si8emQD1zJXu/skQx3n+c=
+d7y.io/api/v2 v2.3.1/go.mod h1:dEZydwgMnLfmiwRUoFqjmYrpDnjsWth2NS8YPBsRb68=
 d7y.io/dragonfly/v2 v2.5.2-0.20260817025753-bc9a1267534a h1:oiNNg3pjRhFSJVSpx6ZzVhXDlIw8dagTEo428OTuGDg=
 d7y.io/dragonfly/v2 v2.5.2-0.20260817025753-bc9a1267534a/go.mod h1:EMDbzqKyoweP8mjozB3X1wZkhvZd7wdqs3+WKFdv80Q=
 github.com/alecthomas/template v0.0.0-20160405071501-a0175ee3bccc/go.mod h1:LOuyumcjzFXgccqObfd/Ljyb9UuFJ6TxHnclSeseNhc=

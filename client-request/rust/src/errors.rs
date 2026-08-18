@@ -28,6 +28,9 @@ pub enum Error {
     #[error{"request internal error: {0}"}]
     Internal(String),
 
+    #[error{"host {0} not found"}]
+    HostNotFound(String),
+
     #[allow(clippy::enum_variant_names)]
     #[error(transparent)]
     BackendError(#[from] BackendError),
@@ -39,6 +42,17 @@ pub enum Error {
     #[allow(clippy::enum_variant_names)]
     #[error(transparent)]
     DfdaemonError(#[from] DfdaemonError),
+
+    #[allow(clippy::enum_variant_names)]
+    #[error(transparent)]
+    NetAddrParseError(#[from] std::net::AddrParseError),
+
+    #[error(transparent)]
+    TonicStatus(#[from] tonic::Status),
+
+    #[allow(clippy::enum_variant_names)]
+    #[error(transparent)]
+    TonicTransportError(#[from] tonic::transport::Error),
 }
 
 /// The error detail for Backend.
