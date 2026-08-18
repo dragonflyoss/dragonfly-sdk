@@ -37,8 +37,6 @@ import (
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 )
 
-// mockScheduler is a mock scheduler service which returns the given hosts as
-// seed peers.
 type mockScheduler struct {
 	schedulerv2.UnimplementedSchedulerServer
 	hosts []*commonv2.Host
@@ -48,7 +46,6 @@ func (s *mockScheduler) ListHosts(ctx context.Context, req *schedulerv2.ListHost
 	return &schedulerv2.ListHostsResponse{Hosts: s.hosts}, nil
 }
 
-// setupMockScheduler starts a mock scheduler and returns its endpoint.
 func setupMockScheduler(t testing.TB, hosts []*commonv2.Host) string {
 	t.Helper()
 
@@ -65,8 +62,6 @@ func setupMockScheduler(t testing.TB, hosts []*commonv2.Host) string {
 	return fmt.Sprintf("http://%s", listener.Addr())
 }
 
-// mockSeedPeer is a mock seed peer service which responds to health checks and
-// serves download task requests.
 type mockSeedPeer struct {
 	dfdaemonv2.UnimplementedDfdaemonUploadServer
 	downloadErr error
@@ -95,12 +90,10 @@ func (s *mockSeedPeer) DownloadTask(req *dfdaemonv2.DownloadTaskRequest, stream 
 	return nil
 }
 
-// setupMockSeedPeer starts a mock seed peer and returns its port.
 func setupMockSeedPeer(t testing.TB, downloadErr error) int32 {
 	return setupMockSeedPeerServer(t, &mockSeedPeer{downloadErr: downloadErr})
 }
 
-// setupMockSeedPeerServer starts the given mock seed peer and returns its port.
 func setupMockSeedPeerServer(t testing.TB, peer *mockSeedPeer) int32 {
 	t.Helper()
 
@@ -122,8 +115,6 @@ func setupMockSeedPeerServer(t testing.TB, peer *mockSeedPeer) int32 {
 	return int32(listener.Addr().(*net.TCPAddr).Port)
 }
 
-// createSeedPeerHost creates a seed peer host pointing at the mock seed peer
-// server and the mock seed peer proxy.
 func createSeedPeerHost(name string, port, proxyPort int32) *commonv2.Host {
 	return &commonv2.Host{
 		Id:        name,
@@ -136,8 +127,6 @@ func createSeedPeerHost(name string, port, proxyPort int32) *commonv2.Host {
 	}
 }
 
-// setupMockSeedPeerProxy starts an HTTP server acting as the seed peer proxy
-// and returns its port.
 func setupMockSeedPeerProxy(t testing.TB, handler http.HandlerFunc) int32 {
 	t.Helper()
 
@@ -152,8 +141,6 @@ func setupMockSeedPeerProxy(t testing.TB, handler http.HandlerFunc) int32 {
 	return int32(port)
 }
 
-// TestNewRequestDefaults asserts the documented default values of the request
-// constructors.
 func TestNewRequestDefaults(t *testing.T) {
 	assert := assert.New(t)
 
@@ -175,9 +162,6 @@ func TestNewRequestDefaults(t *testing.T) {
 	assert.Equal(30*time.Minute, image.timeout)
 }
 
-// setupBenchProxy starts a mock scheduler with a single seed peer serving the
-// given body through its proxy, and returns the proxy client along with the
-// seed peer proxy endpoint.
 func setupBenchProxy(b *testing.B, body []byte) (*Proxy, string) {
 	b.Helper()
 

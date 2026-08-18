@@ -39,19 +39,7 @@ use tonic_health::pb::HealthCheckResponse;
 /// proxy for the get benchmarks.
 const BODY_SIZE: usize = 64 * 1024;
 
-// Installs the default crypto provider once for the TLS backed clients.
-fn init_crypto() {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    });
-}
-
-// Mock scheduler service for benchmarking, which returns the given hosts as
-// seed peers.
 async fn setup_mock_scheduler(hosts: Vec<Host>) -> MockServer {
-    init_crypto();
-
     let mut mocks = MockSet::new();
     mocks.mock(|when, then| {
         when.path("/scheduler.v2.Scheduler/ListHosts");
@@ -63,9 +51,6 @@ async fn setup_mock_scheduler(hosts: Vec<Host>) -> MockServer {
     server
 }
 
-// Mock seed peer service for benchmarking, which responds to health checks
-// from the seed peer selector and serves download task requests with the
-// given mocks.
 async fn setup_mock_seed_peer(mut mocks: MockSet) -> MockServer {
     mocks.mock(|when, then| {
         when.path("/grpc.health.v1.Health/Check");
@@ -79,8 +64,6 @@ async fn setup_mock_seed_peer(mut mocks: MockSet) -> MockServer {
     server
 }
 
-// Creates a seed peer host pointing at the mock seed peer server and the
-// mock seed peer proxy.
 fn create_seed_peer_host(name: &str, port: u16, proxy_port: u16) -> Host {
     Host {
         id: name.to_string(),
@@ -94,19 +77,14 @@ fn create_seed_peer_host(name: &str, port: u16, proxy_port: u16) -> Host {
     }
 }
 
-// Mock seed peer proxy for benchmarking, which serves the proxied GET requests
-// with the given mocks.
 async fn setup_mock_seed_peer_proxy(mocks: MockSet) -> MockServer {
     let server = MockServer::new_http("seed-peer-proxy").with_mocks(mocks);
     server.start().await.unwrap();
     server
 }
 
-// setup_bench_proxy starts a mock scheduler with a single seed peer serving
-// the given body through its proxy, and returns the proxy client under
-// benchmark and the seed peer proxy endpoint, along with the mock servers
-// that must be kept alive for the duration of the benchmarks.
 async fn setup_bench_proxy(body: Vec<u8>) -> (Proxy, String, (MockServer, MockServer, MockServer)) {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let mut proxy_mocks = MockSet::new();
     proxy_mocks.mock(|when, then| {
         when.get().path("/file.txt");

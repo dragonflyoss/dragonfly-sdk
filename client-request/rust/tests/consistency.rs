@@ -24,8 +24,6 @@ use dragonfly_client_util::id_generator::{IDGenerator, TaskIDParameter};
 use siphasher::sip::SipHasher;
 use std::hash::Hasher;
 
-/// Computes the hash of the vnode with the Rust `Hash` encoding: the replica
-/// id as 8 native-endian bytes, the name bytes and the 0xff terminator.
 fn vnode_hash(id: usize, name: &str) -> u64 {
     let mut hasher = SipHasher::new();
     hasher.write_usize(id);
@@ -34,8 +32,6 @@ fn vnode_hash(id: usize, name: &str) -> u64 {
     hasher.finish()
 }
 
-/// Computes the hash of the key with the Rust `Hash` encoding: the key bytes
-/// and the 0xff terminator.
 fn key_hash(key: &str) -> u64 {
     let mut hasher = SipHasher::new();
     hasher.write(key.as_bytes());

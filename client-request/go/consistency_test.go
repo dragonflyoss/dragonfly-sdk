@@ -31,8 +31,6 @@ import (
 	"d7y.io/dragonfly-sdk/client-request/go/internal/hashring"
 )
 
-// vnodeHash computes the hash of the vnode with the Rust Hash encoding: the
-// replica id as 8 native-endian bytes, the name bytes and the 0xff terminator.
 func vnodeHash(id uint64, name string) uint64 {
 	buf := make([]byte, 0, 8+len(name)+1)
 	buf = binary.LittleEndian.AppendUint64(buf, id)
@@ -41,8 +39,6 @@ func vnodeHash(id uint64, name string) uint64 {
 	return siphash.Hash(0, 0, buf)
 }
 
-// keyHash computes the hash of the key with the Rust Hash encoding: the key
-// bytes and the 0xff terminator.
 func keyHash(key string) uint64 {
 	buf := make([]byte, 0, len(key)+1)
 	buf = append(buf, key...)
@@ -95,9 +91,6 @@ func TestHashring(t *testing.T) {
 	}, sel("task-a", 100))
 }
 
-// TestTaskID asserts the fixed task id vectors shared with the Rust
-// test suite (client-request/rust/tests/consistency.rs). Both sides must
-// produce the same outputs; do not change one without the other.
 func TestTaskID(t *testing.T) {
 	assert := assert.New(t)
 

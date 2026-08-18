@@ -1431,18 +1431,8 @@ mod tests {
     use tonic_health::pb::health_check_response::ServingStatus;
     use tonic_health::pb::HealthCheckResponse;
 
-    // Installs the default crypto provider once for the TLS backed clients.
-    fn init_crypto() {
-        static INIT: std::sync::Once = std::sync::Once::new();
-        INIT.call_once(|| {
-            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        });
-    }
-
-    // Mock scheduler service for testing, which returns the given hosts as seed peers.
     async fn setup_mock_scheduler(hosts: Vec<Host>) -> Result<mocktail::server::MockServer> {
-        init_crypto();
-
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let mut mocks = MockSet::new();
         mocks.mock(|when, then| {
             when.path("/scheduler.v2.Scheduler/ListHosts");
@@ -1457,8 +1447,6 @@ mod tests {
         Ok(server)
     }
 
-    // Mock seed peer service for testing, which responds to health checks from the
-    // seed peer selector and serves download task requests with the given mocks.
     async fn setup_mock_seed_peer(mut mocks: MockSet) -> Result<mocktail::server::MockServer> {
         mocks.mock(|when, then| {
             when.path("/grpc.health.v1.Health/Check");
@@ -1475,8 +1463,6 @@ mod tests {
         Ok(server)
     }
 
-    // Creates a seed peer host pointing at the mock seed peer server and the
-    // mock seed peer proxy.
     fn create_seed_peer_host(name: &str, port: u16, proxy_port: u16) -> Host {
         Host {
             id: name.to_string(),
@@ -1490,8 +1476,6 @@ mod tests {
         }
     }
 
-    // Mock seed peer proxy for testing, which serves the proxied GET requests
-    // with the given mocks.
     async fn setup_mock_seed_peer_proxy(mocks: MockSet) -> Result<mocktail::server::MockServer> {
         let server = MockServer::new_http("seed-peer-proxy").with_mocks(mocks);
         server.start().await.map_err(|err| {
@@ -1741,9 +1725,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_scatters_across_replicas() {
-        // A bad and a good seed peer proxy; with 2 replicas and the default
-        // max retries the request covers both seed peers, so it succeeds no
-        // matter which one is picked first.
         let mut bad_mocks = MockSet::new();
         bad_mocks.mock(|when, then| {
             when.get().path("/file.txt");
@@ -1872,13 +1853,6 @@ mod tests {
         assert!(matches!(result, Err(Error::InvalidArgument(_))));
     }
 
-    // Asserts the core invariant of the replicas design: the seed peers that a
-    // preheat writes to are exactly the seed peers that downloads of the same
-    // task scatter across. The expected seed peers of each case are pinned by
-    // the endpoint selection vectors. Only the expected seed peers serve the
-    // download task mock, so the preheat fails if any other seed peer is
-    // selected, and the proxy bodies identify the seed peers that the
-    // downloads hit.
     #[tokio::test]
     async fn test_preheat_and_get_hit_same_seed_peers() {
         let cases = [
@@ -1965,9 +1939,6 @@ mod tests {
         }
     }
 
-    // Asserts the fixed endpoint selection vectors shared with the Go test suite
-    // (client-request/go/request_test.go). Both sides must produce the same
-    // outputs, do not change one without the other.
     #[tokio::test]
     async fn test_lookup_endpoints() {
         let mut servers = Vec::new();

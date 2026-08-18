@@ -122,10 +122,6 @@ func TestGetInto(t *testing.T) {
 	assert.Equal("hello dragonfly", buf.String())
 }
 
-// TestGetErrorTypes asserts the error mapping of the X-Dragonfly-Error-Type
-// header returned by the seed peer proxy. The mock proxy echoes the request
-// tag as the error type, so each case scopes its error type without sharing
-// state with the handler.
 func TestGetErrorTypes(t *testing.T) {
 	proxyPort := setupMockSeedPeerProxy(t, func(w http.ResponseWriter, r *http.Request) {
 		if errorType := r.Header.Get("X-Dragonfly-Tag"); errorType != "" {
@@ -274,9 +270,6 @@ func TestGetIntoTimeout(t *testing.T) {
 	assert.ErrorIs(err, ErrRequestTimeout)
 }
 
-// TestLookupEndpoints asserts the fixed endpoint selection vectors
-// shared with the Rust test suite (client-request/rust/src/lib.rs). Both sides
-// must produce the same outputs; do not change one without the other.
 func TestLookupEndpoints(t *testing.T) {
 	assert := assert.New(t)
 	endpoints := make(map[string]string, 3)
@@ -382,8 +375,6 @@ func TestLookupEndpointsNoAvailableSeedPeers(t *testing.T) {
 	assert.ErrorContains(err, "failed to select seed peers")
 }
 
-// TestTaskIDBlobDigestDisabled asserts that a blob url falls back to url based
-// task id when the blob digest based task id is disabled.
 func TestTaskIDBlobDigestDisabled(t *testing.T) {
 	assert := assert.New(t)
 
