@@ -19,6 +19,7 @@ package request
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -48,7 +49,7 @@ func (s *mockScheduler) ListHosts(ctx context.Context, req *schedulerv2.ListHost
 }
 
 // setupMockScheduler starts a mock scheduler and returns its endpoint.
-func setupMockScheduler(t *testing.T, hosts []*commonv2.Host) string {
+func setupMockScheduler(t testing.TB, hosts []*commonv2.Host) string {
 	t.Helper()
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -95,12 +96,12 @@ func (s *mockSeedPeer) DownloadTask(req *dfdaemonv2.DownloadTaskRequest, stream 
 }
 
 // setupMockSeedPeer starts a mock seed peer and returns its port.
-func setupMockSeedPeer(t *testing.T, downloadErr error) int32 {
+func setupMockSeedPeer(t testing.TB, downloadErr error) int32 {
 	return setupMockSeedPeerServer(t, &mockSeedPeer{downloadErr: downloadErr})
 }
 
 // setupMockSeedPeerServer starts the given mock seed peer and returns its port.
-func setupMockSeedPeerServer(t *testing.T, peer *mockSeedPeer) int32 {
+func setupMockSeedPeerServer(t testing.TB, peer *mockSeedPeer) int32 {
 	t.Helper()
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -137,7 +138,7 @@ func createSeedPeerHost(name string, port, proxyPort int32) *commonv2.Host {
 
 // setupMockSeedPeerProxy starts an HTTP server acting as the seed peer proxy
 // and returns its port.
-func setupMockSeedPeerProxy(t *testing.T, handler http.HandlerFunc) int32 {
+func setupMockSeedPeerProxy(t testing.TB, handler http.HandlerFunc) int32 {
 	t.Helper()
 
 	server := httptest.NewServer(handler)
@@ -172,4 +173,98 @@ func TestNewRequestDefaults(t *testing.T) {
 	assert.Equal(2, image.replicas)
 	assert.Equal(4, image.concurrentTaskCount)
 	assert.Equal(30*time.Minute, image.timeout)
+}
+
+// setupBenchProxy starts a mock scheduler with a single seed peer serving the
+// given body through its proxy, and returns the proxy client along with the
+// seed peer proxy endpoint.
+func setupBenchProxy(b *testing.B, body []byte) (*Proxy, string) {
+	b.Helper()
+
+	proxyPort := setupMockSeedPeerProxy(b, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(body)
+	})
+	port := setupMockSeedPeer(b, nil)
+	endpoint := setupMockScheduler(b, []*commonv2.Host{createSeedPeerHost("seed-peer-1", port, proxyPort)})
+
+	proxy, err := New(context.Background(), endpoint)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { proxy.Close() })
+
+	return proxy, fmt.Sprintf("http://127.0.0.1:%d", proxyPort)
+}
+
+func BenchmarkGet(b *testing.B) {
+	proxy, _ := setupBenchProxy(b, make([]byte, 64*1024))
+	req := NewGetRequest("http://example.com/file.txt", WithGetRequestReplicas(1))
+
+	b.ReportAllocs()
+	for b.Loop() {
+		resp, err := proxy.Get(context.Background(), req)
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+			b.Fatal(err)
+		}
+		resp.Body.Close()
+	}
+}
+
+func BenchmarkGetInto(b *testing.B) {
+	proxy, _ := setupBenchProxy(b, make([]byte, 64*1024))
+	req := NewGetRequest("http://example.com/file.txt", WithGetRequestReplicas(1))
+
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err := proxy.GetInto(context.Background(), req, io.Discard); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkGetWithEndpoints(b *testing.B) {
+	proxy, endpoint := setupBenchProxy(b, make([]byte, 64*1024))
+	endpoints := []string{endpoint}
+	req := NewGetRequest("http://example.com/file.txt", WithGetRequestReplicas(1))
+
+	b.ReportAllocs()
+	for b.Loop() {
+		resp, err := proxy.GetWithEndpoints(context.Background(), endpoints, req)
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+			b.Fatal(err)
+		}
+		resp.Body.Close()
+	}
+}
+
+func BenchmarkLookupEndpoints(b *testing.B) {
+	proxy, _ := setupBenchProxy(b, nil)
+	req := NewGetRequest("http://example.com/file.txt")
+
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err := proxy.LookupEndpoints(context.Background(), req); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkPreheat(b *testing.B) {
+	proxy, _ := setupBenchProxy(b, nil)
+	req := NewPreheatRequest("http://example.com/file.txt", WithPreheatRequestReplicas(1))
+
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := proxy.Preheat(context.Background(), req); err != nil {
+			b.Fatal(err)
+		}
+	}
 }
