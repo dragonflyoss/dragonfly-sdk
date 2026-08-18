@@ -18,7 +18,7 @@
 //!
 //! Usage: cargo run --example get -- <scheduler-endpoint> <url>
 
-use dragonfly_client_request::{GetRequest, Proxy, Request};
+use dragonfly_client_request::{Builder, Client, GetRequest};
 use futures::TryStreamExt;
 use tokio::io::AsyncWriteExt;
 
@@ -30,12 +30,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    let proxy = Proxy::builder()
+    let client = Builder::default()
         .scheduler_endpoint(args[1].clone())
         .build()
         .await?;
 
-    let response = proxy
+    let response = client
         .get(&GetRequest {
             url: args[2].clone(),
             ..Default::default()

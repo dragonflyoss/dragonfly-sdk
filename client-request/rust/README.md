@@ -10,15 +10,15 @@ and preheating files or OCI images through seed peers.
 ## Usage
 
 ```rust
-use dragonfly_client_request::{GetRequest, Proxy, Request};
+use dragonfly_client_request::{Builder, Client, GetRequest};
 use futures::TryStreamExt;
 
-let proxy = Proxy::builder()
+let client = Builder::default()
     .scheduler_endpoint("http://127.0.0.1:8002".to_string())
     .build()
     .await?;
 
-let response = proxy
+let response = client
     .get(&GetRequest {
         url: "https://example.com/file.txt".to_string(),
         ..Default::default()
@@ -40,7 +40,7 @@ peers are fewer than the replicas, while downloading clamps the replicas to
 the available seed peers. The default replicas is 2:
 
 ```rust
-proxy
+client
     .preheat(&PreheatRequest {
         url: "https://example.com/file.txt".to_string(),
         replicas: 3,
@@ -48,7 +48,7 @@ proxy
     })
     .await?;
 
-let response = proxy
+let response = client
     .get(&GetRequest {
         url: "https://example.com/file.txt".to_string(),
         replicas: 3,
@@ -66,11 +66,11 @@ let request = GetRequest {
     ..Default::default()
 };
 
-let endpoints = proxy.lookup_endpoints(&request).await?;
-let response = proxy.get_with_endpoints(&endpoints, &request).await?;
+let endpoints = client.lookup_endpoints(&request).await?;
+let response = client.get_with_endpoints(&endpoints, &request).await?;
 
 // Or write the response body directly into a buffer:
-// let response = proxy.get_into_with_endpoints(&endpoints, &request, &mut buf).await?;
+// let response = client.get_into_with_endpoints(&endpoints, &request, &mut buf).await?;
 ```
 
 The `preheat` feature enables preheating OCI images by resolving manifests from

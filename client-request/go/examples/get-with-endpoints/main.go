@@ -39,21 +39,21 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	proxy, err := request.New(ctx, os.Args[1])
+	client, err := request.New(ctx, os.Args[1])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	defer proxy.Close()
+	defer client.Close()
 
 	req := request.NewGetRequest(os.Args[2])
-	endpoints, err := proxy.LookupEndpoints(ctx, req)
+	endpoints, err := client.LookupEndpoints(ctx, req)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 
-	resp, err := proxy.GetWithEndpoints(ctx, endpoints, req)
+	resp, err := client.GetWithEndpoints(ctx, endpoints, req)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

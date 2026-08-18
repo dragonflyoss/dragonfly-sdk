@@ -33,10 +33,10 @@ func TestNewSuccess(t *testing.T) {
 	assert := assert.New(t)
 	endpoint := setupMockScheduler(t, nil)
 
-	proxy, err := New(context.Background(), endpoint)
+	c, err := New(context.Background(), endpoint)
 	assert.NoError(err)
-	assert.Equal(uint8(1), proxy.maxRetries)
-	proxy.Close()
+	assert.Equal(uint8(1), c.(*client).maxRetries)
+	c.Close()
 }
 
 func TestNewEmptyEndpoint(t *testing.T) {
@@ -49,7 +49,7 @@ func TestNewInvalidRetryTimes(t *testing.T) {
 	assert := assert.New(t)
 	endpoint := setupMockScheduler(t, nil)
 
-	_, err := New(context.Background(), endpoint, WithProxyMaxRetries(11))
+	_, err := New(context.Background(), endpoint, WithClientMaxRetries(11))
 	assert.ErrorIs(err, ErrInvalidArgument)
 }
 
@@ -57,7 +57,7 @@ func TestNewInvalidHealthCheckInterval(t *testing.T) {
 	assert := assert.New(t)
 	endpoint := setupMockScheduler(t, nil)
 
-	_, err := New(context.Background(), endpoint, WithProxyHealthCheckInterval(0))
+	_, err := New(context.Background(), endpoint, WithClientHealthCheckInterval(0))
 	assert.ErrorIs(err, ErrInvalidArgument)
 }
 
@@ -73,9 +73,9 @@ func TestGet(t *testing.T) {
 	port := setupMockSeedPeer(t, nil)
 	endpoint := setupMockScheduler(t, []*commonv2.Host{createSeedPeerHost("seed-peer-1", port, proxyPort)})
 
-	proxy, err := New(context.Background(), endpoint)
+	client, err := New(context.Background(), endpoint)
 	assert.NoError(err)
-	defer proxy.Close()
+	defer client.Close()
 
 	req := NewGetRequest(
 		"http://example.com/file.txt",
@@ -84,7 +84,7 @@ func TestGet(t *testing.T) {
 		WithGetRequestApplication("app1"),
 	)
 
-	resp, err := proxy.Get(context.Background(), req)
+	resp, err := client.Get(context.Background(), req)
 	assert.NoError(err)
 	defer resp.Body.Close()
 
@@ -108,12 +108,12 @@ func TestGetInto(t *testing.T) {
 	port := setupMockSeedPeer(t, nil)
 	endpoint := setupMockScheduler(t, []*commonv2.Host{createSeedPeerHost("seed-peer-1", port, proxyPort)})
 
-	proxy, err := New(context.Background(), endpoint)
+	client, err := New(context.Background(), endpoint)
 	assert.NoError(err)
-	defer proxy.Close()
+	defer client.Close()
 
 	var buf bytes.Buffer
-	resp, err := proxy.GetInto(context.Background(), NewGetRequest("http://example.com/file.txt", WithGetRequestReplicas(1)), &buf)
+	resp, err := client.GetInto(context.Background(), NewGetRequest("http://example.com/file.txt", WithGetRequestReplicas(1)), &buf)
 	assert.NoError(err)
 
 	assert.True(resp.Success)
@@ -134,9 +134,9 @@ func TestGetErrorTypes(t *testing.T) {
 	port := setupMockSeedPeer(t, nil)
 	endpoint := setupMockScheduler(t, []*commonv2.Host{createSeedPeerHost("seed-peer-1", port, proxyPort)})
 
-	proxy, err := New(context.Background(), endpoint)
+	client, err := New(context.Background(), endpoint)
 	assert.NoError(t, err)
-	defer proxy.Close()
+	defer client.Close()
 
 	get := func(tag string) error {
 		opts := []GetRequestOption{WithGetRequestReplicas(1)}
@@ -144,7 +144,7 @@ func TestGetErrorTypes(t *testing.T) {
 			opts = append(opts, WithGetRequestTag(tag))
 		}
 
-		_, err := proxy.Get(context.Background(), NewGetRequest("http://example.com/file.txt", opts...))
+		_, err := client.Get(context.Background(), NewGetRequest("http://example.com/file.txt", opts...))
 		return err
 	}
 
@@ -192,11 +192,11 @@ func TestGetScattersAcrossReplicas(t *testing.T) {
 		createSeedPeerHost("seed-peer-2", setupMockSeedPeer(t, nil), goodProxyPort),
 	})
 
-	proxy, err := New(context.Background(), endpoint)
+	client, err := New(context.Background(), endpoint)
 	assert.NoError(err)
-	defer proxy.Close()
+	defer client.Close()
 
-	resp, err := proxy.Get(context.Background(), NewGetRequest("http://example.com/file.txt", WithGetRequestReplicas(2)))
+	resp, err := client.Get(context.Background(), NewGetRequest("http://example.com/file.txt", WithGetRequestReplicas(2)))
 	assert.NoError(err)
 	defer resp.Body.Close()
 
@@ -213,12 +213,12 @@ func TestGetWithEndpoints(t *testing.T) {
 	})
 	endpoint := setupMockScheduler(t, nil)
 
-	proxy, err := New(context.Background(), endpoint)
+	client, err := New(context.Background(), endpoint)
 	assert.NoError(err)
-	defer proxy.Close()
+	defer client.Close()
 
 	endpoints := []string{"http://127.0.0.1:1", fmt.Sprintf("http://127.0.0.1:%d", goodProxyPort)}
-	resp, err := proxy.GetWithEndpoints(context.Background(), endpoints, NewGetRequest("http://example.com/file.txt"))
+	resp, err := client.GetWithEndpoints(context.Background(), endpoints, NewGetRequest("http://example.com/file.txt"))
 	assert.NoError(err)
 	defer resp.Body.Close()
 
@@ -231,11 +231,11 @@ func TestGetWithEndpointsEmpty(t *testing.T) {
 	assert := assert.New(t)
 	endpoint := setupMockScheduler(t, nil)
 
-	proxy, err := New(context.Background(), endpoint)
+	client, err := New(context.Background(), endpoint)
 	assert.NoError(err)
-	defer proxy.Close()
+	defer client.Close()
 
-	_, err = proxy.GetWithEndpoints(context.Background(), nil, NewGetRequest("http://example.com/file.txt"))
+	_, err = client.GetWithEndpoints(context.Background(), nil, NewGetRequest("http://example.com/file.txt"))
 	assert.ErrorIs(err, ErrInvalidArgument)
 }
 
@@ -243,11 +243,11 @@ func TestGetInvalidReplicas(t *testing.T) {
 	assert := assert.New(t)
 	endpoint := setupMockScheduler(t, nil)
 
-	proxy, err := New(context.Background(), endpoint)
+	client, err := New(context.Background(), endpoint)
 	assert.NoError(err)
-	defer proxy.Close()
+	defer client.Close()
 
-	_, err = proxy.Get(context.Background(), NewGetRequest("http://example.com/file.txt", WithGetRequestReplicas(0)))
+	_, err = client.Get(context.Background(), NewGetRequest("http://example.com/file.txt", WithGetRequestReplicas(0)))
 	assert.ErrorIs(err, ErrInvalidArgument)
 }
 
@@ -260,13 +260,13 @@ func TestGetIntoTimeout(t *testing.T) {
 	port := setupMockSeedPeer(t, nil)
 	endpoint := setupMockScheduler(t, []*commonv2.Host{createSeedPeerHost("seed-peer-1", port, proxyPort)})
 
-	proxy, err := New(context.Background(), endpoint)
+	client, err := New(context.Background(), endpoint)
 	assert.NoError(err)
-	defer proxy.Close()
+	defer client.Close()
 
 	var buf bytes.Buffer
 	req := NewGetRequest("http://example.com/file.txt", WithGetRequestReplicas(1), WithGetRequestTimeout(50*time.Millisecond))
-	_, err = proxy.GetInto(context.Background(), req, &buf)
+	_, err = client.GetInto(context.Background(), req, &buf)
 	assert.ErrorIs(err, ErrRequestTimeout)
 }
 
@@ -281,9 +281,9 @@ func TestLookupEndpoints(t *testing.T) {
 	}
 	endpoint := setupMockScheduler(t, hosts)
 
-	proxy, err := New(context.Background(), endpoint)
+	client, err := New(context.Background(), endpoint)
 	assert.NoError(err)
-	defer proxy.Close()
+	defer client.Close()
 
 	blobURL := "http://registry.example.com/v2/library/ubuntu/blobs/sha256:b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e"
 	tests := []struct {
@@ -356,7 +356,7 @@ func TestLookupEndpoints(t *testing.T) {
 			expected = append(expected, endpoints[name])
 		}
 
-		addrs, err := proxy.LookupEndpoints(context.Background(), tt.req)
+		addrs, err := client.LookupEndpoints(context.Background(), tt.req)
 		assert.NoError(err)
 		assert.Equal(expected, addrs)
 	}
@@ -366,11 +366,11 @@ func TestLookupEndpointsNoAvailableSeedPeers(t *testing.T) {
 	assert := assert.New(t)
 	endpoint := setupMockScheduler(t, nil)
 
-	proxy, err := New(context.Background(), endpoint)
+	client, err := New(context.Background(), endpoint)
 	assert.NoError(err)
-	defer proxy.Close()
+	defer client.Close()
 
-	_, err = proxy.LookupEndpoints(context.Background(), NewGetRequest("http://example.com/payload.txt"))
+	_, err = client.LookupEndpoints(context.Background(), NewGetRequest("http://example.com/payload.txt"))
 	assert.ErrorIs(err, ErrInternal)
 	assert.ErrorContains(err, "failed to select seed peers")
 }

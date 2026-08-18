@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-//! Benchmarks for the `Request` trait implemented by `Proxy`, mirroring the
+//! Benchmarks for the `Client` trait, mirroring the
 //! Go `BenchmarkGet`/`BenchmarkGetInto`/`BenchmarkGetWithEndpoints`/
 //! `BenchmarkLookupEndpoints`/`BenchmarkPreheat` benchmarks: a mock scheduler
 //! with a single seed peer serving a fixed body through its proxy.
@@ -27,7 +27,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use dragonfly_api::common::v2::Host;
 use dragonfly_api::dfdaemon::v2::DownloadTaskResponse;
 use dragonfly_api::scheduler::v2::ListHostsResponse;
-use dragonfly_client_request::{GetRequest, PreheatRequest, Proxy, Request};
+use dragonfly_client_request::{Builder, Client, GetRequest, PreheatRequest};
 use futures::TryStreamExt;
 use mocktail::prelude::*;
 use mocktail::server::MockServer;
@@ -83,7 +83,9 @@ async fn setup_mock_seed_peer_proxy(mocks: MockSet) -> MockServer {
     server
 }
 
-async fn setup_bench_proxy(body: Vec<u8>) -> (Proxy, String, (MockServer, MockServer, MockServer)) {
+async fn setup_bench_client(
+    body: Vec<u8>,
+) -> (impl Client, String, (MockServer, MockServer, MockServer)) {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let mut proxy_mocks = MockSet::new();
     proxy_mocks.mock(|when, then| {
@@ -112,7 +114,7 @@ async fn setup_bench_proxy(body: Vec<u8>) -> (Proxy, String, (MockServer, MockSe
     .await;
 
     let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
-    let proxy = Proxy::builder()
+    let client = Builder::default()
         .scheduler_endpoint(scheduler_endpoint)
         .build()
         .await
@@ -120,7 +122,7 @@ async fn setup_bench_proxy(body: Vec<u8>) -> (Proxy, String, (MockServer, MockSe
 
     let proxy_endpoint = format!("http://127.0.0.1:{}", mock_proxy.port().unwrap());
     (
-        proxy,
+        client,
         proxy_endpoint,
         (mock_scheduler, mock_seed_peer, mock_proxy),
     )
@@ -128,7 +130,7 @@ async fn setup_bench_proxy(body: Vec<u8>) -> (Proxy, String, (MockServer, MockSe
 
 fn bench_request(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
-    let (proxy, proxy_endpoint, _servers) = rt.block_on(setup_bench_proxy(vec![b'a'; BODY_SIZE]));
+    let (client, proxy_endpoint, _servers) = rt.block_on(setup_bench_client(vec![b'a'; BODY_SIZE]));
 
     let request = GetRequest {
         url: "http://example.com/file.txt".to_string(),
@@ -139,7 +141,7 @@ fn bench_request(c: &mut Criterion) {
     let mut group = c.benchmark_group("request");
     group.bench_function("get", |b| {
         b.to_async(&rt).iter(|| async {
-            let response = proxy.get(&request).await.unwrap();
+            let response = client.get(&request).await.unwrap();
             let mut body = response.body.unwrap();
             while let Some(chunk) = body.try_next().await.unwrap() {
                 black_box(chunk);
@@ -150,7 +152,7 @@ fn bench_request(c: &mut Criterion) {
     group.bench_function("get_into", |b| {
         b.to_async(&rt).iter(|| async {
             let mut buf = BytesMut::new();
-            proxy.get_into(&request, &mut buf).await.unwrap();
+            client.get_into(&request, &mut buf).await.unwrap();
             black_box(&buf);
         })
     });
@@ -158,7 +160,7 @@ fn bench_request(c: &mut Criterion) {
     let endpoints = vec![proxy_endpoint.clone()];
     group.bench_function("get_with_endpoints", |b| {
         b.to_async(&rt).iter(|| async {
-            let response = proxy
+            let response = client
                 .get_with_endpoints(&endpoints, &request)
                 .await
                 .unwrap();
@@ -175,7 +177,7 @@ fn bench_request(c: &mut Criterion) {
     };
     group.bench_function("lookup_endpoints", |b| {
         b.to_async(&rt).iter(|| async {
-            black_box(proxy.lookup_endpoints(&lookup_request).await.unwrap());
+            black_box(client.lookup_endpoints(&lookup_request).await.unwrap());
         })
     });
 
@@ -190,7 +192,7 @@ fn bench_request(c: &mut Criterion) {
         .measurement_time(Duration::from_secs(1));
     group.bench_function("preheat", |b| {
         b.to_async(&rt).iter(|| async {
-            proxy.preheat(&preheat_request).await.unwrap();
+            client.preheat(&preheat_request).await.unwrap();
         })
     });
     group.finish();

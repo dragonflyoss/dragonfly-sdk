@@ -20,7 +20,7 @@
 //!
 //! Usage: cargo run --example replicas -- <scheduler-endpoint> <url>
 
-use dragonfly_client_request::{GetRequest, PreheatRequest, Proxy, Request};
+use dragonfly_client_request::{Builder, Client, GetRequest, PreheatRequest};
 use futures::TryStreamExt;
 use tokio::io::AsyncWriteExt;
 
@@ -32,13 +32,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    let proxy = Proxy::builder()
+    let client = Builder::default()
         .scheduler_endpoint(args[1].clone())
         .build()
         .await?;
 
     // Preheat the file to 3 replicas of seed peers.
-    proxy
+    client
         .preheat(&PreheatRequest {
             url: args[2].clone(),
             replicas: 3,
@@ -47,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     // Download the file with the request scattered across the 3 replicas.
-    let response = proxy
+    let response = client
         .get(&GetRequest {
             url: args[2].clone(),
             replicas: 3,

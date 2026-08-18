@@ -19,7 +19,7 @@
 //!
 //! Usage: cargo run --example lookup_endpoints -- <scheduler-endpoint> <url>
 
-use dragonfly_client_request::{GetRequest, Proxy, Request};
+use dragonfly_client_request::{Builder, Client, GetRequest};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -29,12 +29,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    let proxy = Proxy::builder()
+    let client = Builder::default()
         .scheduler_endpoint(args[1].clone())
         .build()
         .await?;
 
-    let endpoints = proxy
+    let endpoints = client
         .lookup_endpoints(&GetRequest {
             url: args[2].clone(),
             ..Default::default()

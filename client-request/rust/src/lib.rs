@@ -33,10 +33,7 @@ use id_generator::{IDGenerator, TaskIDParameter};
 use net::{format_url, preferred_local_ip};
 use pool::{Builder as PoolBuilder, Entry, Factory, Pool};
 use rand::seq::SliceRandom;
-use reqwest::{
-    header::{HeaderMap, HeaderValue},
-    Client,
-};
+use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_tracing::TracingMiddleware;
 use rustls_pki_types::CertificateDer;
@@ -102,7 +99,7 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// The default number of seed peers serving a task.
 const DEFAULT_REPLICAS: usize = 2;
 
-/// A specialized Result type for the proxy module.
+/// A specialized Result type for the request module.
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// The type alias for the response body stream of zero-copy `Bytes` chunks.
@@ -117,7 +114,7 @@ pub type Body = Box<dyn Stream<Item = Result<Bytes>> + Send + Unpin>;
 /// Dragonfly seed client's proxy, abstracting the underlying communication details to simplify
 /// client implementation and usage.
 #[async_trait]
-pub trait Request {
+pub trait Client {
     /// Sends an GET request to a remote server via the Dragonfly and returns a response
     /// with a streaming body.
     ///
@@ -138,7 +135,7 @@ pub trait Request {
     /// Sends an GET request to a remote server via the given seed peer endpoints of the
     /// Dragonfly (e.g., the ones returned by `lookup_endpoints`), instead of selecting
     /// seed peers by the consistent hash ring. The request is sent to a randomly picked
-    /// endpoint and retried on the others up to the max retries of the proxy, and
+    /// endpoint and retried on the others up to the max retries of the client, and
     /// returns a response with a streaming body.
     async fn get_with_endpoints(
         &self,
@@ -149,7 +146,7 @@ pub trait Request {
     /// Sends an GET request to a remote server via the given seed peer endpoints of the
     /// Dragonfly and writes the response body directly into the provided buffer. The
     /// request is sent to a randomly picked endpoint and retried on the others up to
-    /// the max retries of the proxy.
+    /// the max retries of the client.
     async fn get_into_with_endpoints(
         &self,
         endpoints: &[String],
@@ -494,7 +491,7 @@ impl Factory<String, ClientWithMiddleware> for HTTPClientFactory {
     async fn make_client(&self, proxy_addr: &String) -> Result<ClientWithMiddleware> {
         // TODO(chlins): Support client certificates and set `danger_accept_invalid_certs`
         // based on the certificates.
-        let client = Client::builder()
+        let client = reqwest::Client::builder()
             .hickory_dns(true)
             .danger_accept_invalid_certs(true)
             .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
@@ -513,7 +510,7 @@ impl Factory<String, ClientWithMiddleware> for HTTPClientFactory {
     }
 }
 
-/// The builder for Proxy.
+/// The builder for the client.
 pub struct Builder {
     /// The endpoint of the scheduler service.
     scheduler_endpoint: String,
@@ -541,7 +538,7 @@ impl Default for Builder {
     }
 }
 
-/// Implements the builder pattern for Proxy.
+/// Implements the builder pattern for the client.
 impl Builder {
     /// Sets the scheduler endpoint.
     pub fn scheduler_endpoint(mut self, endpoint: String) -> Self {
@@ -567,8 +564,8 @@ impl Builder {
         self
     }
 
-    /// Builds and returns a Proxy instance.
-    pub async fn build(self) -> Result<Proxy> {
+    /// Builds and returns a client that implements the `Client` trait.
+    pub async fn build(self) -> Result<impl Client> {
         // Validate input parameters.
         self.validate()?;
 
@@ -616,7 +613,7 @@ impl Builder {
             .to_string_lossy()
             .to_string();
         let id_generator = IDGenerator::new(local_ip, hostname, true);
-        let proxy = Proxy {
+        Ok(client {
             seed_peer_selector,
             max_retries: self.max_retries,
             client_pool: Arc::new(
@@ -626,9 +623,7 @@ impl Builder {
                     .build(),
             ),
             id_generator: Arc::new(id_generator),
-        };
-
-        Ok(proxy)
+        })
     }
 
     /// Validates the input parameters.
@@ -659,9 +654,12 @@ impl Builder {
     }
 }
 
-/// The HTTP proxy client that sends requests via Dragonfly.
+/// The HTTP client that sends requests via Dragonfly, implementing the `Client`
+/// trait. The lowercase name intentionally mirrors the unexported `client` struct
+/// of the Go implementation, distinguished from the `Client` trait by case.
+#[allow(non_camel_case_types)]
 #[derive(Clone)]
-pub struct Proxy {
+struct client {
     /// The selector service for selecting seed peers.
     seed_peer_selector: Arc<SeedPeerSelector>,
 
@@ -675,14 +673,6 @@ pub struct Proxy {
     id_generator: Arc<IDGenerator>,
 }
 
-/// Implements the proxy client that sends requests via Dragonfly.
-impl Proxy {
-    /// Returns a new Builder for Proxy.
-    pub fn builder() -> Builder {
-        Builder::default()
-    }
-}
-
 /// Implements the interface for sending requests via the Dragonfly.
 ///
 /// This struct enables interaction with remote servers through the Dragonfly, providing methods
@@ -692,7 +682,7 @@ impl Proxy {
 /// Dragonfly seed client's proxy, abstracting the underlying communication details to simplify
 /// client implementation and usage.
 #[async_trait]
-impl Request for Proxy {
+impl Client for client {
     /// Sends an GET request to a remote server via the Dragonfly and returns a response
     /// with a streaming body.
     ///
@@ -779,7 +769,7 @@ impl Request for Proxy {
     /// Sends an GET request to a remote server via the given seed peer endpoints of the
     /// Dragonfly (e.g., the ones returned by `lookup_endpoints`), instead of selecting
     /// seed peers by the consistent hash ring. The request is sent to a randomly picked
-    /// endpoint and retried on the others up to the max retries of the proxy, and
+    /// endpoint and retried on the others up to the max retries of the client, and
     /// returns a response with a streaming body.
     async fn get_with_endpoints(
         &self,
@@ -817,7 +807,7 @@ impl Request for Proxy {
     /// Sends an GET request to a remote server via the given seed peer endpoints of the
     /// Dragonfly and writes the response body directly into the provided buffer. The
     /// request is sent to a randomly picked endpoint and retried on the others up to
-    /// the max retries of the proxy.
+    /// the max retries of the client.
     async fn get_into_with_endpoints(
         &self,
         endpoints: &[String],
@@ -929,7 +919,7 @@ impl Request for Proxy {
             .chain(manifest.layers.iter().map(|layer| &layer.digest))
         {
             let semaphore = semaphore.clone();
-            let proxy = self.clone();
+            let client = self.clone();
             let preheat_request = PreheatRequest {
                 url: Self::build_blob_url(registry, repository, digest),
                 header: header.clone(),
@@ -952,7 +942,7 @@ impl Request for Proxy {
                         .await
                         .map_err(|err| Error::Internal(err.to_string()))?;
 
-                    proxy.preheat(&preheat_request).await?;
+                    client.preheat(&preheat_request).await?;
                     debug!("preheated blob: {}", preheat_request.url);
                     Ok(())
                 }
@@ -1153,8 +1143,8 @@ impl Request for Proxy {
     }
 }
 
-/// Implements proxy request logic.
-impl Proxy {
+/// Implements client request logic.
+impl client {
     /// Looks up the proxy endpoints of the seed peers serving the request, in the
     /// consistent hash ring selection order.
     async fn lookup_proxy_endpoints(&self, request: &GetRequest) -> Result<Vec<String>> {
@@ -1204,7 +1194,7 @@ impl Proxy {
     }
 
     /// Scatters the request across the given seed peer endpoints: it tries randomly
-    /// picked endpoints one by one, limited by the max retries of the proxy.
+    /// picked endpoints one by one, limited by the max retries of the client.
     async fn send_with_endpoints(
         &self,
         endpoints: &[String],
@@ -1427,7 +1417,6 @@ impl Proxy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Request;
     use dragonfly_api::common::v2::Host;
     use dragonfly_api::dfdaemon::v2::DownloadTaskResponse;
     use dragonfly_api::scheduler::v2::ListHostsResponse;
@@ -1491,21 +1480,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_proxy_new_success() {
+    async fn test_client_new_success() {
         let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
         let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
-        let result = Proxy::builder()
+        let result = Builder::default()
             .scheduler_endpoint(scheduler_endpoint)
             .build()
             .await;
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap().max_retries, 1);
     }
 
     #[tokio::test]
-    async fn test_proxy_new_empty_endpoint() {
-        let result = Proxy::builder()
+    async fn test_client_new_empty_endpoint() {
+        let result = Builder::default()
             .scheduler_endpoint("".to_string())
             .build()
             .await;
@@ -1515,11 +1503,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_proxy_new_invalid_retry_times() {
+    async fn test_client_new_invalid_retry_times() {
         let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
 
         let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
-        let result = Proxy::builder()
+        let result = Builder::default()
             .scheduler_endpoint(scheduler_endpoint)
             .max_retries(11)
             .build()
@@ -1530,11 +1518,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_proxy_new_invalid_health_check_interval() {
+    async fn test_client_new_invalid_health_check_interval() {
         let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
 
         let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
-        let result = Proxy::builder()
+        let result = Builder::default()
             .scheduler_endpoint(scheduler_endpoint)
             .max_retries(11)
             .build()
@@ -1548,7 +1536,7 @@ mod tests {
     async fn test_preheat_file_no_available_seed_peers() {
         let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
         let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
-        let proxy = Proxy::builder()
+        let client = Builder::default()
             .scheduler_endpoint(scheduler_endpoint)
             .build()
             .await
@@ -1562,7 +1550,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = proxy.preheat(&request).await;
+        let result = client.preheat(&request).await;
         assert!(
             matches!(result, Err(Error::Internal(message)) if message.contains("failed to select seed peers"))
         );
@@ -1599,7 +1587,7 @@ mod tests {
         .unwrap();
 
         let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
-        let proxy = Proxy::builder()
+        let client = Builder::default()
             .scheduler_endpoint(scheduler_endpoint)
             .build()
             .await
@@ -1613,7 +1601,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = proxy.preheat(&request).await;
+        let result = client.preheat(&request).await;
         assert!(result.is_ok(), "preheat should succeed: {:?}", result.err());
     }
 
@@ -1629,7 +1617,7 @@ mod tests {
         .unwrap();
 
         let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
-        let proxy = Proxy::builder()
+        let client = Builder::default()
             .scheduler_endpoint(scheduler_endpoint)
             .build()
             .await
@@ -1640,7 +1628,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = proxy.preheat(&request).await;
+        let result = client.preheat(&request).await;
         assert!(
             matches!(result, Err(Error::Internal(message)) if message.contains("insufficient seed peers"))
         );
@@ -1665,7 +1653,7 @@ mod tests {
         .unwrap();
 
         let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
-        let proxy = Proxy::builder()
+        let client = Builder::default()
             .scheduler_endpoint(scheduler_endpoint)
             .build()
             .await
@@ -1677,7 +1665,7 @@ mod tests {
             ..Default::default()
         };
 
-        let response = proxy.get(&request).await.unwrap();
+        let response = client.get(&request).await.unwrap();
         assert!(response.success);
         assert_eq!(response.status_code, Some(reqwest::StatusCode::OK));
 
@@ -1708,7 +1696,7 @@ mod tests {
         .unwrap();
 
         let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
-        let proxy = Proxy::builder()
+        let client = Builder::default()
             .scheduler_endpoint(scheduler_endpoint)
             .build()
             .await
@@ -1721,7 +1709,7 @@ mod tests {
         };
 
         let mut buf = BytesMut::new();
-        let response = proxy.get_into(&request, &mut buf).await.unwrap();
+        let response = client.get_into(&request, &mut buf).await.unwrap();
         assert!(response.success);
         assert_eq!(response.status_code, Some(reqwest::StatusCode::OK));
         assert!(response.body.is_none());
@@ -1763,7 +1751,7 @@ mod tests {
         .unwrap();
 
         let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
-        let proxy = Proxy::builder()
+        let client = Builder::default()
             .scheduler_endpoint(scheduler_endpoint)
             .build()
             .await
@@ -1775,7 +1763,7 @@ mod tests {
         };
 
         let mut buf = BytesMut::new();
-        let response = proxy.get_into(&request, &mut buf).await.unwrap();
+        let response = client.get_into(&request, &mut buf).await.unwrap();
         assert!(response.success);
         assert_eq!(&buf[..], b"ok");
     }
@@ -1801,7 +1789,7 @@ mod tests {
         .unwrap();
 
         let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
-        let proxy = Proxy::builder()
+        let client = Builder::default()
             .scheduler_endpoint(scheduler_endpoint)
             .build()
             .await
@@ -1813,7 +1801,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = proxy.get(&request).await;
+        let result = client.get(&request).await;
         assert!(
             matches!(result, Err(Error::BackendError(err)) if err.message.as_deref() == Some("boom"))
         );
@@ -1823,7 +1811,7 @@ mod tests {
     async fn test_get_with_endpoints_empty() {
         let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
         let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
-        let proxy = Proxy::builder()
+        let client = Builder::default()
             .scheduler_endpoint(scheduler_endpoint)
             .build()
             .await
@@ -1834,7 +1822,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = proxy.get_with_endpoints(&[], &request).await;
+        let result = client.get_with_endpoints(&[], &request).await;
         assert!(matches!(result, Err(Error::InvalidArgument(_))));
     }
 
@@ -1842,7 +1830,7 @@ mod tests {
     async fn test_get_invalid_replicas() {
         let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
         let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
-        let proxy = Proxy::builder()
+        let client = Builder::default()
             .scheduler_endpoint(scheduler_endpoint)
             .build()
             .await
@@ -1854,7 +1842,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = proxy.get(&request).await;
+        let result = client.get(&request).await;
         assert!(matches!(result, Err(Error::InvalidArgument(_))));
     }
 
@@ -1911,7 +1899,7 @@ mod tests {
 
             let mock_scheduler = setup_mock_scheduler(hosts).await.unwrap();
             let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
-            let proxy = Proxy::builder()
+            let client = Builder::default()
                 .scheduler_endpoint(scheduler_endpoint)
                 .build()
                 .await
@@ -1922,7 +1910,7 @@ mod tests {
                 replicas,
                 ..Default::default()
             };
-            proxy.preheat(&preheat_request).await.unwrap();
+            client.preheat(&preheat_request).await.unwrap();
 
             let mut served = std::collections::HashSet::new();
             for _ in 0..10 {
@@ -1933,7 +1921,7 @@ mod tests {
                 };
 
                 let mut buf = BytesMut::new();
-                let response = proxy.get_into(&request, &mut buf).await.unwrap();
+                let response = client.get_into(&request, &mut buf).await.unwrap();
                 assert!(response.success);
                 served.insert(String::from_utf8(buf.to_vec()).unwrap());
             }
@@ -1959,7 +1947,7 @@ mod tests {
 
         let mock_scheduler = setup_mock_scheduler(hosts).await.unwrap();
         let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
-        let proxy = Proxy::builder()
+        let client = Builder::default()
             .scheduler_endpoint(scheduler_endpoint)
             .build()
             .await
@@ -2062,7 +2050,7 @@ mod tests {
                 .iter()
                 .map(|name| endpoints[name].clone())
                 .collect();
-            assert_eq!(proxy.lookup_endpoints(&request).await.unwrap(), expected);
+            assert_eq!(client.lookup_endpoints(&request).await.unwrap(), expected);
         }
     }
 
@@ -2070,7 +2058,7 @@ mod tests {
     async fn test_lookup_endpoints_no_available_seed_peers() {
         let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
         let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
-        let proxy = Proxy::builder()
+        let client = Builder::default()
             .scheduler_endpoint(scheduler_endpoint)
             .build()
             .await
@@ -2081,7 +2069,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = proxy.lookup_endpoints(&request).await;
+        let result = client.lookup_endpoints(&request).await;
         assert!(
             matches!(result, Err(Error::Internal(message)) if message.contains("failed to select seed peers"))
         );
@@ -2105,7 +2093,7 @@ mod tests {
         .unwrap();
 
         let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
-        let proxy = Proxy::builder()
+        let client = Builder::default()
             .scheduler_endpoint(scheduler_endpoint)
             .build()
             .await
@@ -2119,7 +2107,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = proxy.preheat(&request).await;
+        let result = client.preheat(&request).await;
         assert!(
             matches!(result, Err(Error::Internal(message)) if message.contains("failed to download task"))
         );
@@ -2130,7 +2118,7 @@ mod tests {
     async fn test_preheat_image_invalid_reference() {
         let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
         let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
-        let proxy = Proxy::builder()
+        let client = Builder::default()
             .scheduler_endpoint(scheduler_endpoint)
             .build()
             .await
@@ -2141,7 +2129,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = proxy.preheat_image(&request).await;
+        let result = client.preheat_image(&request).await;
         assert!(
             matches!(result, Err(Error::InvalidArgument(message)) if message.contains("invalid image reference"))
         );
@@ -2152,7 +2140,7 @@ mod tests {
     async fn test_preheat_image_invalid_platform() {
         let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
         let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
-        let proxy = Proxy::builder()
+        let client = Builder::default()
             .scheduler_endpoint(scheduler_endpoint)
             .build()
             .await
@@ -2164,7 +2152,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = proxy.preheat_image(&request).await;
+        let result = client.preheat_image(&request).await;
         assert!(
             matches!(result, Err(Error::InvalidArgument(message)) if message.contains("invalid platform format"))
         );
@@ -2175,7 +2163,7 @@ mod tests {
     async fn test_preheat_image_unreachable_registry() {
         let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
         let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
-        let proxy = Proxy::builder()
+        let client = Builder::default()
             .scheduler_endpoint(scheduler_endpoint)
             .build()
             .await
@@ -2186,7 +2174,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = proxy.preheat_image(&request).await;
+        let result = client.preheat_image(&request).await;
         assert!(
             matches!(result, Err(Error::Internal(message)) if message.contains("failed to pull image manifest"))
         );
@@ -2195,7 +2183,7 @@ mod tests {
     #[cfg(feature = "preheat")]
     #[test]
     fn test_build_blob_url_uses_https_by_default() {
-        let url = Proxy::build_blob_url("registry.example.com", "library/nginx", "sha256:abcdef");
+        let url = client::build_blob_url("registry.example.com", "library/nginx", "sha256:abcdef");
 
         assert_eq!(
             url,

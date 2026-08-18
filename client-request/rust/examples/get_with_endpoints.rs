@@ -20,7 +20,7 @@
 //!
 //! Usage: cargo run --example get_with_endpoints -- <scheduler-endpoint> <url>
 
-use dragonfly_client_request::{GetRequest, Proxy, Request};
+use dragonfly_client_request::{Builder, Client, GetRequest};
 use futures::TryStreamExt;
 use tokio::io::AsyncWriteExt;
 
@@ -32,7 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    let proxy = Proxy::builder()
+    let client = Builder::default()
         .scheduler_endpoint(args[1].clone())
         .build()
         .await?;
@@ -42,8 +42,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
 
-    let endpoints = proxy.lookup_endpoints(&request).await?;
-    let response = proxy.get_with_endpoints(&endpoints, &request).await?;
+    let endpoints = client.lookup_endpoints(&request).await?;
+    let response = client.get_with_endpoints(&endpoints, &request).await?;
 
     // The body is a stream of zero-copy `Bytes` chunks.
     let mut body = response.body.ok_or("missing response body")?;

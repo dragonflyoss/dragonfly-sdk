@@ -34,13 +34,13 @@ func TestPreheatNoAvailableSeedPeers(t *testing.T) {
 	assert := assert.New(t)
 	endpoint := setupMockScheduler(t, nil)
 
-	proxy, err := New(context.Background(), endpoint)
+	client, err := New(context.Background(), endpoint)
 	assert.NoError(err)
-	defer proxy.Close()
+	defer client.Close()
 
 	req := NewPreheatRequest("http://example.com/payload.txt", WithPreheatRequestTag("preheat"), WithPreheatRequestApplication("dfctl"))
 
-	err = proxy.Preheat(context.Background(), req)
+	err = client.Preheat(context.Background(), req)
 	assert.ErrorIs(err, ErrInternal)
 	assert.ErrorContains(err, "failed to select seed peers")
 }
@@ -50,13 +50,13 @@ func TestPreheatSucceedsWithSeedPeer(t *testing.T) {
 	port := setupMockSeedPeer(t, nil)
 	endpoint := setupMockScheduler(t, []*commonv2.Host{createSeedPeerHost("seed-peer-1", port, 0)})
 
-	proxy, err := New(context.Background(), endpoint)
+	client, err := New(context.Background(), endpoint)
 	assert.NoError(err)
-	defer proxy.Close()
+	defer client.Close()
 
 	req := NewPreheatRequest("http://example.com/payload.txt", WithPreheatRequestTag("preheat"), WithPreheatRequestApplication("dfctl"), WithPreheatRequestReplicas(1))
 
-	assert.NoError(proxy.Preheat(context.Background(), req))
+	assert.NoError(client.Preheat(context.Background(), req))
 }
 
 func TestPreheatInsufficientSeedPeers(t *testing.T) {
@@ -64,12 +64,12 @@ func TestPreheatInsufficientSeedPeers(t *testing.T) {
 	port := setupMockSeedPeer(t, nil)
 	endpoint := setupMockScheduler(t, []*commonv2.Host{createSeedPeerHost("seed-peer-1", port, 0)})
 
-	proxy, err := New(context.Background(), endpoint)
+	client, err := New(context.Background(), endpoint)
 	assert.NoError(err)
-	defer proxy.Close()
+	defer client.Close()
 
 	req := NewPreheatRequest("http://example.com/payload.txt")
-	err = proxy.Preheat(context.Background(), req)
+	err = client.Preheat(context.Background(), req)
 	assert.ErrorIs(err, ErrInternal)
 	assert.ErrorContains(err, "insufficient seed peers")
 }
@@ -79,13 +79,13 @@ func TestPreheatFailsWhenSeedPeerDownloadFails(t *testing.T) {
 	port := setupMockSeedPeer(t, status.Error(codes.Internal, "storage is full"))
 	endpoint := setupMockScheduler(t, []*commonv2.Host{createSeedPeerHost("seed-peer-1", port, 0)})
 
-	proxy, err := New(context.Background(), endpoint)
+	client, err := New(context.Background(), endpoint)
 	assert.NoError(err)
-	defer proxy.Close()
+	defer client.Close()
 
 	req := NewPreheatRequest("http://example.com/payload.txt", WithPreheatRequestTag("preheat"), WithPreheatRequestApplication("dfctl"), WithPreheatRequestReplicas(1))
 
-	err = proxy.Preheat(context.Background(), req)
+	err = client.Preheat(context.Background(), req)
 	assert.ErrorContains(err, "failed to download task")
 }
 
@@ -93,12 +93,12 @@ func TestPreheatImageInvalidReference(t *testing.T) {
 	assert := assert.New(t)
 	endpoint := setupMockScheduler(t, nil)
 
-	proxy, err := New(context.Background(), endpoint)
+	client, err := New(context.Background(), endpoint)
 	assert.NoError(err)
-	defer proxy.Close()
+	defer client.Close()
 
 	req := NewPreheatImageRequest("invalid image reference!!")
-	err = proxy.PreheatImage(context.Background(), req)
+	err = client.PreheatImage(context.Background(), req)
 	assert.ErrorContains(err, "invalid image reference")
 }
 
@@ -106,12 +106,12 @@ func TestPreheatImageInvalidPlatform(t *testing.T) {
 	assert := assert.New(t)
 	endpoint := setupMockScheduler(t, nil)
 
-	proxy, err := New(context.Background(), endpoint)
+	client, err := New(context.Background(), endpoint)
 	assert.NoError(err)
-	defer proxy.Close()
+	defer client.Close()
 
 	req := NewPreheatImageRequest("docker.io/library/nginx:latest", WithPreheatImageRequestPlatform("linux-amd64"))
-	err = proxy.PreheatImage(context.Background(), req)
+	err = client.PreheatImage(context.Background(), req)
 	assert.Error(err)
 }
 
@@ -119,14 +119,14 @@ func TestPreheatImageUnreachableRegistry(t *testing.T) {
 	assert := assert.New(t)
 	endpoint := setupMockScheduler(t, nil)
 
-	proxy, err := New(context.Background(), endpoint)
+	client, err := New(context.Background(), endpoint)
 	assert.NoError(err)
-	defer proxy.Close()
+	defer client.Close()
 
 	// Port 1 is reserved and refuses connections, so pulling the manifest fails.
 	req := NewPreheatImageRequest("127.0.0.1:1/library/nginx:latest", WithPreheatImageRequestTimeout(5*time.Second))
 
-	err = proxy.PreheatImage(context.Background(), req)
+	err = client.PreheatImage(context.Background(), req)
 	assert.Error(err)
 }
 
@@ -157,9 +157,9 @@ func TestPreheatAndGetHitSameSeedPeers(t *testing.T) {
 	}
 	endpoint := setupMockScheduler(t, hosts)
 
-	proxy, err := New(context.Background(), endpoint)
+	client, err := New(context.Background(), endpoint)
 	assert.NoError(t, err)
-	defer proxy.Close()
+	defer client.Close()
 
 	tests := []struct {
 		url      string
@@ -178,14 +178,14 @@ func TestPreheatAndGetHitSameSeedPeers(t *testing.T) {
 			clear(preheated)
 			clear(served)
 			mu.Unlock()
-			assert.NoError(proxy.Preheat(context.Background(), NewPreheatRequest(tt.url, WithPreheatRequestReplicas(tt.replicas))))
+			assert.NoError(client.Preheat(context.Background(), NewPreheatRequest(tt.url, WithPreheatRequestReplicas(tt.replicas))))
 
 			mu.Lock()
 			assert.Len(preheated, tt.replicas)
 			mu.Unlock()
 
 			for range 10 {
-				resp, err := proxy.Get(context.Background(), NewGetRequest(tt.url, WithGetRequestReplicas(tt.replicas)))
+				resp, err := client.Get(context.Background(), NewGetRequest(tt.url, WithGetRequestReplicas(tt.replicas)))
 				assert.NoError(err)
 				assert.NoError(resp.Body.Close())
 			}

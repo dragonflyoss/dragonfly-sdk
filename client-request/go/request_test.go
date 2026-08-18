@@ -162,7 +162,7 @@ func TestNewRequestDefaults(t *testing.T) {
 	assert.Equal(30*time.Minute, image.timeout)
 }
 
-func setupBenchProxy(b *testing.B, body []byte) (*Proxy, string) {
+func setupBenchClient(b *testing.B, body []byte) (Client, string) {
 	b.Helper()
 
 	proxyPort := setupMockSeedPeerProxy(b, func(w http.ResponseWriter, r *http.Request) {
@@ -171,22 +171,22 @@ func setupBenchProxy(b *testing.B, body []byte) (*Proxy, string) {
 	port := setupMockSeedPeer(b, nil)
 	endpoint := setupMockScheduler(b, []*commonv2.Host{createSeedPeerHost("seed-peer-1", port, proxyPort)})
 
-	proxy, err := New(context.Background(), endpoint)
+	client, err := New(context.Background(), endpoint)
 	if err != nil {
 		b.Fatal(err)
 	}
-	b.Cleanup(func() { proxy.Close() })
+	b.Cleanup(func() { client.Close() })
 
-	return proxy, fmt.Sprintf("http://127.0.0.1:%d", proxyPort)
+	return client, fmt.Sprintf("http://127.0.0.1:%d", proxyPort)
 }
 
 func BenchmarkGet(b *testing.B) {
-	proxy, _ := setupBenchProxy(b, make([]byte, 64*1024))
+	client, _ := setupBenchClient(b, make([]byte, 64*1024))
 	req := NewGetRequest("http://example.com/file.txt", WithGetRequestReplicas(1))
 
 	b.ReportAllocs()
 	for b.Loop() {
-		resp, err := proxy.Get(context.Background(), req)
+		resp, err := client.Get(context.Background(), req)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -199,25 +199,25 @@ func BenchmarkGet(b *testing.B) {
 }
 
 func BenchmarkGetInto(b *testing.B) {
-	proxy, _ := setupBenchProxy(b, make([]byte, 64*1024))
+	client, _ := setupBenchClient(b, make([]byte, 64*1024))
 	req := NewGetRequest("http://example.com/file.txt", WithGetRequestReplicas(1))
 
 	b.ReportAllocs()
 	for b.Loop() {
-		if _, err := proxy.GetInto(context.Background(), req, io.Discard); err != nil {
+		if _, err := client.GetInto(context.Background(), req, io.Discard); err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
 func BenchmarkGetWithEndpoints(b *testing.B) {
-	proxy, endpoint := setupBenchProxy(b, make([]byte, 64*1024))
+	client, endpoint := setupBenchClient(b, make([]byte, 64*1024))
 	endpoints := []string{endpoint}
 	req := NewGetRequest("http://example.com/file.txt", WithGetRequestReplicas(1))
 
 	b.ReportAllocs()
 	for b.Loop() {
-		resp, err := proxy.GetWithEndpoints(context.Background(), endpoints, req)
+		resp, err := client.GetWithEndpoints(context.Background(), endpoints, req)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -230,24 +230,24 @@ func BenchmarkGetWithEndpoints(b *testing.B) {
 }
 
 func BenchmarkLookupEndpoints(b *testing.B) {
-	proxy, _ := setupBenchProxy(b, nil)
+	client, _ := setupBenchClient(b, nil)
 	req := NewGetRequest("http://example.com/file.txt")
 
 	b.ReportAllocs()
 	for b.Loop() {
-		if _, err := proxy.LookupEndpoints(context.Background(), req); err != nil {
+		if _, err := client.LookupEndpoints(context.Background(), req); err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
 func BenchmarkPreheat(b *testing.B) {
-	proxy, _ := setupBenchProxy(b, nil)
+	client, _ := setupBenchClient(b, nil)
 	req := NewPreheatRequest("http://example.com/file.txt", WithPreheatRequestReplicas(1))
 
 	b.ReportAllocs()
 	for b.Loop() {
-		if err := proxy.Preheat(context.Background(), req); err != nil {
+		if err := client.Preheat(context.Background(), req); err != nil {
 			b.Fatal(err)
 		}
 	}

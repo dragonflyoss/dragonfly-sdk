@@ -28,13 +28,13 @@ import (
 
 func main() {
     ctx := context.Background()
-    proxy, err := request.New(ctx, "http://127.0.0.1:8002")
+    client, err := request.New(ctx, "http://127.0.0.1:8002")
     if err != nil {
         panic(err)
     }
-    defer proxy.Close()
+    defer client.Close()
 
-    resp, err := proxy.Get(ctx, request.NewGetRequest("https://example.com/file.txt"))
+    resp, err := client.Get(ctx, request.NewGetRequest("https://example.com/file.txt"))
     if err != nil {
         panic(err)
     }
@@ -57,11 +57,11 @@ req := request.NewGetRequest(
 Preheat a file or an OCI image to the seed peers:
 
 ```go
-if err := proxy.Preheat(ctx, request.NewPreheatRequest("https://example.com/file.txt")); err != nil {
+if err := client.Preheat(ctx, request.NewPreheatRequest("https://example.com/file.txt")); err != nil {
     panic(err)
 }
 
-if err := proxy.PreheatImage(ctx, request.NewPreheatImageRequest("docker.io/library/nginx:latest")); err != nil {
+if err := client.PreheatImage(ctx, request.NewPreheatImageRequest("docker.io/library/nginx:latest")); err != nil {
     panic(err)
 }
 ```
@@ -74,11 +74,11 @@ peers are fewer than the replicas, while downloading clamps the replicas to
 the available seed peers. The default replicas is 2:
 
 ```go
-if err := proxy.Preheat(ctx, request.NewPreheatRequest("https://example.com/file.txt", request.WithPreheatRequestReplicas(3))); err != nil {
+if err := client.Preheat(ctx, request.NewPreheatRequest("https://example.com/file.txt", request.WithPreheatRequestReplicas(3))); err != nil {
     panic(err)
 }
 
-resp, err := proxy.Get(ctx, request.NewGetRequest("https://example.com/file.txt", request.WithGetRequestReplicas(3)))
+resp, err := client.Get(ctx, request.NewGetRequest("https://example.com/file.txt", request.WithGetRequestReplicas(3)))
 if err != nil {
     panic(err)
 }
@@ -90,19 +90,19 @@ the looked-up endpoints directly, scattering the request across them:
 
 ```go
 req := request.NewGetRequest("https://example.com/file.txt")
-endpoints, err := proxy.LookupEndpoints(ctx, req)
+endpoints, err := client.LookupEndpoints(ctx, req)
 if err != nil {
     panic(err)
 }
 
-resp, err := proxy.GetWithEndpoints(ctx, endpoints, req)
+resp, err := client.GetWithEndpoints(ctx, endpoints, req)
 if err != nil {
     panic(err)
 }
 defer resp.Body.Close()
 
 // Or write the response body directly into a writer:
-// resp, err := proxy.GetIntoWithEndpoints(ctx, endpoints, req, w)
+// resp, err := client.GetIntoWithEndpoints(ctx, endpoints, req, w)
 ```
 
 See [examples](./examples) for runnable examples.

@@ -37,14 +37,14 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	proxy, err := request.New(ctx, os.Args[1])
+	client, err := request.New(ctx, os.Args[1])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	defer proxy.Close()
+	defer client.Close()
 
-	resp, err := proxy.Get(ctx, request.NewGetRequest(os.Args[2]))
+	resp, err := client.Get(ctx, request.NewGetRequest(os.Args[2]))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

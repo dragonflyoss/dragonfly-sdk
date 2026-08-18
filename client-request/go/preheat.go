@@ -41,7 +41,7 @@ import (
 // the dfdaemon download task API, without streaming the file content back to
 // the client. It fails when the available seed peers are fewer than the
 // replicas of the request.
-func (p *Proxy) Preheat(ctx context.Context, req *PreheatRequest) error {
+func (c *client) Preheat(ctx context.Context, req *PreheatRequest) error {
 	if err := req.validate(); err != nil {
 		return err
 	}
@@ -57,7 +57,7 @@ func (p *Proxy) Preheat(ctx context.Context, req *PreheatRequest) error {
 	}
 
 	// Select seed peers for downloading.
-	seedPeers, err := p.seedPeerSelector.Select(id, uint32(req.replicas))
+	seedPeers, err := c.seedPeerSelector.Select(id, uint32(req.replicas))
 	if err != nil {
 		return fmt.Errorf("%w: failed to select seed peers from scheduler: %v", ErrInternal, err)
 	}
@@ -102,7 +102,7 @@ func (p *Proxy) Preheat(ctx context.Context, req *PreheatRequest) error {
 	g, ctx := errgroup.WithContext(ctx)
 	for _, peer := range seedPeers {
 		g.Go(func() error {
-			return p.downloadTask(ctx, peer, id, download)
+			return c.downloadTask(ctx, peer, id, download)
 		})
 	}
 
@@ -110,7 +110,7 @@ func (p *Proxy) Preheat(ctx context.Context, req *PreheatRequest) error {
 }
 
 // downloadTask triggers the seed peer to download the task and drains the response stream.
-func (p *Proxy) downloadTask(ctx context.Context, peer *commonv2.Host, id string, download *commonv2.Download) error {
+func (c *client) downloadTask(ctx context.Context, peer *commonv2.Host, id string, download *commonv2.Download) error {
 	addr := net.JoinHostPort(peer.Ip, strconv.Itoa(int(peer.Port)))
 	conn, err := grpc.NewClient(
 		addr,
@@ -145,7 +145,7 @@ func (p *Proxy) downloadTask(ctx context.Context, peer *commonv2.Host, id string
 // Dragonfly. It parses the image reference, authenticates with the OCI
 // registry, resolves the image manifest (including multi-platform image
 // indexes), and triggers the seed client to download each blob (config and layers).
-func (p *Proxy) PreheatImage(ctx context.Context, req *PreheatImageRequest) error {
+func (c *client) PreheatImage(ctx context.Context, req *PreheatImageRequest) error {
 	if err := req.validate(); err != nil {
 		return err
 	}
@@ -194,7 +194,7 @@ func (p *Proxy) PreheatImage(ctx context.Context, req *PreheatImageRequest) erro
 				certificates:                req.certificates,
 			}
 
-			return p.Preheat(ctx, preheatReq)
+			return c.Preheat(ctx, preheatReq)
 		})
 	}
 

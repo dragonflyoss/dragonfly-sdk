@@ -18,7 +18,7 @@
 //!
 //! Usage: cargo run --example preheat --features preheat -- <scheduler-endpoint> file|image <url-or-image>
 
-use dragonfly_client_request::{PreheatImageRequest, PreheatRequest, Proxy, Request};
+use dragonfly_client_request::{Builder, Client, PreheatImageRequest, PreheatRequest};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -31,14 +31,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    let proxy = Proxy::builder()
+    let client = Builder::default()
         .scheduler_endpoint(args[1].clone())
         .build()
         .await?;
 
     match args[2].as_str() {
         "file" => {
-            proxy
+            client
                 .preheat(&PreheatRequest {
                     url: args[3].clone(),
                     ..Default::default()
@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await?
         }
         _ => {
-            proxy
+            client
                 .preheat_image(&PreheatImageRequest {
                     image: args[3].clone(),
                     ..Default::default()

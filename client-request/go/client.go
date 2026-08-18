@@ -84,28 +84,29 @@ const (
 	defaultMaxRetries = 1
 )
 
-// ProxyOption configures the Proxy.
-type ProxyOption func(p *Proxy)
+// ClientOption configures the client.
+type ClientOption func(c *client)
 
-// WithProxyMaxRetries sets the maximum number of retries.
-func WithProxyMaxRetries(retries uint8) ProxyOption {
-	return func(p *Proxy) { p.maxRetries = retries }
+// WithClientMaxRetries sets the maximum number of retries.
+func WithClientMaxRetries(retries uint8) ClientOption {
+	return func(c *client) { c.maxRetries = retries }
 }
 
-// WithProxySchedulerRequestTimeout sets the timeout of requests to the
+// WithClientSchedulerRequestTimeout sets the timeout of requests to the
 // scheduler service.
-func WithProxySchedulerRequestTimeout(timeout time.Duration) ProxyOption {
-	return func(p *Proxy) { p.schedulerRequestTimeout = timeout }
+func WithClientSchedulerRequestTimeout(timeout time.Duration) ClientOption {
+	return func(c *client) { c.schedulerRequestTimeout = timeout }
 }
 
-// WithProxyHealthCheckInterval sets the interval of health check for seed
+// WithClientHealthCheckInterval sets the interval of health check for seed
 // peers.
-func WithProxyHealthCheckInterval(interval time.Duration) ProxyOption {
-	return func(p *Proxy) { p.healthCheckInterval = interval }
+func WithClientHealthCheckInterval(interval time.Duration) ClientOption {
+	return func(c *client) { c.healthCheckInterval = interval }
 }
 
-// Proxy is the HTTP proxy client that sends requests via Dragonfly.
-type Proxy struct {
+// client is the HTTP client that sends requests via Dragonfly, implementing
+// the Client interface.
+type client struct {
 	// maxRetries is the number of times to retry a request.
 	maxRetries uint8
 
@@ -126,20 +127,20 @@ type Proxy struct {
 	schedulerConn *grpc.ClientConn
 }
 
-// New creates a Proxy that connects to the given scheduler endpoint,
+// New creates a Client that connects to the given scheduler endpoint,
 // e.g. "http://scheduler-service:8002".
-func New(ctx context.Context, schedulerEndpoint string, opts ...ProxyOption) (*Proxy, error) {
-	p := &Proxy{
+func New(ctx context.Context, schedulerEndpoint string, opts ...ClientOption) (Client, error) {
+	c := &client{
 		maxRetries:              defaultMaxRetries,
 		schedulerRequestTimeout: defaultSchedulerRequestTimeout,
 		healthCheckInterval:     defaultHealthCheckInterval,
 		clientPool:              pool.New(httpClientFactory, defaultClientPoolCapacity, defaultClientPoolIdleTimeout),
 	}
 	for _, opt := range opts {
-		opt(p)
+		opt(c)
 	}
 
-	target, err := p.validate(schedulerEndpoint)
+	target, err := c.validate(schedulerEndpoint)
 	if err != nil {
 		return nil, err
 	}
@@ -149,7 +150,7 @@ func New(ctx context.Context, schedulerEndpoint string, opts ...ProxyOption) (*P
 		return nil, fmt.Errorf("%w: failed to connect to scheduler %s: %v", ErrInternal, schedulerEndpoint, err)
 	}
 
-	seedPeerSelector, err := selector.New(ctx, schedulerv2.NewSchedulerClient(schedulerConn), p.healthCheckInterval, p.schedulerRequestTimeout)
+	seedPeerSelector, err := selector.New(ctx, schedulerv2.NewSchedulerClient(schedulerConn), c.healthCheckInterval, c.schedulerRequestTimeout)
 	if err != nil {
 		schedulerConn.Close()
 		return nil, fmt.Errorf("%w: failed to create seed peer selector: %v", ErrInternal, err)
@@ -159,34 +160,34 @@ func New(ctx context.Context, schedulerEndpoint string, opts ...ProxyOption) (*P
 	// periodically.
 	go seedPeerSelector.Run()
 
-	p.seedPeerSelector = seedPeerSelector
-	p.schedulerConn = schedulerConn
-	return p, nil
+	c.seedPeerSelector = seedPeerSelector
+	c.schedulerConn = schedulerConn
+	return c, nil
 }
 
 // Close stops the background seed peer refresh and closes the scheduler
 // connection.
-func (p *Proxy) Close() error {
-	p.seedPeerSelector.Close()
-	return p.schedulerConn.Close()
+func (c *client) Close() error {
+	c.seedPeerSelector.Close()
+	return c.schedulerConn.Close()
 }
 
 // validate validates the input parameters and returns the scheduler grpc target.
-func (p *Proxy) validate(schedulerEndpoint string) (string, error) {
+func (c *client) validate(schedulerEndpoint string) (string, error) {
 	u, err := url.Parse(schedulerEndpoint)
 	if err != nil || u.Host == "" {
 		return "", fmt.Errorf("%w: invalid scheduler endpoint: %s", ErrInvalidArgument, schedulerEndpoint)
 	}
 
-	if p.schedulerRequestTimeout < 100*time.Millisecond {
+	if c.schedulerRequestTimeout < 100*time.Millisecond {
 		return "", fmt.Errorf("%w: scheduler request timeout must be at least 100 milliseconds", ErrInvalidArgument)
 	}
 
-	if p.healthCheckInterval < time.Second || p.healthCheckInterval > 600*time.Second {
+	if c.healthCheckInterval < time.Second || c.healthCheckInterval > 600*time.Second {
 		return "", fmt.Errorf("%w: health check interval must be between 1 and 600 seconds", ErrInvalidArgument)
 	}
 
-	if p.maxRetries > 10 {
+	if c.maxRetries > 10 {
 		return "", fmt.Errorf("%w: max retries must be between 0 and 10", ErrInvalidArgument)
 	}
 
@@ -226,7 +227,7 @@ func httpClientFactory(proxyAddr string) (*http.Client, error) {
 
 // Get sends a GET request to a remote server via the Dragonfly and returns a
 // response with a streaming body. The caller must close the body.
-func (p *Proxy) Get(ctx context.Context, req *GetRequest) (*GetResponse, error) {
+func (c *client) Get(ctx context.Context, req *GetRequest) (*GetResponse, error) {
 	if err := req.validate(); err != nil {
 		return nil, err
 	}
@@ -234,7 +235,7 @@ func (p *Proxy) Get(ctx context.Context, req *GetRequest) (*GetResponse, error) 
 	// The timeout covers the whole request including the body read, so the
 	// cancel function is called when the body is closed.
 	ctx, cancel := context.WithTimeout(ctx, req.timeout)
-	resp, err := p.trySend(ctx, req)
+	resp, err := c.trySend(ctx, req)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -245,7 +246,7 @@ func (p *Proxy) Get(ctx context.Context, req *GetRequest) (*GetResponse, error) 
 
 // GetInto sends a GET request to a remote server via the Dragonfly and writes
 // the response body directly into the provided writer.
-func (p *Proxy) GetInto(ctx context.Context, req *GetRequest, w io.Writer) (*GetResponse, error) {
+func (c *client) GetInto(ctx context.Context, req *GetRequest, w io.Writer) (*GetResponse, error) {
 	if err := req.validate(); err != nil {
 		return nil, err
 	}
@@ -253,7 +254,7 @@ func (p *Proxy) GetInto(ctx context.Context, req *GetRequest, w io.Writer) (*Get
 	ctx, cancel := context.WithTimeout(ctx, req.timeout)
 	defer cancel()
 
-	resp, err := p.trySend(ctx, req)
+	resp, err := c.trySend(ctx, req)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			return nil, fmt.Errorf("%w: %v", ErrRequestTimeout, err)
@@ -269,8 +270,8 @@ func (p *Proxy) GetInto(ctx context.Context, req *GetRequest, w io.Writer) (*Get
 // peer endpoints of the Dragonfly (e.g., the ones returned by
 // LookupEndpoints), instead of selecting seed peers by the consistent hash
 // ring. The request is sent to a randomly picked endpoint and retried on the
-// others up to the max retries of the Proxy.
-func (p *Proxy) GetWithEndpoints(ctx context.Context, endpoints []string, req *GetRequest) (*GetResponse, error) {
+// others up to the max retries of the client.
+func (c *client) GetWithEndpoints(ctx context.Context, endpoints []string, req *GetRequest) (*GetResponse, error) {
 	if err := req.validate(); err != nil {
 		return nil, err
 	}
@@ -278,7 +279,7 @@ func (p *Proxy) GetWithEndpoints(ctx context.Context, endpoints []string, req *G
 	// The timeout covers the whole request including the body read, so the
 	// cancel function is called when the body is closed.
 	ctx, cancel := context.WithTimeout(ctx, req.timeout)
-	resp, err := p.sendWithEndpoints(ctx, endpoints, req)
+	resp, err := c.sendWithEndpoints(ctx, endpoints, req)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -290,8 +291,8 @@ func (p *Proxy) GetWithEndpoints(ctx context.Context, endpoints []string, req *G
 // GetIntoWithEndpoints sends a GET request to a remote server via the given
 // seed peer endpoints of the Dragonfly and writes the response body directly
 // into the provided writer. The request is sent to a randomly picked endpoint
-// and retried on the others up to the max retries of the Proxy.
-func (p *Proxy) GetIntoWithEndpoints(ctx context.Context, endpoints []string, req *GetRequest, w io.Writer) (*GetResponse, error) {
+// and retried on the others up to the max retries of the client.
+func (c *client) GetIntoWithEndpoints(ctx context.Context, endpoints []string, req *GetRequest, w io.Writer) (*GetResponse, error) {
 	if err := req.validate(); err != nil {
 		return nil, err
 	}
@@ -299,7 +300,7 @@ func (p *Proxy) GetIntoWithEndpoints(ctx context.Context, endpoints []string, re
 	ctx, cancel := context.WithTimeout(ctx, req.timeout)
 	defer cancel()
 
-	resp, err := p.sendWithEndpoints(ctx, endpoints, req)
+	resp, err := c.sendWithEndpoints(ctx, endpoints, req)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			return nil, fmt.Errorf("%w: %v", ErrRequestTimeout, err)
@@ -313,8 +314,8 @@ func (p *Proxy) GetIntoWithEndpoints(ctx context.Context, endpoints []string, re
 
 // sendWithEndpoints scatters the request across the given seed peer endpoints:
 // it tries randomly picked endpoints one by one, limited by the max retries of
-// the Proxy.
-func (p *Proxy) sendWithEndpoints(ctx context.Context, endpoints []string, req *GetRequest) (*http.Response, error) {
+// the client.
+func (c *client) sendWithEndpoints(ctx context.Context, endpoints []string, req *GetRequest) (*http.Response, error) {
 	if len(endpoints) == 0 {
 		return nil, fmt.Errorf("%w: no endpoints to send request", ErrInvalidArgument)
 	}
@@ -326,15 +327,15 @@ func (p *Proxy) sendWithEndpoints(ctx context.Context, endpoints []string, req *
 	rand.Shuffle(len(shuffled), func(i, j int) { shuffled[i], shuffled[j] = shuffled[j], shuffled[i] })
 
 	var lastErr error
-	for attempt := range int(p.maxRetries) + 1 {
+	for attempt := range int(c.maxRetries) + 1 {
 		endpoint := shuffled[attempt%len(shuffled)]
-		entry, err := p.clientPool.Entry(endpoint, endpoint)
+		entry, err := c.clientPool.Entry(endpoint, endpoint)
 		if err != nil {
 			return nil, err
 		}
 
 		guard := entry.RequestGuard()
-		resp, err := p.send(ctx, entry.Client, req)
+		resp, err := c.send(ctx, entry.Client, req)
 		guard.Done()
 		if err != nil {
 			slog.Warn("failed to send request to endpoint", "endpoint", endpoint, "error", err)
@@ -383,7 +384,7 @@ func copyResponse(resp *http.Response, w io.Writer) (*GetResponse, error) {
 // the seed peers serving the request, in the consistent hash ring selection
 // order for the request's task id. It returns up to the replicas of the
 // request distinct endpoints, clamped to the number of available seed peers.
-func (p *Proxy) LookupEndpoints(ctx context.Context, req *GetRequest) ([]string, error) {
+func (c *client) LookupEndpoints(ctx context.Context, req *GetRequest) ([]string, error) {
 	if err := req.validate(); err != nil {
 		return nil, err
 	}
@@ -393,7 +394,7 @@ func (p *Proxy) LookupEndpoints(ctx context.Context, req *GetRequest) ([]string,
 		return nil, fmt.Errorf("%w: failed to generate task id: %v", ErrInternal, err)
 	}
 
-	seedPeers, err := p.seedPeerSelector.Select(taskID, uint32(req.replicas))
+	seedPeers, err := c.seedPeerSelector.Select(taskID, uint32(req.replicas))
 	if err != nil {
 		return nil, fmt.Errorf("%w: failed to select seed peers from scheduler: %v", ErrInternal, err)
 	}
@@ -422,13 +423,13 @@ func generateTaskID(req *GetRequest) (string, error) {
 
 // lookupProxyEndpoints looks up the proxy endpoints of the seed peers serving the
 // request, in the consistent hash ring selection order.
-func (p *Proxy) lookupProxyEndpoints(req *GetRequest) ([]string, error) {
+func (c *client) lookupProxyEndpoints(req *GetRequest) ([]string, error) {
 	taskID, err := generateTaskID(req)
 	if err != nil {
 		return nil, fmt.Errorf("%w: failed to generate task id: %v", ErrInternal, err)
 	}
 
-	seedPeers, err := p.seedPeerSelector.Select(taskID, uint32(req.replicas))
+	seedPeers, err := c.seedPeerSelector.Select(taskID, uint32(req.replicas))
 	if err != nil {
 		return nil, fmt.Errorf("%w: failed to select seed peers from scheduler: %v", ErrInternal, err)
 	}
@@ -444,18 +445,18 @@ func (p *Proxy) lookupProxyEndpoints(req *GetRequest) ([]string, error) {
 
 // trySend scatters the request across the seed peers serving it and returns
 // the first successful response.
-func (p *Proxy) trySend(ctx context.Context, req *GetRequest) (*http.Response, error) {
-	endpoints, err := p.lookupProxyEndpoints(req)
+func (c *client) trySend(ctx context.Context, req *GetRequest) (*http.Response, error) {
+	endpoints, err := c.lookupProxyEndpoints(req)
 	if err != nil {
 		return nil, err
 	}
 
-	return p.sendWithEndpoints(ctx, endpoints, req)
+	return c.sendWithEndpoints(ctx, endpoints, req)
 }
 
 // send sends a request to the specified URL via the client with the given
 // headers.
-func (p *Proxy) send(ctx context.Context, client *http.Client, req *GetRequest) (*http.Response, error) {
+func (c *client) send(ctx context.Context, httpClient *http.Client, req *GetRequest) (*http.Response, error) {
 	headers, err := makeRequestHeaders(req)
 	if err != nil {
 		return nil, err
@@ -467,7 +468,7 @@ func (p *Proxy) send(ctx context.Context, client *http.Client, req *GetRequest) 
 	}
 	httpReq.Header = headers
 
-	resp, err := client.Do(httpReq)
+	resp, err := httpClient.Do(httpReq)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			return nil, fmt.Errorf("%w: %v", ErrRequestTimeout, err)

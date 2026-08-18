@@ -37,18 +37,18 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	proxy, err := request.New(ctx, os.Args[1])
+	client, err := request.New(ctx, os.Args[1])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	defer proxy.Close()
+	defer client.Close()
 
 	switch os.Args[2] {
 	case "file":
-		err = proxy.Preheat(ctx, request.NewPreheatRequest(os.Args[3]))
+		err = client.Preheat(ctx, request.NewPreheatRequest(os.Args[3]))
 	case "image":
-		err = proxy.PreheatImage(ctx, request.NewPreheatImageRequest(os.Args[3]))
+		err = client.PreheatImage(ctx, request.NewPreheatImageRequest(os.Args[3]))
 	}
 
 	if err != nil {

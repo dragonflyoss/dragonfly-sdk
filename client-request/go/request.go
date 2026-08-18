@@ -40,12 +40,12 @@ const defaultConcurrentTaskCount = 4
 // defaultReplicas is the default number of seed peers serving a task.
 const defaultReplicas = 2
 
-// Request is the interface for sending requests via the Dragonfly.
+// Client is the interface for sending requests via the Dragonfly.
 //
 // It enables interaction with remote servers through the Dragonfly, shielding
 // the complex request logic between the client and the Dragonfly seed client's
 // proxy.
-type Request interface {
+type Client interface {
 	// Get sends a GET request to a remote server via the Dragonfly and returns
 	// a response with a streaming body. The caller must close the body.
 	Get(ctx context.Context, req *GetRequest) (*GetResponse, error)
@@ -83,6 +83,10 @@ type Request interface {
 	// task id. It returns up to the replicas of the request distinct
 	// endpoints, clamped to the number of available seed peers.
 	LookupEndpoints(ctx context.Context, req *GetRequest) ([]string, error)
+
+	// Close stops the background seed peer refresh and closes the scheduler
+	// connection.
+	Close() error
 }
 
 // GetRequest represents a GET request to be sent via the Dragonfly. Construct

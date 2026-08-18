@@ -39,21 +39,21 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	proxy, err := request.New(ctx, os.Args[1])
+	client, err := request.New(ctx, os.Args[1])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	defer proxy.Close()
+	defer client.Close()
 
 	// Preheat the file to 3 replicas of seed peers.
-	if err := proxy.Preheat(ctx, request.NewPreheatRequest(os.Args[2], request.WithPreheatRequestReplicas(3))); err != nil {
+	if err := client.Preheat(ctx, request.NewPreheatRequest(os.Args[2], request.WithPreheatRequestReplicas(3))); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 
 	// Download the file with the request scattered across the 3 replicas.
-	resp, err := proxy.Get(ctx, request.NewGetRequest(os.Args[2], request.WithGetRequestReplicas(3)))
+	resp, err := client.Get(ctx, request.NewGetRequest(os.Args[2], request.WithGetRequestReplicas(3)))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
