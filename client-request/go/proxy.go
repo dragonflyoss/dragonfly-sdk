@@ -104,6 +104,9 @@ func WithProxyHealthCheckInterval(interval time.Duration) ProxyOption {
 	return func(p *Proxy) { p.healthCheckInterval = interval }
 }
 
+// Ensure Proxy implements the Request interface at compile time.
+var _ Request = (*Proxy)(nil)
+
 // Proxy is the HTTP proxy client that sends requests via Dragonfly.
 type Proxy struct {
 	// maxRetries is the number of times to retry a request.
@@ -254,52 +257,6 @@ func (p *Proxy) GetInto(ctx context.Context, req *GetRequest, w io.Writer) (*Get
 	defer cancel()
 
 	resp, err := p.trySend(ctx, req)
-	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			return nil, fmt.Errorf("%w: %v", ErrRequestTimeout, err)
-		}
-
-		return nil, err
-	}
-
-	return copyResponse(resp, w)
-}
-
-// GetWithEndpoints sends a GET request to a remote server via the given seed
-// peer endpoints of the Dragonfly (e.g., the ones returned by
-// LookupEndpoints), instead of selecting seed peers by the consistent hash
-// ring. The request is sent to a randomly picked endpoint and retried on the
-// others up to the max retries of the Proxy.
-func (p *Proxy) GetWithEndpoints(ctx context.Context, endpoints []string, req *GetRequest) (*GetResponse, error) {
-	if err := req.validate(); err != nil {
-		return nil, err
-	}
-
-	// The timeout covers the whole request including the body read, so the
-	// cancel function is called when the body is closed.
-	ctx, cancel := context.WithTimeout(ctx, req.timeout)
-	resp, err := p.sendWithEndpoints(ctx, endpoints, req)
-	if err != nil {
-		cancel()
-		return nil, err
-	}
-
-	return streamResponse(resp, cancel), nil
-}
-
-// GetIntoWithEndpoints sends a GET request to a remote server via the given
-// seed peer endpoints of the Dragonfly and writes the response body directly
-// into the provided writer. The request is sent to a randomly picked endpoint
-// and retried on the others up to the max retries of the Proxy.
-func (p *Proxy) GetIntoWithEndpoints(ctx context.Context, endpoints []string, req *GetRequest, w io.Writer) (*GetResponse, error) {
-	if err := req.validate(); err != nil {
-		return nil, err
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, req.timeout)
-	defer cancel()
-
-	resp, err := p.sendWithEndpoints(ctx, endpoints, req)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			return nil, fmt.Errorf("%w: %v", ErrRequestTimeout, err)
