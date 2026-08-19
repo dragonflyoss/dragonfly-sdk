@@ -1878,6 +1878,7 @@ mod tests {
             let path = url.strip_prefix("http://example.com").unwrap();
             let mut hosts = Vec::new();
             let mut servers = Vec::new();
+            let mut proxy_servers = Vec::new();
             for name in ["seed-peer-1", "seed-peer-2", "seed-peer-3"] {
                 let mut mocks = MockSet::new();
                 if expected.contains(&name) {
@@ -1896,7 +1897,8 @@ mod tests {
                 let mut proxy_mocks = MockSet::new();
                 proxy_mocks.mock(|when, then| {
                     when.get().path(path);
-                    then.text(name);
+                    then.status(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+                        .text(name);
                 });
                 let seed_peer_proxy = setup_mock_seed_peer_proxy(proxy_mocks).await.unwrap();
 
@@ -1906,13 +1908,15 @@ mod tests {
                     seed_peer_proxy.port().unwrap(),
                 ));
                 servers.push(seed_peer);
-                servers.push(seed_peer_proxy);
+                proxy_servers.push((name, seed_peer_proxy));
             }
 
             let mock_scheduler = setup_mock_scheduler(hosts).await.unwrap();
             let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+
             let proxy = Proxy::builder()
                 .scheduler_endpoint(scheduler_endpoint)
+                .max_retries(2)
                 .build()
                 .await
                 .unwrap();
@@ -1924,23 +1928,24 @@ mod tests {
             };
             proxy.preheat(&preheat_request).await.unwrap();
 
-            let mut served = std::collections::HashSet::new();
-            for _ in 0..10 {
-                let request = GetRequest {
-                    url: url.to_string(),
-                    replicas,
-                    ..Default::default()
-                };
+            let request = GetRequest {
+                url: url.to_string(),
+                replicas,
+                ..Default::default()
+            };
 
-                let mut buf = BytesMut::new();
-                let response = proxy.get_into(&request, &mut buf).await.unwrap();
-                assert!(response.success);
-                served.insert(String::from_utf8(buf.to_vec()).unwrap());
+            let mut buf = BytesMut::new();
+            let result = proxy.get_into(&request, &mut buf).await;
+            assert!(result.is_err());
+
+            for (name, server) in proxy_servers.iter() {
+                let hits: usize = server.mocks().iter().map(|mock| mock.match_count()).sum();
+                if expected.contains(name) {
+                    assert!(hits >= 1, "{url}: expected seed peer {name} to be hit");
+                } else {
+                    assert_eq!(hits, 0, "{url}: unexpected seed peer {name} was hit");
+                }
             }
-
-            let expected: std::collections::HashSet<String> =
-                expected.iter().map(|name| name.to_string()).collect();
-            assert_eq!(served, expected);
         }
     }
 
