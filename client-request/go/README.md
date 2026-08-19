@@ -85,8 +85,10 @@ if err != nil {
 defer resp.Body.Close()
 ```
 
-Look up the endpoints of the seed peers serving a request, then download from
-the looked-up endpoints directly, scattering the request across them:
+Look up the endpoints of the seed peers serving a request, then create a proxy
+bound to those endpoints and download from them directly, scattering the
+request across them. The endpoints proxy keeps a client with a reusable
+connection pool per endpoint and doesn't sync seed peers from the scheduler:
 
 ```go
 req := request.NewGetRequest("https://example.com/file.txt")
@@ -95,14 +97,19 @@ if err != nil {
     panic(err)
 }
 
-resp, err := proxy.GetWithEndpoints(ctx, endpoints, req)
+proxyWithEndpoints, err := request.NewWithEndpoints(endpoints)
+if err != nil {
+    panic(err)
+}
+
+resp, err := proxyWithEndpoints.Get(ctx, req)
 if err != nil {
     panic(err)
 }
 defer resp.Body.Close()
 
 // Or write the response body directly into a writer:
-// resp, err := proxy.GetIntoWithEndpoints(ctx, endpoints, req, w)
+// resp, err := proxyWithEndpoints.GetInto(ctx, req, w)
 ```
 
 See [examples](./examples) for runnable examples.

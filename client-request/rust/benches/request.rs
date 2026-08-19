@@ -14,8 +14,9 @@
  * limitations under the License.
  */
 
-//! Benchmarks for the `Request` trait implemented by `Proxy`, mirroring the
-//! Go `BenchmarkGet`/`BenchmarkGetInto`/`BenchmarkGetWithEndpoints`/
+//! Benchmarks for the `Request` trait implemented by `Proxy` and the
+//! `RequestWithEndpoints` trait implemented by `ProxyWithEndpoints`, mirroring
+//! the Go `BenchmarkGet`/`BenchmarkGetInto`/`BenchmarkGetWithEndpoints`/
 //! `BenchmarkLookupEndpoints`/`BenchmarkPreheat` benchmarks: a mock scheduler
 //! with a single seed peer serving a fixed body through its proxy.
 
@@ -27,7 +28,9 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use dragonfly_api::common::v2::Host;
 use dragonfly_api::dfdaemon::v2::DownloadTaskResponse;
 use dragonfly_api::scheduler::v2::ListHostsResponse;
-use dragonfly_client_request::{GetRequest, PreheatRequest, Proxy, Request};
+use dragonfly_client_request::{
+    GetRequest, PreheatRequest, Proxy, ProxyWithEndpoints, Request, RequestWithEndpoints,
+};
 use futures::TryStreamExt;
 use mocktail::prelude::*;
 use mocktail::server::MockServer;
@@ -155,13 +158,16 @@ fn bench_request(c: &mut Criterion) {
         })
     });
 
-    let endpoints = vec![proxy_endpoint.clone()];
+    let proxy_with_endpoints = rt.block_on(async {
+        ProxyWithEndpoints::builder()
+            .endpoints(vec![proxy_endpoint.clone()])
+            .build()
+            .await
+            .unwrap()
+    });
     group.bench_function("get_with_endpoints", |b| {
         b.to_async(&rt).iter(|| async {
-            let response = proxy
-                .get_with_endpoints(&endpoints, &request)
-                .await
-                .unwrap();
+            let response = proxy_with_endpoints.get(&request).await.unwrap();
             let mut body = response.body.unwrap();
             while let Some(chunk) = body.try_next().await.unwrap() {
                 black_box(chunk);

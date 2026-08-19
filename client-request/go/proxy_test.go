@@ -33,10 +33,10 @@ func TestNewSuccess(t *testing.T) {
 	assert := assert.New(t)
 	endpoint := setupMockScheduler(t, nil)
 
-	proxy, err := New(context.Background(), endpoint)
+	p, err := New(context.Background(), endpoint)
 	assert.NoError(err)
-	assert.Equal(uint8(1), proxy.maxRetries)
-	proxy.Close()
+	assert.Equal(uint8(1), p.maxRetries)
+	p.Close()
 }
 
 func TestNewEmptyEndpoint(t *testing.T) {
@@ -203,40 +203,6 @@ func TestGetScattersAcrossReplicas(t *testing.T) {
 	body, err := io.ReadAll(resp.Body)
 	assert.NoError(err)
 	assert.Equal("ok", string(body))
-}
-
-func TestGetWithEndpoints(t *testing.T) {
-	assert := assert.New(t)
-
-	goodProxyPort := setupMockSeedPeerProxy(t, func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, "ok")
-	})
-	endpoint := setupMockScheduler(t, nil)
-
-	proxy, err := New(context.Background(), endpoint)
-	assert.NoError(err)
-	defer proxy.Close()
-
-	endpoints := []string{"http://127.0.0.1:1", fmt.Sprintf("http://127.0.0.1:%d", goodProxyPort)}
-	resp, err := proxy.GetWithEndpoints(context.Background(), endpoints, NewGetRequest("http://example.com/file.txt"))
-	assert.NoError(err)
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	assert.NoError(err)
-	assert.Equal("ok", string(body))
-}
-
-func TestGetWithEndpointsEmpty(t *testing.T) {
-	assert := assert.New(t)
-	endpoint := setupMockScheduler(t, nil)
-
-	proxy, err := New(context.Background(), endpoint)
-	assert.NoError(err)
-	defer proxy.Close()
-
-	_, err = proxy.GetWithEndpoints(context.Background(), nil, NewGetRequest("http://example.com/file.txt"))
-	assert.ErrorIs(err, ErrInvalidArgument)
 }
 
 func TestGetInvalidReplicas(t *testing.T) {

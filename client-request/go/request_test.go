@@ -211,13 +211,16 @@ func BenchmarkGetInto(b *testing.B) {
 }
 
 func BenchmarkGetWithEndpoints(b *testing.B) {
-	proxy, endpoint := setupBenchProxy(b, make([]byte, 64*1024))
-	endpoints := []string{endpoint}
+	_, endpoint := setupBenchProxy(b, make([]byte, 64*1024))
+	proxy, err := NewWithEndpoints([]string{endpoint})
+	if err != nil {
+		b.Fatal(err)
+	}
 	req := NewGetRequest("http://example.com/file.txt", WithGetRequestReplicas(1))
 
 	b.ReportAllocs()
 	for b.Loop() {
-		resp, err := proxy.GetWithEndpoints(context.Background(), endpoints, req)
+		resp, err := proxy.Get(context.Background(), req)
 		if err != nil {
 			b.Fatal(err)
 		}

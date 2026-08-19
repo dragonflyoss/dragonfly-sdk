@@ -31,7 +31,7 @@ use futures::{Stream, TryStreamExt};
 use http::{default_proxy_rule_filtered_query_params, headermap_to_hashmap};
 use id_generator::{IDGenerator, TaskIDParameter};
 use net::{format_url, preferred_local_ip};
-use pool::{Builder as PoolBuilder, Entry, Factory, Pool};
+use pool::{Builder as PoolBuilder, Factory, Pool};
 use rand::seq::SliceRandom;
 use reqwest::{
     header::{HeaderMap, HeaderValue},
@@ -41,6 +41,7 @@ use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_tracing::TracingMiddleware;
 use rustls_pki_types::CertificateDer;
 use selector::{SeedPeerSelector, Selector};
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -135,28 +136,6 @@ pub trait Request {
     /// and headers) is returned separately.
     async fn get_into(&self, request: &GetRequest, buf: &mut BytesMut) -> Result<GetResponse>;
 
-    /// Sends an GET request to a remote server via the given seed peer endpoints of the
-    /// Dragonfly (e.g., the ones returned by `lookup_endpoints`), instead of selecting
-    /// seed peers by the consistent hash ring. The request is sent to a randomly picked
-    /// endpoint and retried on the others up to the max retries of the proxy, and
-    /// returns a response with a streaming body.
-    async fn get_with_endpoints(
-        &self,
-        endpoints: &[String],
-        request: &GetRequest,
-    ) -> Result<GetResponse<Body>>;
-
-    /// Sends an GET request to a remote server via the given seed peer endpoints of the
-    /// Dragonfly and writes the response body directly into the provided buffer. The
-    /// request is sent to a randomly picked endpoint and retried on the others up to
-    /// the max retries of the proxy.
-    async fn get_into_with_endpoints(
-        &self,
-        endpoints: &[String],
-        request: &GetRequest,
-        buf: &mut BytesMut,
-    ) -> Result<GetResponse>;
-
     /// Preheats an OCI image by downloading all its blobs via the Dragonfly.
     ///
     /// This method is designed for scenarios where OCI image content needs to be pre-cached in
@@ -183,6 +162,25 @@ pub trait Request {
     /// would serve the request without sending it. It returns up to the replicas of the
     /// request distinct endpoints, clamped to the number of available seed peers.
     async fn lookup_endpoints(&self, request: &GetRequest) -> Result<Vec<String>>;
+}
+
+/// Defines the interface for sending requests via fixed seed peer endpoints of the Dragonfly.
+///
+/// Unlike `Request`, implementations send requests to the seed peer endpoints given at
+/// construction (e.g., the ones returned by `Request::lookup_endpoints`), without selecting
+/// seed peers by the consistent hash ring or syncing them from the scheduler.
+#[async_trait]
+pub trait RequestWithEndpoints {
+    /// Sends an GET request to a remote server via the seed peer endpoints of the
+    /// Dragonfly and returns a response with a streaming body. The request is sent to a
+    /// randomly picked endpoint and retried on the others up to the max retries.
+    async fn get(&self, request: &GetRequest) -> Result<GetResponse<Body>>;
+
+    /// Sends an GET request to a remote server via the seed peer endpoints of the
+    /// Dragonfly and writes the response body directly into the provided buffer. The
+    /// request is sent to a randomly picked endpoint and retried on the others up to the
+    /// max retries.
+    async fn get_into(&self, request: &GetRequest, buf: &mut BytesMut) -> Result<GetResponse>;
 }
 
 /// Represents a GET request to be sent via the Dragonfly.
@@ -514,7 +512,7 @@ impl Factory<String, ClientWithMiddleware> for HTTPClientFactory {
 }
 
 /// The builder for Proxy.
-pub struct Builder {
+pub struct ProxyBuilder {
     /// The endpoint of the scheduler service.
     scheduler_endpoint: String,
 
@@ -529,8 +527,8 @@ pub struct Builder {
 }
 
 /// Implements Default trait.
-impl Default for Builder {
-    /// Returns a default Builder.
+impl Default for ProxyBuilder {
+    /// Returns a default ProxyBuilder.
     fn default() -> Self {
         Self {
             scheduler_endpoint: "".to_string(),
@@ -542,7 +540,7 @@ impl Default for Builder {
 }
 
 /// Implements the builder pattern for Proxy.
-impl Builder {
+impl ProxyBuilder {
     /// Sets the scheduler endpoint.
     pub fn scheduler_endpoint(mut self, endpoint: String) -> Self {
         self.scheduler_endpoint = endpoint;
@@ -677,9 +675,9 @@ pub struct Proxy {
 
 /// Implements the proxy client that sends requests via Dragonfly.
 impl Proxy {
-    /// Returns a new Builder for Proxy.
-    pub fn builder() -> Builder {
-        Builder::default()
+    /// Returns a new ProxyBuilder for Proxy.
+    pub fn builder() -> ProxyBuilder {
+        ProxyBuilder::default()
     }
 }
 
@@ -721,9 +719,6 @@ impl Request for Proxy {
             })
         };
 
-        // The timeout covers sending the request and receiving the response
-        // headers; reading the body stream is covered by the request timeout
-        // set in send.
         tokio::time::timeout(request.timeout, get)
             .await
             .map_err(|err| Error::RequestTimeout(err.to_string()))?
@@ -770,94 +765,6 @@ impl Request for Proxy {
             })
         };
 
-        // Apply timeout which will properly cancel the operation when timeout is reached.
-        tokio::time::timeout(request.timeout, get_into)
-            .await
-            .map_err(|err| Error::RequestTimeout(err.to_string()))?
-    }
-
-    /// Sends an GET request to a remote server via the given seed peer endpoints of the
-    /// Dragonfly (e.g., the ones returned by `lookup_endpoints`), instead of selecting
-    /// seed peers by the consistent hash ring. The request is sent to a randomly picked
-    /// endpoint and retried on the others up to the max retries of the proxy, and
-    /// returns a response with a streaming body.
-    async fn get_with_endpoints(
-        &self,
-        endpoints: &[String],
-        request: &GetRequest,
-    ) -> Result<GetResponse> {
-        request.validate()?;
-
-        let get = async {
-            let response = self.send_with_endpoints(endpoints, request).await?;
-            let header = response.headers().clone();
-            let status_code = response.status();
-            let body: Body = Box::new(
-                response
-                    .bytes_stream()
-                    .map_err(|err| Error::Internal(err.to_string())),
-            );
-
-            Ok(GetResponse {
-                success: status_code.is_success(),
-                header,
-                status_code: Some(status_code),
-                body: Some(body),
-            })
-        };
-
-        // The timeout covers sending the request and receiving the response
-        // headers; reading the body stream is covered by the request timeout
-        // set in send.
-        tokio::time::timeout(request.timeout, get)
-            .await
-            .map_err(|err| Error::RequestTimeout(err.to_string()))?
-    }
-
-    /// Sends an GET request to a remote server via the given seed peer endpoints of the
-    /// Dragonfly and writes the response body directly into the provided buffer. The
-    /// request is sent to a randomly picked endpoint and retried on the others up to
-    /// the max retries of the proxy.
-    async fn get_into_with_endpoints(
-        &self,
-        endpoints: &[String],
-        request: &GetRequest,
-        buf: &mut BytesMut,
-    ) -> Result<GetResponse> {
-        request.validate()?;
-
-        let get_into = async {
-            let mut response = self.send_with_endpoints(endpoints, request).await?;
-            let status = response.status();
-            let header = response.headers().clone();
-
-            if status.is_success() {
-                // Reserve the capacity upfront and copy each chunk into the buffer
-                // directly, without aggregating the whole body first.
-                if let Some(content_length) = response.content_length() {
-                    buf.reserve(content_length as usize);
-                }
-
-                while let Some(chunk) = response.chunk().await.map_err(|err| {
-                    if err.is_timeout() {
-                        return Error::RequestTimeout(err.to_string());
-                    }
-
-                    Error::Internal(format!("failed to read response body: {err}"))
-                })? {
-                    buf.extend_from_slice(&chunk);
-                }
-            }
-
-            Ok(GetResponse {
-                success: status.is_success(),
-                header,
-                status_code: Some(status),
-                body: None,
-            })
-        };
-
-        // Apply timeout which will properly cancel the operation when timeout is reached.
         tokio::time::timeout(request.timeout, get_into)
             .await
             .map_err(|err| Error::RequestTimeout(err.to_string()))?
@@ -1226,7 +1133,7 @@ impl Proxy {
         for attempt in 0..(self.max_retries as usize + 1) {
             let endpoint = shuffled[attempt % shuffled.len()];
             let entry = self.client_pool.entry(endpoint, endpoint).await?;
-            match self.send(&entry, request).await {
+            match self.send(&entry.client, request).await {
                 Ok(response) => return Ok(response),
                 Err(err) => {
                     warn!("failed to send request to endpoint {}: {:?}", endpoint, err);
@@ -1247,15 +1154,14 @@ impl Proxy {
         self.send_with_endpoints(&endpoints, request).await
     }
 
-    /// Send a request to the specified URL via client entry with the given headers.
+    /// Send a request to the specified URL via the client with the given headers.
     async fn send(
         &self,
-        entry: &Entry<ClientWithMiddleware>,
+        client: &ClientWithMiddleware,
         request: &GetRequest,
     ) -> Result<reqwest::Response> {
         let headers = self.make_request_headers(request)?;
-        let response = entry
-            .client
+        let response = client
             .get(&request.url)
             .headers(headers)
             .timeout(request.timeout)
@@ -1388,7 +1294,10 @@ impl Proxy {
         headers.insert("X-Dragonfly-Use-P2P", HeaderValue::from_static("true"));
         Ok(headers)
     }
+}
 
+/// Implements helpers for the preheat feature.
+impl Proxy {
     /// Helper function to check if a URL is an OCI blob URL (e.g., /v2/<name>/blobs/sha256:
     /// <digest>).
     #[cfg(feature = "preheat")]
@@ -1421,6 +1330,355 @@ impl Proxy {
         };
 
         Ok(OciClient::new(oci_config))
+    }
+}
+
+/// The builder for ProxyWithEndpoints.
+pub struct ProxyWithEndpointsBuilder {
+    /// The seed peer endpoints serving the requests.
+    endpoints: Vec<String>,
+
+    /// The number of times to retry a request.
+    max_retries: u8,
+}
+
+/// Implements Default trait.
+impl Default for ProxyWithEndpointsBuilder {
+    /// Returns a default ProxyWithEndpointsBuilder.
+    fn default() -> Self {
+        Self {
+            endpoints: Vec::new(),
+            max_retries: 1,
+        }
+    }
+}
+
+/// Implements the builder pattern for ProxyWithEndpoints.
+impl ProxyWithEndpointsBuilder {
+    /// Sets the seed peer endpoints serving the requests.
+    pub fn endpoints(mut self, endpoints: Vec<String>) -> Self {
+        self.endpoints = endpoints;
+        self
+    }
+
+    /// Sets the maximum number of retries.
+    pub fn max_retries(mut self, retries: u8) -> Self {
+        self.max_retries = retries;
+        self
+    }
+
+    /// Builds and returns a ProxyWithEndpoints instance.
+    pub async fn build(self) -> Result<ProxyWithEndpoints> {
+        // Validate input parameters.
+        self.validate()?;
+
+        // Create a client per endpoint, so every endpoint has its own reusable
+        // connection pool.
+        let factory = HTTPClientFactory::default();
+        let mut clients = HashMap::with_capacity(self.endpoints.len());
+        for endpoint in self.endpoints.iter() {
+            if clients.contains_key(endpoint) {
+                continue;
+            }
+
+            clients.insert(endpoint.clone(), factory.make_client(endpoint).await?);
+        }
+
+        Ok(ProxyWithEndpoints {
+            endpoints: self.endpoints,
+            max_retries: self.max_retries,
+            clients,
+        })
+    }
+
+    /// Validates the input parameters.
+    fn validate(&self) -> Result<()> {
+        if self.endpoints.is_empty() {
+            return Err(Error::InvalidArgument(
+                "endpoints must not be empty".to_string(),
+            ));
+        }
+
+        if self.max_retries > 10 {
+            return Err(Error::InvalidArgument(
+                "max retries must be between 0 and 10".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+/// The HTTP proxy client that sends requests via the fixed seed peer endpoints of the
+/// Dragonfly given at construction, without selecting seed peers by the consistent hash
+/// ring or syncing them from the scheduler.
+#[derive(Clone)]
+pub struct ProxyWithEndpoints {
+    /// The seed peer endpoints serving the requests.
+    endpoints: Vec<String>,
+
+    /// The number of times to retry a request.
+    max_retries: u8,
+
+    /// The clients keyed by endpoint, so every endpoint has its own reusable
+    /// connection pool.
+    clients: HashMap<String, ClientWithMiddleware>,
+}
+
+/// Implements the proxy client that sends requests via the fixed seed peer endpoints.
+impl ProxyWithEndpoints {
+    /// Returns a new ProxyWithEndpointsBuilder for ProxyWithEndpoints.
+    pub fn builder() -> ProxyWithEndpointsBuilder {
+        ProxyWithEndpointsBuilder::default()
+    }
+
+    /// Scatters the request across the endpoints: it tries randomly picked endpoints
+    /// one by one, limited by the max retries.
+    async fn try_send(&self, request: &GetRequest) -> Result<reqwest::Response> {
+        // Scatter the request across the endpoints: shuffle them and make
+        // 1 + max retries attempts, wrapping around when the endpoints are
+        // fewer than the attempts.
+        let mut shuffled: Vec<&String> = self.endpoints.iter().collect();
+        shuffled.shuffle(&mut rand::rng());
+
+        let mut last_err = None;
+        for attempt in 0..(self.max_retries as usize + 1) {
+            let endpoint = shuffled[attempt % shuffled.len()];
+            let client = self
+                .clients
+                .get(endpoint)
+                .ok_or_else(|| Error::Internal(format!("no client for endpoint {endpoint}")))?;
+            match self.send(client, request).await {
+                Ok(response) => return Ok(response),
+                Err(err) => {
+                    warn!("failed to send request to endpoint {}: {:?}", endpoint, err);
+                    last_err = Some(err);
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            Error::Internal("failed to send request to any endpoint".to_string())
+        }))
+    }
+
+    /// Send a request to the specified URL via the client with the given headers.
+    async fn send(
+        &self,
+        client: &ClientWithMiddleware,
+        request: &GetRequest,
+    ) -> Result<reqwest::Response> {
+        let headers = self.make_request_headers(request)?;
+        let response = client
+            .get(&request.url)
+            .headers(headers)
+            .timeout(request.timeout)
+            .send()
+            .await
+            .map_err(|err| match err {
+                reqwest_middleware::Error::Reqwest(err) if err.is_timeout() => {
+                    Error::RequestTimeout(err.to_string())
+                }
+                err => Error::Internal(err.to_string()),
+            })?;
+
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+
+        let response_headers = response.headers().clone();
+        let header_map = headermap_to_hashmap(&response_headers);
+        let message = response.text().await.ok();
+        let error_type = response_headers
+            .get("X-Dragonfly-Error-Type")
+            .and_then(|v| v.to_str().ok());
+
+        match error_type {
+            Some("backend") => Err(Error::BackendError(BackendError {
+                message,
+                header: header_map,
+                status_code: Some(status),
+            })),
+            Some("proxy") => Err(Error::ProxyError(ProxyError {
+                message,
+                header: header_map,
+                status_code: Some(status),
+            })),
+            Some("dfdaemon") => Err(Error::DfdaemonError(DfdaemonError { message })),
+            Some(other) => Err(Error::ProxyError(ProxyError {
+                message: Some(format!("unknown error type from proxy: {other}")),
+                header: header_map,
+                status_code: Some(status),
+            })),
+            None => Err(Error::ProxyError(ProxyError {
+                message: Some(format!("unexpected status code from proxy: {status}")),
+                header: header_map,
+                status_code: Some(status),
+            })),
+        }
+    }
+
+    /// Make request headers applies p2p related headers to the request headers.
+    fn make_request_headers(&self, request: &GetRequest) -> Result<HeaderMap> {
+        let mut headers = request.header.clone();
+        if let Some(piece_length) = request.piece_length {
+            headers.insert(
+                "X-Dragonfly-Piece-Length",
+                piece_length.to_string().parse().map_err(|err| {
+                    Error::InvalidArgument(format!("invalid piece length: {err}"))
+                })?,
+            );
+        }
+
+        if let Some(tag) = request.tag.clone() {
+            headers.insert(
+                "X-Dragonfly-Tag",
+                tag.to_string()
+                    .parse()
+                    .map_err(|err| Error::InvalidArgument(format!("invalid tag: {err}")))?,
+            );
+        }
+
+        if let Some(application) = request.application.clone() {
+            headers.insert(
+                "X-Dragonfly-Application",
+                application
+                    .to_string()
+                    .parse()
+                    .map_err(|err| Error::InvalidArgument(format!("invalid application: {err}")))?,
+            );
+        }
+
+        if let Some(content_for_calculating_task_id) =
+            request.content_for_calculating_task_id.clone()
+        {
+            headers.insert(
+                "X-Dragonfly-Content-For-Calculating-Task-ID",
+                content_for_calculating_task_id
+                    .to_string()
+                    .parse()
+                    .map_err(|err| {
+                        Error::InvalidArgument(format!(
+                            "invalid content for calculating task id: {err}"
+                        ))
+                    })?,
+            );
+        }
+
+        headers.insert(
+            "X-Dragonfly-Enable-Task-ID-Based-Blob-Digest",
+            request
+                .enable_task_id_based_blob_digest
+                .to_string()
+                .parse()
+                .map_err(|err| {
+                    Error::InvalidArgument(format!(
+                        "invalid enable task id based blob digest: {err}"
+                    ))
+                })?,
+        );
+
+        if let Some(priority) = request.priority {
+            headers.insert(
+                "X-Dragonfly-Priority",
+                priority
+                    .to_string()
+                    .parse()
+                    .map_err(|err| Error::InvalidArgument(format!("invalid priority: {err}")))?,
+            );
+        }
+
+        if !request.filtered_query_params.is_empty() {
+            let value = request.filtered_query_params.join(",");
+            headers.insert(
+                "X-Dragonfly-Filtered-Query-Params",
+                value.parse().map_err(|err| {
+                    Error::InvalidArgument(format!("invalid filtered query params: {err}"))
+                })?,
+            );
+        }
+
+        headers.insert("X-Dragonfly-Use-P2P", HeaderValue::from_static("true"));
+        Ok(headers)
+    }
+}
+
+/// Implements the interface for sending requests via the fixed seed peer endpoints of the
+/// Dragonfly given at construction, without selecting seed peers by the consistent hash
+/// ring or syncing them from the scheduler.
+#[async_trait]
+impl RequestWithEndpoints for ProxyWithEndpoints {
+    /// Sends an GET request to a remote server via the seed peer endpoints of the
+    /// Dragonfly and returns a response with a streaming body. The request is sent to a
+    /// randomly picked endpoint and retried on the others up to the max retries.
+    async fn get(&self, request: &GetRequest) -> Result<GetResponse> {
+        request.validate()?;
+
+        let get = async {
+            let response = self.try_send(request).await?;
+            let header = response.headers().clone();
+            let status_code = response.status();
+            let body: Body = Box::new(
+                response
+                    .bytes_stream()
+                    .map_err(|err| Error::Internal(err.to_string())),
+            );
+
+            Ok(GetResponse {
+                success: status_code.is_success(),
+                header,
+                status_code: Some(status_code),
+                body: Some(body),
+            })
+        };
+
+        tokio::time::timeout(request.timeout, get)
+            .await
+            .map_err(|err| Error::RequestTimeout(err.to_string()))?
+    }
+
+    /// Sends an GET request to a remote server via the seed peer endpoints of the
+    /// Dragonfly and writes the response body directly into the provided buffer. The
+    /// request is sent to a randomly picked endpoint and retried on the others up to the
+    /// max retries.
+    async fn get_into(&self, request: &GetRequest, buf: &mut BytesMut) -> Result<GetResponse> {
+        request.validate()?;
+
+        let get_into = async {
+            let mut response = self.try_send(request).await?;
+            let status = response.status();
+            let header = response.headers().clone();
+
+            if status.is_success() {
+                // Reserve the capacity upfront and copy each chunk into the buffer
+                // directly, without aggregating the whole body first.
+                if let Some(content_length) = response.content_length() {
+                    buf.reserve(content_length as usize);
+                }
+
+                while let Some(chunk) = response.chunk().await.map_err(|err| {
+                    if err.is_timeout() {
+                        return Error::RequestTimeout(err.to_string());
+                    }
+
+                    Error::Internal(format!("failed to read response body: {err}"))
+                })? {
+                    buf.extend_from_slice(&chunk);
+                }
+            }
+
+            Ok(GetResponse {
+                success: status.is_success(),
+                header,
+                status_code: Some(status),
+                body: None,
+            })
+        };
+
+        tokio::time::timeout(request.timeout, get_into)
+            .await
+            .map_err(|err| Error::RequestTimeout(err.to_string()))?
     }
 }
 
@@ -1491,7 +1749,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_proxy_new_success() {
+    async fn test_new_success() {
         let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
         let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
         let result = Proxy::builder()
@@ -1504,7 +1762,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_proxy_new_empty_endpoint() {
+    async fn test_new_empty_endpoint() {
         let result = Proxy::builder()
             .scheduler_endpoint("".to_string())
             .build()
@@ -1515,7 +1773,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_proxy_new_invalid_retry_times() {
+    async fn test_new_invalid_retry_times() {
         let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
 
         let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
@@ -1530,7 +1788,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_proxy_new_invalid_health_check_interval() {
+    async fn test_new_invalid_health_check_interval() {
         let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
 
         let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
@@ -1545,7 +1803,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_preheat_file_no_available_seed_peers() {
+    async fn test_preheat_no_available_seed_peers() {
         let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
         let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
         let proxy = Proxy::builder()
@@ -1820,11 +2078,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_with_endpoints_empty() {
-        let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
-        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
-        let proxy = Proxy::builder()
-            .scheduler_endpoint(scheduler_endpoint)
+    async fn test_new_with_endpoints_empty() {
+        let result = ProxyWithEndpoints::builder()
+            .endpoints(vec![])
+            .build()
+            .await;
+        assert!(matches!(result, Err(Error::InvalidArgument(_))));
+    }
+
+    #[tokio::test]
+    async fn test_get_into_with_endpoints() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut mocks = MockSet::new();
+        mocks.mock(|when, then| {
+            when.get().path("/file.txt");
+            then.text("hello dragonfly");
+        });
+        let mock_proxy = setup_mock_seed_peer_proxy(mocks).await.unwrap();
+
+        let endpoints = vec![
+            "http://127.0.0.1:1".to_string(),
+            format!("http://127.0.0.1:{}", mock_proxy.port().unwrap()),
+        ];
+        let proxy = ProxyWithEndpoints::builder()
+            .endpoints(endpoints)
             .build()
             .await
             .unwrap();
@@ -1834,8 +2111,158 @@ mod tests {
             ..Default::default()
         };
 
-        let result = proxy.get_with_endpoints(&[], &request).await;
+        let mut buf = BytesMut::new();
+        let response = proxy.get_into(&request, &mut buf).await.unwrap();
+        assert!(response.success);
+        assert_eq!(response.status_code, Some(reqwest::StatusCode::OK));
+        assert_eq!(&buf[..], b"hello dragonfly");
+    }
+
+    #[tokio::test]
+    async fn test_new_with_endpoints() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let endpoints = vec![
+            "http://127.0.0.1:4001".to_string(),
+            "http://127.0.0.1:4001".to_string(),
+            "http://127.0.0.1:4002".to_string(),
+        ];
+        let proxy = ProxyWithEndpoints::builder()
+            .endpoints(endpoints.clone())
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(proxy.max_retries, 1);
+        assert_eq!(proxy.endpoints, endpoints);
+        assert_eq!(proxy.clients.len(), 2);
+        assert!(proxy.clients.contains_key("http://127.0.0.1:4001"));
+        assert!(proxy.clients.contains_key("http://127.0.0.1:4002"));
+    }
+
+    #[tokio::test]
+    async fn test_new_with_endpoints_invalid_max_retries() {
+        let result = ProxyWithEndpoints::builder()
+            .endpoints(vec!["http://127.0.0.1:4001".to_string()])
+            .max_retries(11)
+            .build()
+            .await;
         assert!(matches!(result, Err(Error::InvalidArgument(_))));
+    }
+
+    #[tokio::test]
+    async fn test_new_with_endpoints_invalid_endpoint() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let result = ProxyWithEndpoints::builder()
+            .endpoints(vec!["://".to_string()])
+            .build()
+            .await;
+        assert!(matches!(result, Err(Error::Internal(_))));
+    }
+
+    #[tokio::test]
+    async fn test_get_with_endpoints() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut mocks = MockSet::new();
+        mocks.mock(|when, then| {
+            when.get().path("/file.txt");
+            then.text("hello dragonfly");
+        });
+        let mock_proxy = setup_mock_seed_peer_proxy(mocks).await.unwrap();
+
+        let endpoints = vec![
+            "http://127.0.0.1:1".to_string(),
+            format!("http://127.0.0.1:{}", mock_proxy.port().unwrap()),
+        ];
+        let proxy = ProxyWithEndpoints::builder()
+            .endpoints(endpoints)
+            .build()
+            .await
+            .unwrap();
+
+        let request = GetRequest {
+            url: "http://example.com/file.txt".to_string(),
+            ..Default::default()
+        };
+
+        let response = proxy.get(&request).await.unwrap();
+        assert!(response.success);
+        assert_eq!(response.status_code, Some(reqwest::StatusCode::OK));
+
+        let mut body = response.body.unwrap();
+        let mut content = Vec::new();
+        while let Some(chunk) = body.try_next().await.unwrap() {
+            content.extend_from_slice(&chunk);
+        }
+        assert_eq!(content, b"hello dragonfly");
+    }
+
+    #[tokio::test]
+    async fn test_get_with_endpoints_all_endpoints_down() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let proxy = ProxyWithEndpoints::builder()
+            .endpoints(vec!["http://127.0.0.1:1".to_string()])
+            .build()
+            .await
+            .unwrap();
+
+        let request = GetRequest {
+            url: "http://example.com/file.txt".to_string(),
+            ..Default::default()
+        };
+
+        let result = proxy.get(&request).await;
+        assert!(matches!(result, Err(Error::Internal(_))));
+    }
+
+    #[tokio::test]
+    async fn test_get_with_endpoints_invalid_replicas() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let proxy = ProxyWithEndpoints::builder()
+            .endpoints(vec!["http://127.0.0.1:4001".to_string()])
+            .build()
+            .await
+            .unwrap();
+
+        let request = GetRequest {
+            url: "http://example.com/file.txt".to_string(),
+            replicas: 0,
+            ..Default::default()
+        };
+
+        let result = proxy.get(&request).await;
+        assert!(matches!(result, Err(Error::InvalidArgument(_))));
+    }
+
+    #[tokio::test]
+    async fn test_get_with_endpoints_error_type_backend() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut mocks = MockSet::new();
+        mocks.mock(|when, then| {
+            when.get().path("/file.txt");
+            then.status(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+                .headers([("X-Dragonfly-Error-Type", "backend")])
+                .text("boom");
+        });
+        let mock_proxy = setup_mock_seed_peer_proxy(mocks).await.unwrap();
+
+        let proxy = ProxyWithEndpoints::builder()
+            .endpoints(vec![format!(
+                "http://127.0.0.1:{}",
+                mock_proxy.port().unwrap()
+            )])
+            .build()
+            .await
+            .unwrap();
+
+        let request = GetRequest {
+            url: "http://example.com/file.txt".to_string(),
+            ..Default::default()
+        };
+
+        let result = proxy.get(&request).await;
+        assert!(
+            matches!(result, Err(Error::BackendError(err)) if err.message.as_deref() == Some("boom"))
+        );
     }
 
     #[tokio::test]
