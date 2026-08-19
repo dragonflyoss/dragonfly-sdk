@@ -150,14 +150,14 @@ func TestPreheatAndGetHitSameSeedPeers(t *testing.T) {
 			mu.Lock()
 			served[name] = true
 			mu.Unlock()
-			fmt.Fprint(w, "ok")
+			w.WriteHeader(http.StatusInternalServerError)
 		})
 
 		hosts = append(hosts, createSeedPeerHost(name, port, proxyPort))
 	}
 	endpoint := setupMockScheduler(t, hosts)
 
-	proxy, err := New(context.Background(), endpoint)
+	proxy, err := New(context.Background(), endpoint, WithProxyMaxRetries(2))
 	assert.NoError(t, err)
 	defer proxy.Close()
 
@@ -184,11 +184,8 @@ func TestPreheatAndGetHitSameSeedPeers(t *testing.T) {
 			assert.Len(preheated, tt.replicas)
 			mu.Unlock()
 
-			for range 10 {
-				resp, err := proxy.Get(context.Background(), NewGetRequest(tt.url, WithGetRequestReplicas(tt.replicas)))
-				assert.NoError(err)
-				assert.NoError(resp.Body.Close())
-			}
+			_, err := proxy.Get(context.Background(), NewGetRequest(tt.url, WithGetRequestReplicas(tt.replicas)))
+			assert.Error(err)
 
 			mu.Lock()
 			assert.Equal(preheated, served)
