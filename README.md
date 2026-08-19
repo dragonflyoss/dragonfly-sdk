@@ -1,8 +1,6 @@
 # Dragonfly SDK
 
 [![GitHub release](https://img.shields.io/github/release/dragonflyoss/dragonfly-sdk.svg)](https://github.com/dragonflyoss/dragonfly-sdk/releases)
-[![CI (Rust)](https://github.com/dragonflyoss/dragonfly-sdk/actions/workflows/ci-rust.yml/badge.svg?branch=main)](https://github.com/dragonflyoss/dragonfly-sdk/actions/workflows/ci-rust.yml)
-[![CI (Go)](https://github.com/dragonflyoss/dragonfly-sdk/actions/workflows/ci-go.yml/badge.svg?branch=main)](https://github.com/dragonflyoss/dragonfly-sdk/actions/workflows/ci-go.yml)
 [![Twitter](https://img.shields.io/twitter/url?style=social&url=https%3A%2F%2Ftwitter.com%2Fdragonfly_oss)](https://twitter.com/dragonfly_oss)
 [![LICENSE](https://img.shields.io/github/license/dragonflyoss/dragonfly.svg?style=flat-square)](https://github.com/dragonflyoss/dragonfly/blob/main/LICENSE)
 
