@@ -53,7 +53,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	resp, err := proxy.GetWithEndpoints(ctx, endpoints, req)
+	proxyWithEndpoints, err := request.NewWithEndpoints(endpoints)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
+	resp, err := proxyWithEndpoints.Get(ctx, req)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

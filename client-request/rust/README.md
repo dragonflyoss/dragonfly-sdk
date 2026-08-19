@@ -10,7 +10,7 @@ and preheating files or OCI images through seed peers.
 ## Usage
 
 ```rust
-use dragonfly_client_request::{GetRequest, Proxy, Request};
+use dragonfly_client_request::{Proxy, GetRequest, Request};
 use futures::TryStreamExt;
 
 let proxy = Proxy::builder()
@@ -57,8 +57,10 @@ let response = proxy
     .await?;
 ```
 
-Look up the endpoints of the seed peers serving a request, then download from
-the looked-up endpoints directly, scattering the request across them:
+Look up the endpoints of the seed peers serving a request, then create a proxy
+bound to those endpoints and download from them directly, scattering the
+request across them. The endpoints proxy keeps a client with a reusable
+connection pool per endpoint and doesn't sync seed peers from the scheduler:
 
 ```rust
 let request = GetRequest {
@@ -67,10 +69,15 @@ let request = GetRequest {
 };
 
 let endpoints = proxy.lookup_endpoints(&request).await?;
-let response = proxy.get_with_endpoints(&endpoints, &request).await?;
+let proxy_with_endpoints = ProxyWithEndpoints::builder()
+    .endpoints(endpoints)
+    .build()
+    .await?;
+
+let response = proxy_with_endpoints.get(&request).await?;
 
 // Or write the response body directly into a buffer:
-// let response = proxy.get_into_with_endpoints(&endpoints, &request, &mut buf).await?;
+// let response = proxy_with_endpoints.get_into(&request, &mut buf).await?;
 ```
 
 The `preheat` feature enables preheating OCI images by resolving manifests from
@@ -78,7 +85,7 @@ the registry and triggering seed peers to download each blob:
 
 ```toml
 [dependencies]
-dragonfly-client-request = { version = "1.5.0", features = ["preheat"] }
+dragonfly-client-request = { version = "1.6.0", features = ["preheat"] }
 ```
 
 See [examples](./examples) for runnable examples.
