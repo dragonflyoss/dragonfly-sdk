@@ -84,7 +84,7 @@ class Client:
 
     def __init__(self, socket_path: str = DEFAULT_DFDAEMON_SOCKET_PATH):
         self.socket_path = socket_path
-        self._channel = grpc.insecure_channel(f"unix://{socket_path}")
+        self._channel = grpc.insecure_channel(f"unix:{socket_path}")
         self._stub = dfdaemon_pb2_grpc.DfdaemonDownloadStub(self._channel)
 
     def __enter__(self) -> "Client":
