@@ -8,7 +8,7 @@ require (
 	github.com/dchest/siphash v1.2.3
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/sync v0.22.0
-	google.golang.org/grpc v1.83.0
+	google.golang.org/grpc v1.83.1
 	google.golang.org/protobuf v1.36.12
 )
 
