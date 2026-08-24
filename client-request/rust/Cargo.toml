@@ -42,7 +42,7 @@ reqwest = { version = "0.12.28", default-features = false, features = [
 reqwest-tracing = "0.5"
 reqwest-middleware = "0.4"
 prost-wkt-types = "0.7"
-rand = "0.9"
+rand = "0.10"
 rustls-pki-types = "1.14.1"
 tokio = { version = "1.52.3", features = ["full", "tracing"] }
 tokio-util = { version = "0.7.18", features = ["full"] }
