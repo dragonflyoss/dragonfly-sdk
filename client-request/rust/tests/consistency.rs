@@ -134,6 +134,104 @@ fn test_task_id() {
 
     assert_eq!(
         generator
+            .task_id(TaskIDParameter::URLBased {
+                url: "https://example.com/file.txt?z=9&b=2&a=1".to_string(),
+                piece_length: None,
+                tag: Some("foo".to_string()),
+                application: Some("bar".to_string()),
+                filtered_query_params: vec!["z".to_string()],
+                revision: None,
+            })
+            .unwrap(),
+        "8b3f6e9b9b8fe20903bced565cfd1d0aaef354a4c17573f0c2c1979210443f9d"
+    );
+
+    assert_eq!(
+        generator
+            .task_id(TaskIDParameter::URLBased {
+                url: "https://example.com/file.txt?b=2&a=1&b=1".to_string(),
+                piece_length: None,
+                tag: None,
+                application: None,
+                filtered_query_params: vec!["c".to_string()],
+                revision: None,
+            })
+            .unwrap(),
+        "7c8801d0596be5e8f9449d5c4af23866c72fe5205119c0e5912981f3b16a37aa"
+    );
+
+    assert_eq!(
+        generator
+            .task_id(TaskIDParameter::URLBased {
+                url: "https://example.com/file.txt?k=a b&m=x*y&n=c~d".to_string(),
+                piece_length: Some(1024),
+                tag: None,
+                application: None,
+                filtered_query_params: vec!["none".to_string()],
+                revision: None,
+            })
+            .unwrap(),
+        "6196a6846023f6d3c1e4d30f6c86f3d4186e4c664a33e5692b0e04e49b26a9af"
+    );
+
+    assert_eq!(
+        generator
+            .task_id(TaskIDParameter::URLBased {
+                url: "https://example.com/file.txt?a=1&b=2".to_string(),
+                piece_length: None,
+                tag: Some("foo".to_string()),
+                application: None,
+                filtered_query_params: vec!["a".to_string(), "b".to_string()],
+                revision: None,
+            })
+            .unwrap(),
+        "c8f4b41117329d54af920010394f6f607bac707e933ab2f18d372e3dd4c7fcb3"
+    );
+
+    assert_eq!(
+        generator
+            .task_id(TaskIDParameter::URLBased {
+                url: "https://example.com/file.txt?b=2&a=1".to_string(),
+                piece_length: None,
+                tag: None,
+                application: None,
+                filtered_query_params: vec![],
+                revision: None,
+            })
+            .unwrap(),
+        "980ee327518ccc5a7c30703e1a2232e8ba9047b39431f940636c85b6146f8b9a"
+    );
+
+    assert_eq!(
+        generator
+            .task_id(TaskIDParameter::URLBased {
+                url: "https://example.com/file.txt?a=1;x&b=2".to_string(),
+                piece_length: None,
+                tag: None,
+                application: None,
+                filtered_query_params: vec!["none".to_string()],
+                revision: None,
+            })
+            .unwrap(),
+        "370933e9d7ab42b3ed90287213cd5f8def6091c8606da5b2dc79436061b06c34"
+    );
+
+    assert_eq!(
+        generator
+            .task_id(TaskIDParameter::URLBased {
+                url: "http://www.xx.yy/path?u=f&x=y&m=z&x=s#size".to_string(),
+                piece_length: None,
+                tag: None,
+                application: None,
+                filtered_query_params: vec!["x".to_string(), "m".to_string()],
+                revision: None,
+            })
+            .unwrap(),
+        "3570c3c808f06fd250a7a60634b9275d72c56edc248576508bb06264c2c65825"
+    );
+
+    assert_eq!(
+        generator
             .task_id(TaskIDParameter::Content("This is a test file".to_string()))
             .unwrap(),
         "e2d0fe1585a63ec6009c8016ff8dda8b17719a637405a4e23c0ff81339148249"

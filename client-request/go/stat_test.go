@@ -81,6 +81,7 @@ func TestStatImageQueriesSeedPeers(t *testing.T) {
 	assert.Equal("dfctl", statImageRequest.GetApplication())
 	assert.Equal(idgen.DefaultFilteredQueryParams, statImageRequest.GetFilteredQueryParams())
 	assert.Equal(defaultRequestTimeout, statImageRequest.GetTimeout().AsDuration())
+	assert.True(statImageRequest.GetEnableTaskIdBasedBlobDigest())
 
 	assert.Len(resp.Layers, 2)
 	assert.Len(resp.Peers, 1)
@@ -183,6 +184,25 @@ func TestStatImageInvalidImageReference(t *testing.T) {
 
 	_, err = proxy.StatImage(context.Background(), req)
 	assert.ErrorIs(err, ErrInvalidArgument)
+}
+
+func TestStatImageSchedulerInvalidArgument(t *testing.T) {
+	assert := assert.New(t)
+	endpoint := setupMockSchedulerServer(t, &mockScheduler{
+		statImage: func(req *schedulerv2.StatImageRequest) (*schedulerv2.StatImageResponse, error) {
+			return nil, status.Error(codes.InvalidArgument, "piece length must be between 4MiB and 64MiB")
+		},
+	})
+
+	proxy, err := New(context.Background(), endpoint)
+	assert.NoError(err)
+	defer proxy.Close()
+
+	req := NewStatImageRequest("example.com/foo/bar:1.0")
+
+	_, err = proxy.StatImage(context.Background(), req)
+	assert.ErrorIs(err, ErrInvalidArgument)
+	assert.ErrorContains(err, "failed to stat image")
 }
 
 func TestStatImageSchedulerError(t *testing.T) {

@@ -26,6 +26,7 @@ import (
 	"time"
 
 	commonv2 "d7y.io/api/v2/pkg/apis/common/v2"
+	"d7y.io/dragonfly/v2/pkg/idgen"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -345,7 +346,7 @@ func TestTaskIDBlobDigestDisabled(t *testing.T) {
 	assert := assert.New(t)
 
 	blobURL := "http://registry.example.com/v2/library/ubuntu/blobs/sha256:b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e"
-	id, err := generateTaskID(&GetRequest{url: blobURL})
+	id, err := idgen.TaskIDV2(blobURL, nil, "", "", nil, "", false)
 	assert.NoError(err)
 	assert.NotEqual("b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e", id)
 }

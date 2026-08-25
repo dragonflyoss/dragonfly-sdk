@@ -19,10 +19,14 @@ package request
 import (
 	"context"
 	"fmt"
+	"math"
 
 	schedulerv2 "d7y.io/api/v2/pkg/apis/scheduler/v2"
 	managertypes "d7y.io/dragonfly/v2/manager/types"
 	"d7y.io/dragonfly/v2/pkg/oci"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/durationpb"
 )
 
@@ -40,11 +44,12 @@ func (p *Proxy) StatImage(ctx context.Context, req *StatImageRequest) (*StatImag
 	}
 
 	statImageRequest := &schedulerv2.StatImageRequest{
-		Url:                 ref.ManifestURL(),
-		PieceLength:         req.pieceLength,
-		FilteredQueryParams: req.filteredQueryParams,
-		Timeout:             durationpb.New(req.timeout),
-		Scope:               managertypes.AllSeedPeersScope,
+		Url:                         ref.ManifestURL(),
+		PieceLength:                 req.pieceLength,
+		FilteredQueryParams:         req.filteredQueryParams,
+		Timeout:                     durationpb.New(req.timeout),
+		Scope:                       managertypes.AllSeedPeersScope,
+		EnableTaskIdBasedBlobDigest: req.enableTaskIDBasedBlobDigest,
 	}
 
 	if req.tag != "" {
@@ -67,8 +72,15 @@ func (p *Proxy) StatImage(ctx context.Context, req *StatImageRequest) (*StatImag
 		statImageRequest.Platform = &req.platform
 	}
 
-	resp, err := schedulerv2.NewSchedulerClient(p.schedulerConn).StatImage(ctx, statImageRequest)
+	resp, err := schedulerv2.NewSchedulerClient(p.schedulerConn).StatImage(ctx, statImageRequest,
+		grpc.MaxCallRecvMsgSize(math.MaxInt32),
+		grpc.MaxCallSendMsgSize(math.MaxInt32),
+	)
 	if err != nil {
+		if status.Code(err) == codes.InvalidArgument {
+			return nil, fmt.Errorf("%w: failed to stat image %s: %v", ErrInvalidArgument, req.image, err)
+		}
+
 		return nil, fmt.Errorf("%w: failed to stat image %s: %v", ErrInternal, req.image, err)
 	}
 

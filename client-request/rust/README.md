@@ -86,7 +86,7 @@ distribution of an OCI image with the layers cached by each seed peer:
 
 ```toml
 [dependencies]
-dragonfly-client-request = { version = "1.6.0", features = ["preheat"] }
+dragonfly-client-request = { version = "1.6.1", features = ["preheat"] }
 ```
 
 ```rust

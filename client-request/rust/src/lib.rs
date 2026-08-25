@@ -75,6 +75,7 @@ mod net;
 mod pool;
 mod selector;
 mod shutdown;
+mod url;
 
 /// The max idle connections per host.
 const POOL_MAX_IDLE_PER_HOST: usize = 1024;
@@ -510,8 +511,10 @@ pub struct StatImageRequest {
     pub password: Option<String>,
 
     /// Platform specifies the target platform in the format "os/arch"
-    /// (e.g., "linux/amd64", "linux/arm64"). This is used to select the correct
-    /// manifest from a multi-platform image index, default is current platform.
+    /// (e.g., "linux/amd64", "linux/arm64"). This is used by the scheduler to select
+    /// the correct manifest from a multi-platform image index, default is the
+    /// scheduler's platform. It should be consistent with the platform used when the
+    /// image was preheated, otherwise the layers can not be found on the peers.
     pub platform: Option<String>,
 
     /// The optional piece length for the Dragonfly task.
@@ -529,6 +532,12 @@ pub struct StatImageRequest {
     /// will generate the same task id.
     /// Default value includes the filtered query params of s3, gcs, oss, obs, cos.
     pub filtered_query_params: Vec<String>,
+
+    /// Enable task id based blob digest. It indicates whether to use the blob digest for
+    /// task id calculation when the layer url is an OCI blob url. It should be consistent
+    /// with the value used when the image was preheated, otherwise the tasks can not be
+    /// found on the peers, default is true.
+    pub enable_task_id_based_blob_digest: bool,
 
     /// The timeout for the request, default is 30 minutes.
     pub timeout: Duration,
@@ -549,6 +558,7 @@ impl Default for StatImageRequest {
             tag: None,
             application: None,
             filtered_query_params: default_proxy_rule_filtered_query_params(),
+            enable_task_id_based_blob_digest: true,
             timeout: DEFAULT_REQUEST_TIMEOUT,
         }
     }
@@ -741,7 +751,7 @@ impl ProxyBuilder {
 
     /// Validates the input parameters.
     fn validate(&self) -> Result<()> {
-        if let Err(err) = url::Url::parse(&self.scheduler_endpoint) {
+        if let Err(err) = ::url::Url::parse(&self.scheduler_endpoint) {
             return Err(Error::InvalidArgument(err.to_string()));
         };
 
@@ -1027,6 +1037,7 @@ impl Request for Proxy {
                 })?,
             ),
             scope: STAT_IMAGE_SCOPE_ALL_SEED_PEERS.to_string(),
+            enable_task_id_based_blob_digest: request.enable_task_id_based_blob_digest,
             ..Default::default()
         };
 
@@ -1044,12 +1055,16 @@ impl Request for Proxy {
             })?;
 
         let response = SchedulerClient::new(channel)
-            .max_decoding_message_size(usize::MAX)
-            .max_encoding_message_size(usize::MAX)
+            .max_decoding_message_size(i32::MAX as usize)
+            .max_encoding_message_size(i32::MAX as usize)
             .stat_image(stat_image_request)
             .await
-            .map_err(|err| {
-                Error::Internal(format!("failed to stat image {}: {}", request.image, err))
+            .map_err(|err| match err.code() {
+                tonic::Code::InvalidArgument => Error::InvalidArgument(format!(
+                    "failed to stat image {}: {}",
+                    request.image, err
+                )),
+                _ => Error::Internal(format!("failed to stat image {}: {}", request.image, err)),
             })?
             .into_inner();
 
@@ -2876,6 +2891,7 @@ mod tests {
                         prost_wkt_types::Duration::try_from(DEFAULT_REQUEST_TIMEOUT).unwrap(),
                     ),
                     scope: STAT_IMAGE_SCOPE_ALL_SEED_PEERS.to_string(),
+                    enable_task_id_based_blob_digest: true,
                     ..Default::default()
                 });
             then.pb(ApiStatImageResponse {
@@ -2956,6 +2972,7 @@ mod tests {
                         prost_wkt_types::Duration::try_from(DEFAULT_REQUEST_TIMEOUT).unwrap(),
                     ),
                     scope: STAT_IMAGE_SCOPE_ALL_SEED_PEERS.to_string(),
+                    enable_task_id_based_blob_digest: true,
                     ..Default::default()
                 });
             then.pb(ApiStatImageResponse::default());
@@ -2996,6 +3013,7 @@ mod tests {
                         prost_wkt_types::Duration::try_from(DEFAULT_REQUEST_TIMEOUT).unwrap(),
                     ),
                     scope: STAT_IMAGE_SCOPE_ALL_SEED_PEERS.to_string(),
+                    enable_task_id_based_blob_digest: true,
                     ..Default::default()
                 });
             then.pb(ApiStatImageResponse::default());
@@ -3040,6 +3058,7 @@ mod tests {
                         prost_wkt_types::Duration::try_from(DEFAULT_REQUEST_TIMEOUT).unwrap(),
                     ),
                     scope: STAT_IMAGE_SCOPE_ALL_SEED_PEERS.to_string(),
+                    enable_task_id_based_blob_digest: true,
                     ..Default::default()
                 });
             then.pb(ApiStatImageResponse::default());
@@ -3105,6 +3124,36 @@ mod tests {
         let result = proxy.stat_image(&request).await;
         assert!(
             matches!(result, Err(Error::Internal(message)) if message.contains("failed to stat image"))
+        );
+    }
+
+    #[cfg(feature = "preheat")]
+    #[tokio::test]
+    async fn test_stat_image_scheduler_invalid_argument() {
+        let mut mocks = MockSet::new();
+        mocks.mock(|when, then| {
+            when.path("/scheduler.v2.Scheduler/StatImage");
+            then.unprocessable_content();
+        });
+
+        let mock_scheduler = setup_mock_scheduler_with_mocks(vec![], mocks)
+            .await
+            .unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let request = StatImageRequest {
+            image: "example.com/foo/bar:1.0".to_string(),
+            ..Default::default()
+        };
+
+        let result = proxy.stat_image(&request).await;
+        assert!(
+            matches!(result, Err(Error::InvalidArgument(message)) if message.contains("failed to stat image"))
         );
     }
 

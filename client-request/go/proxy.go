@@ -345,7 +345,7 @@ func (p *Proxy) LookupEndpoints(ctx context.Context, req *GetRequest) ([]string,
 		return nil, err
 	}
 
-	taskID, err := generateTaskID(req)
+	taskID, err := idgen.TaskIDV2(req.url, req.pieceLength, req.tag, req.application, req.filteredQueryParams, req.contentForCalculatingTaskID, req.enableTaskIDBasedBlobDigest)
 	if err != nil {
 		return nil, fmt.Errorf("%w: failed to generate task id: %v", ErrInternal, err)
 	}
@@ -363,24 +363,10 @@ func (p *Proxy) LookupEndpoints(ctx context.Context, req *GetRequest) ([]string,
 	return addrs, nil
 }
 
-// generateTaskID generates the task id for the request parameters, identical
-// to the Rust client's task id generation.
-func generateTaskID(req *GetRequest) (string, error) {
-	if req.contentForCalculatingTaskID != "" {
-		return idgen.TaskIDV2ByContent(req.contentForCalculatingTaskID), nil
-	}
-
-	if req.enableTaskIDBasedBlobDigest && idgen.IsBlobURL(req.url) {
-		return idgen.TaskIDV2ByBlobDigest(req.url)
-	}
-
-	return idgen.TaskIDV2ByURLBased(req.url, req.pieceLength, req.tag, req.application, req.filteredQueryParams, ""), nil
-}
-
 // lookupProxyEndpoints looks up the proxy endpoints of the seed peers serving the
 // request, in the consistent hash ring selection order.
 func (p *Proxy) lookupProxyEndpoints(req *GetRequest) ([]string, error) {
-	taskID, err := generateTaskID(req)
+	taskID, err := idgen.TaskIDV2(req.url, req.pieceLength, req.tag, req.application, req.filteredQueryParams, req.contentForCalculatingTaskID, req.enableTaskIDBasedBlobDigest)
 	if err != nil {
 		return nil, fmt.Errorf("%w: failed to generate task id: %v", ErrInternal, err)
 	}

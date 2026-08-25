@@ -173,6 +173,11 @@ func TestNewRequestDefaults(t *testing.T) {
 	assert.Equal(2, image.replicas)
 	assert.Equal(4, image.concurrentTaskCount)
 	assert.Equal(30*time.Minute, image.timeout)
+
+	stat := NewStatImageRequest("docker.io/library/nginx:latest")
+	assert.NotEmpty(stat.filteredQueryParams)
+	assert.True(stat.enableTaskIDBasedBlobDigest)
+	assert.Equal(30*time.Minute, stat.timeout)
 }
 
 func setupBenchProxy(b *testing.B, body []byte) (*Proxy, string) {

@@ -589,6 +589,12 @@ type StatImageRequest struct {
 	// filteredQueryParams is the filtered query params to generate the task id.
 	filteredQueryParams []string
 
+	// enableTaskIDBasedBlobDigest indicates whether to use the blob digest for
+	// task id calculation when the layer url is an OCI blob url. It should be
+	// consistent with the value used when the image was preheated, otherwise
+	// the tasks can not be found on the peers.
+	enableTaskIDBasedBlobDigest bool
+
 	// timeout is the timeout of the request.
 	timeout time.Duration
 }
@@ -606,8 +612,10 @@ func WithStatImageRequestAuth(username, password string) StatImageRequestOption 
 }
 
 // WithStatImageRequestPlatform sets the target platform in the format "os/arch"
-// (e.g., "linux/amd64", "linux/arm64"). This is used to select the correct
-// manifest from a multi-platform image index.
+// (e.g., "linux/amd64", "linux/arm64"). This is used by the scheduler to select the
+// correct manifest from a multi-platform image index, default is the scheduler's
+// platform. It should be consistent with the platform used when the image was
+// preheated, otherwise the layers can not be found on the peers.
 func WithStatImageRequestPlatform(platform string) StatImageRequestOption {
 	return func(r *StatImageRequest) { r.platform = platform }
 }
@@ -635,6 +643,13 @@ func WithStatImageRequestFilteredQueryParams(params []string) StatImageRequestOp
 	return func(r *StatImageRequest) { r.filteredQueryParams = params }
 }
 
+// WithStatImageRequestEnableTaskIDBasedBlobDigest sets whether to use the blob
+// digest for task id calculation when the layer url is an OCI blob url. It should
+// be consistent with the value used when the image was preheated, default is true.
+func WithStatImageRequestEnableTaskIDBasedBlobDigest(enable bool) StatImageRequestOption {
+	return func(r *StatImageRequest) { r.enableTaskIDBasedBlobDigest = enable }
+}
+
 // WithStatImageRequestTimeout sets the timeout of the request.
 func WithStatImageRequestTimeout(timeout time.Duration) StatImageRequestOption {
 	return func(r *StatImageRequest) { r.timeout = timeout }
@@ -644,9 +659,10 @@ func WithStatImageRequestTimeout(timeout time.Duration) StatImageRequestOption {
 // values.
 func NewStatImageRequest(image string, opts ...StatImageRequestOption) *StatImageRequest {
 	r := &StatImageRequest{
-		image:               image,
-		filteredQueryParams: idgen.DefaultFilteredQueryParams,
-		timeout:             defaultRequestTimeout,
+		image:                       image,
+		filteredQueryParams:         idgen.DefaultFilteredQueryParams,
+		enableTaskIDBasedBlobDigest: true,
+		timeout:                     defaultRequestTimeout,
 	}
 	for _, opt := range opts {
 		opt(r)
