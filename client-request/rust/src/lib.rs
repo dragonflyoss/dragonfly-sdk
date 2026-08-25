@@ -75,6 +75,7 @@ mod net;
 mod pool;
 mod selector;
 mod shutdown;
+mod url;
 
 /// The max idle connections per host.
 const POOL_MAX_IDLE_PER_HOST: usize = 1024;
@@ -750,7 +751,7 @@ impl ProxyBuilder {
 
     /// Validates the input parameters.
     fn validate(&self) -> Result<()> {
-        if let Err(err) = url::Url::parse(&self.scheduler_endpoint) {
+        if let Err(err) = ::url::Url::parse(&self.scheduler_endpoint) {
             return Err(Error::InvalidArgument(err.to_string()));
         };
 
