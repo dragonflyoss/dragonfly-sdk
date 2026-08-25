@@ -15,7 +15,7 @@ default = []
 preheat = ["dep:oci-client", "dep:oci-spec"]
 
 [dependencies]
-dragonfly-api = "2.3.2"
+dragonfly-api = "2.3.3"
 async-trait = "0.1"
 futures = "0.3.32"
 hostname = "^0.4"

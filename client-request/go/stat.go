@@ -44,11 +44,12 @@ func (p *Proxy) StatImage(ctx context.Context, req *StatImageRequest) (*StatImag
 	}
 
 	statImageRequest := &schedulerv2.StatImageRequest{
-		Url:                 ref.ManifestURL(),
-		PieceLength:         req.pieceLength,
-		FilteredQueryParams: req.filteredQueryParams,
-		Timeout:             durationpb.New(req.timeout),
-		Scope:               managertypes.AllSeedPeersScope,
+		Url:                         ref.ManifestURL(),
+		PieceLength:                 req.pieceLength,
+		FilteredQueryParams:         req.filteredQueryParams,
+		Timeout:                     durationpb.New(req.timeout),
+		Scope:                       managertypes.AllSeedPeersScope,
+		EnableTaskIdBasedBlobDigest: req.enableTaskIDBasedBlobDigest,
 	}
 
 	if req.tag != "" {

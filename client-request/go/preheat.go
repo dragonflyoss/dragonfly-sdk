@@ -28,6 +28,7 @@ import (
 
 	commonv2 "d7y.io/api/v2/pkg/apis/common/v2"
 	dfdaemonv2 "d7y.io/api/v2/pkg/apis/dfdaemon/v2"
+	"d7y.io/dragonfly/v2/pkg/idgen"
 	"d7y.io/dragonfly/v2/pkg/net/ip"
 	"d7y.io/dragonfly/v2/pkg/oci"
 	"golang.org/x/sync/errgroup"
@@ -49,9 +50,8 @@ func (p *Proxy) Preheat(ctx context.Context, req *PreheatRequest) error {
 	ctx, cancel := context.WithTimeout(ctx, req.timeout)
 	defer cancel()
 
-	// Generate task id for selecting seed peer. PreheatRequest has the same
-	// fields as GetRequest, so it converts directly.
-	id, err := generateTaskID((*GetRequest)(req))
+	// Generate task id for selecting seed peer.
+	id, err := idgen.TaskIDV2(req.url, req.pieceLength, req.tag, req.application, req.filteredQueryParams, req.contentForCalculatingTaskID, req.enableTaskIDBasedBlobDigest)
 	if err != nil {
 		return fmt.Errorf("%w: failed to generate task id: %v", ErrInternal, err)
 	}

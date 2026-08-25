@@ -81,6 +81,7 @@ func TestStatImageQueriesSeedPeers(t *testing.T) {
 	assert.Equal("dfctl", statImageRequest.GetApplication())
 	assert.Equal(idgen.DefaultFilteredQueryParams, statImageRequest.GetFilteredQueryParams())
 	assert.Equal(defaultRequestTimeout, statImageRequest.GetTimeout().AsDuration())
+	assert.True(statImageRequest.GetEnableTaskIdBasedBlobDigest())
 
 	assert.Len(resp.Layers, 2)
 	assert.Len(resp.Peers, 1)

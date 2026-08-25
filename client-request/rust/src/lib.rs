@@ -532,6 +532,12 @@ pub struct StatImageRequest {
     /// Default value includes the filtered query params of s3, gcs, oss, obs, cos.
     pub filtered_query_params: Vec<String>,
 
+    /// Enable task id based blob digest. It indicates whether to use the blob digest for
+    /// task id calculation when the layer url is an OCI blob url. It should be consistent
+    /// with the value used when the image was preheated, otherwise the tasks can not be
+    /// found on the peers, default is true.
+    pub enable_task_id_based_blob_digest: bool,
+
     /// The timeout for the request, default is 30 minutes.
     pub timeout: Duration,
 }
@@ -551,6 +557,7 @@ impl Default for StatImageRequest {
             tag: None,
             application: None,
             filtered_query_params: default_proxy_rule_filtered_query_params(),
+            enable_task_id_based_blob_digest: true,
             timeout: DEFAULT_REQUEST_TIMEOUT,
         }
     }
@@ -1029,6 +1036,7 @@ impl Request for Proxy {
                 })?,
             ),
             scope: STAT_IMAGE_SCOPE_ALL_SEED_PEERS.to_string(),
+            enable_task_id_based_blob_digest: request.enable_task_id_based_blob_digest,
             ..Default::default()
         };
 
@@ -2882,6 +2890,7 @@ mod tests {
                         prost_wkt_types::Duration::try_from(DEFAULT_REQUEST_TIMEOUT).unwrap(),
                     ),
                     scope: STAT_IMAGE_SCOPE_ALL_SEED_PEERS.to_string(),
+                    enable_task_id_based_blob_digest: true,
                     ..Default::default()
                 });
             then.pb(ApiStatImageResponse {
@@ -2962,6 +2971,7 @@ mod tests {
                         prost_wkt_types::Duration::try_from(DEFAULT_REQUEST_TIMEOUT).unwrap(),
                     ),
                     scope: STAT_IMAGE_SCOPE_ALL_SEED_PEERS.to_string(),
+                    enable_task_id_based_blob_digest: true,
                     ..Default::default()
                 });
             then.pb(ApiStatImageResponse::default());
@@ -3002,6 +3012,7 @@ mod tests {
                         prost_wkt_types::Duration::try_from(DEFAULT_REQUEST_TIMEOUT).unwrap(),
                     ),
                     scope: STAT_IMAGE_SCOPE_ALL_SEED_PEERS.to_string(),
+                    enable_task_id_based_blob_digest: true,
                     ..Default::default()
                 });
             then.pb(ApiStatImageResponse::default());
@@ -3046,6 +3057,7 @@ mod tests {
                         prost_wkt_types::Duration::try_from(DEFAULT_REQUEST_TIMEOUT).unwrap(),
                     ),
                     scope: STAT_IMAGE_SCOPE_ALL_SEED_PEERS.to_string(),
+                    enable_task_id_based_blob_digest: true,
                     ..Default::default()
                 });
             then.pb(ApiStatImageResponse::default());
