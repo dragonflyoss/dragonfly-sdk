@@ -14,6 +14,11 @@
  * limitations under the License.
  */
 
+//! Mirrored from the dragonfly client's `dragonfly-client-util/src/url/mod.rs`.
+//! The canonicalization here decides the task id, so keep both copies in sync,
+//! any divergence silently produces different task ids between the SDK and the
+//! client.
+
 use crate::errors::Error;
 use crate::Result;
 use percent_encoding::percent_encode_byte;
@@ -38,7 +43,11 @@ fn query_escape(s: &str) -> String {
 }
 
 /// Filters and sorts the query parameters by key to canonicalize the url,
-/// identical to the scheduler. The values of the same key keep the original order.
+/// following the scheduler's canonicalization (Go's url.Values.Encode). The
+/// values of the same key keep the original order. Note that the url crate
+/// applies WHATWG normalizations that Go's net/url does not (e.g. lowercasing
+/// the host, stripping default ports, resolving dot segments), so such urls
+/// may still canonicalize differently from the scheduler.
 pub fn filter_query_params(url: &str, filtered_query_params: &[String]) -> Result<String> {
     if filtered_query_params.is_empty() {
         return Ok(url.to_string());

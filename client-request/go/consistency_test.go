@@ -25,10 +25,9 @@ import (
 	"encoding/binary"
 	"testing"
 
+	"d7y.io/dragonfly/v2/pkg/idgen"
 	"github.com/dchest/siphash"
 	"github.com/stretchr/testify/assert"
-
-	"d7y.io/dragonfly/v2/pkg/idgen"
 
 	"d7y.io/dragonfly-sdk/client-request/go/internal/hashring"
 )
