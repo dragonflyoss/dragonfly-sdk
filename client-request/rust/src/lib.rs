@@ -510,8 +510,10 @@ pub struct StatImageRequest {
     pub password: Option<String>,
 
     /// Platform specifies the target platform in the format "os/arch"
-    /// (e.g., "linux/amd64", "linux/arm64"). This is used to select the correct
-    /// manifest from a multi-platform image index, default is current platform.
+    /// (e.g., "linux/amd64", "linux/arm64"). This is used by the scheduler to select
+    /// the correct manifest from a multi-platform image index, default is the
+    /// scheduler's platform. It should be consistent with the platform used when the
+    /// image was preheated, otherwise the layers can not be found on the peers.
     pub platform: Option<String>,
 
     /// The optional piece length for the Dragonfly task.
@@ -1044,12 +1046,16 @@ impl Request for Proxy {
             })?;
 
         let response = SchedulerClient::new(channel)
-            .max_decoding_message_size(usize::MAX)
-            .max_encoding_message_size(usize::MAX)
+            .max_decoding_message_size(i32::MAX as usize)
+            .max_encoding_message_size(i32::MAX as usize)
             .stat_image(stat_image_request)
             .await
-            .map_err(|err| {
-                Error::Internal(format!("failed to stat image {}: {}", request.image, err))
+            .map_err(|err| match err.code() {
+                tonic::Code::InvalidArgument => Error::InvalidArgument(format!(
+                    "failed to stat image {}: {}",
+                    request.image, err
+                )),
+                _ => Error::Internal(format!("failed to stat image {}: {}", request.image, err)),
             })?
             .into_inner();
 
@@ -3105,6 +3111,36 @@ mod tests {
         let result = proxy.stat_image(&request).await;
         assert!(
             matches!(result, Err(Error::Internal(message)) if message.contains("failed to stat image"))
+        );
+    }
+
+    #[cfg(feature = "preheat")]
+    #[tokio::test]
+    async fn test_stat_image_scheduler_invalid_argument() {
+        let mut mocks = MockSet::new();
+        mocks.mock(|when, then| {
+            when.path("/scheduler.v2.Scheduler/StatImage");
+            then.unprocessable_content();
+        });
+
+        let mock_scheduler = setup_mock_scheduler_with_mocks(vec![], mocks)
+            .await
+            .unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let request = StatImageRequest {
+            image: "example.com/foo/bar:1.0".to_string(),
+            ..Default::default()
+        };
+
+        let result = proxy.stat_image(&request).await;
+        assert!(
+            matches!(result, Err(Error::InvalidArgument(message)) if message.contains("failed to stat image"))
         );
     }
 

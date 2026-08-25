@@ -606,8 +606,10 @@ func WithStatImageRequestAuth(username, password string) StatImageRequestOption 
 }
 
 // WithStatImageRequestPlatform sets the target platform in the format "os/arch"
-// (e.g., "linux/amd64", "linux/arm64"). This is used to select the correct
-// manifest from a multi-platform image index.
+// (e.g., "linux/amd64", "linux/arm64"). This is used by the scheduler to select the
+// correct manifest from a multi-platform image index, default is the scheduler's
+// platform. It should be consistent with the platform used when the image was
+// preheated, otherwise the layers can not be found on the peers.
 func WithStatImageRequestPlatform(platform string) StatImageRequestOption {
 	return func(r *StatImageRequest) { r.platform = platform }
 }

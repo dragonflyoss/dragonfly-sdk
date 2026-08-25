@@ -74,6 +74,11 @@ resp, err := proxy.StatImage(ctx, request.NewStatImageRequest("docker.io/library
 if err != nil {
     panic(err)
 }
+
+fmt.Printf("image has %d layers\n", len(resp.Layers))
+for _, peer := range resp.Peers {
+    fmt.Printf("peer %s (%s) cached %d layers\n", peer.Hostname, peer.IP, len(peer.CachedLayers))
+}
 ```
 
 Preheat with multiple replicas and scatter downloads across them. Preheating
