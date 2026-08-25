@@ -39,14 +39,27 @@ import (
 
 type mockScheduler struct {
 	schedulerv2.UnimplementedSchedulerServer
-	hosts []*commonv2.Host
+	hosts     []*commonv2.Host
+	statImage func(*schedulerv2.StatImageRequest) (*schedulerv2.StatImageResponse, error)
 }
 
 func (s *mockScheduler) ListHosts(ctx context.Context, req *schedulerv2.ListHostsRequest) (*schedulerv2.ListHostsResponse, error) {
 	return &schedulerv2.ListHostsResponse{Hosts: s.hosts}, nil
 }
 
+func (s *mockScheduler) StatImage(ctx context.Context, req *schedulerv2.StatImageRequest) (*schedulerv2.StatImageResponse, error) {
+	if s.statImage != nil {
+		return s.statImage(req)
+	}
+
+	return s.UnimplementedSchedulerServer.StatImage(ctx, req)
+}
+
 func setupMockScheduler(t testing.TB, hosts []*commonv2.Host) string {
+	return setupMockSchedulerServer(t, &mockScheduler{hosts: hosts})
+}
+
+func setupMockSchedulerServer(t testing.TB, scheduler *mockScheduler) string {
 	t.Helper()
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -55,7 +68,7 @@ func setupMockScheduler(t testing.TB, hosts []*commonv2.Host) string {
 	}
 
 	server := grpc.NewServer()
-	schedulerv2.RegisterSchedulerServer(server, &mockScheduler{hosts: hosts})
+	schedulerv2.RegisterSchedulerServer(server, scheduler)
 	go func() { _ = server.Serve(listener) }()
 	t.Cleanup(server.Stop)
 
