@@ -65,6 +65,12 @@ type Request interface {
 	// image indexes) and triggers the seed client to download each blob.
 	PreheatImage(ctx context.Context, req *PreheatImageRequest) error
 
+	// StatImage provides detailed status for an OCI image's distribution in
+	// the Dragonfly. It requests the scheduler to resolve the image manifest
+	// and collect the cached layers on each peer. It only queries the seed
+	// peers.
+	StatImage(ctx context.Context, req *StatImageRequest) (*StatImageResponse, error)
+
 	// LookupEndpoints looks up the endpoints of the seed peers serving the
 	// request, in the consistent hash ring selection order for the request's
 	// task id. It returns up to the replicas of the request distinct
@@ -553,4 +559,129 @@ func (r *PreheatImageRequest) validate() error {
 	}
 
 	return nil
+}
+
+// StatImageRequest represents a request to query the distribution of an OCI
+// image in the Dragonfly. Construct it with NewStatImageRequest and set the
+// optional parameters with StatImageRequestOption.
+type StatImageRequest struct {
+	// image is the OCI image reference (e.g., "docker.io/library/nginx:latest").
+	image string
+
+	// username is the username for registry authentication.
+	username string
+
+	// password is the password for registry authentication.
+	password string
+
+	// platform specifies the target platform in the format "os/arch".
+	platform string
+
+	// pieceLength is the task piece length.
+	pieceLength *uint64
+
+	// tag identifies different tasks for the same url.
+	tag string
+
+	// application identifies different tasks for the same url.
+	application string
+
+	// filteredQueryParams is the filtered query params to generate the task id.
+	filteredQueryParams []string
+
+	// timeout is the timeout of the request.
+	timeout time.Duration
+}
+
+// StatImageRequestOption configures the StatImageRequest.
+type StatImageRequestOption func(r *StatImageRequest)
+
+// WithStatImageRequestAuth sets the username and password for registry
+// authentication. If not provided, anonymous access is used.
+func WithStatImageRequestAuth(username, password string) StatImageRequestOption {
+	return func(r *StatImageRequest) {
+		r.username = username
+		r.password = password
+	}
+}
+
+// WithStatImageRequestPlatform sets the target platform in the format "os/arch"
+// (e.g., "linux/amd64", "linux/arm64"). This is used to select the correct
+// manifest from a multi-platform image index.
+func WithStatImageRequestPlatform(platform string) StatImageRequestOption {
+	return func(r *StatImageRequest) { r.platform = platform }
+}
+
+// WithStatImageRequestPieceLength sets the task piece length.
+func WithStatImageRequestPieceLength(pieceLength uint64) StatImageRequestOption {
+	return func(r *StatImageRequest) { r.pieceLength = &pieceLength }
+}
+
+// WithStatImageRequestTag sets the tag that identifies different tasks for the
+// same url.
+func WithStatImageRequestTag(tag string) StatImageRequestOption {
+	return func(r *StatImageRequest) { r.tag = tag }
+}
+
+// WithStatImageRequestApplication sets the application that identifies different
+// tasks for the same url.
+func WithStatImageRequestApplication(application string) StatImageRequestOption {
+	return func(r *StatImageRequest) { r.application = application }
+}
+
+// WithStatImageRequestFilteredQueryParams sets the filtered query params to
+// generate the task id.
+func WithStatImageRequestFilteredQueryParams(params []string) StatImageRequestOption {
+	return func(r *StatImageRequest) { r.filteredQueryParams = params }
+}
+
+// WithStatImageRequestTimeout sets the timeout of the request.
+func WithStatImageRequestTimeout(timeout time.Duration) StatImageRequestOption {
+	return func(r *StatImageRequest) { r.timeout = timeout }
+}
+
+// NewStatImageRequest returns a StatImageRequest for the image with default
+// values.
+func NewStatImageRequest(image string, opts ...StatImageRequestOption) *StatImageRequest {
+	r := &StatImageRequest{
+		image:               image,
+		filteredQueryParams: idgen.DefaultFilteredQueryParams,
+		timeout:             defaultRequestTimeout,
+	}
+	for _, opt := range opts {
+		opt(r)
+	}
+
+	return r
+}
+
+// StatImageResponse represents the distribution of an OCI image in the
+// Dragonfly.
+type StatImageResponse struct {
+	// Layers is the blob urls of the image.
+	Layers []string
+
+	// Peers is the peers that have cached layers of the image.
+	Peers []*PeerImage
+}
+
+// PeerImage represents a peer and the image layers it has cached.
+type PeerImage struct {
+	// IP is the IP address of the peer.
+	IP string
+
+	// Hostname is the hostname of the peer.
+	Hostname string
+
+	// CachedLayers is the layers that the peer has downloaded.
+	CachedLayers []*Layer
+}
+
+// Layer represents the download state of an image layer on a peer.
+type Layer struct {
+	// URL is the blob url of the layer.
+	URL string
+
+	// IsFinished indicates whether the peer has finished downloading the layer.
+	IsFinished bool
 }

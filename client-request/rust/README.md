@@ -81,11 +81,28 @@ let response = proxy_with_endpoints.get(&request).await?;
 ```
 
 The `preheat` feature enables preheating OCI images by resolving manifests from
-the registry and triggering seed peers to download each blob:
+the registry and triggering seed peers to download each blob, and querying the
+distribution of an OCI image with the layers cached by each seed peer:
 
 ```toml
 [dependencies]
 dragonfly-client-request = { version = "1.6.0", features = ["preheat"] }
+```
+
+```rust
+proxy
+    .preheat_image(&PreheatImageRequest {
+        image: "docker.io/library/nginx:latest".to_string(),
+        ..Default::default()
+    })
+    .await?;
+
+let response = proxy
+    .stat_image(&StatImageRequest {
+        image: "docker.io/library/nginx:latest".to_string(),
+        ..Default::default()
+    })
+    .await?;
 ```
 
 See [examples](./examples) for runnable examples.

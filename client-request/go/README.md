@@ -66,6 +66,16 @@ if err := proxy.PreheatImage(ctx, request.NewPreheatImageRequest("docker.io/libr
 }
 ```
 
+Query the distribution of an OCI image, listing the layers cached by each
+seed peer:
+
+```go
+resp, err := proxy.StatImage(ctx, request.NewStatImageRequest("docker.io/library/nginx:latest"))
+if err != nil {
+    panic(err)
+}
+```
+
 Preheat with multiple replicas and scatter downloads across them. Preheating
 writes the file to the given number of distinct seed peers, and downloading
 scatters each request across those replicas by picking a random one, retrying
