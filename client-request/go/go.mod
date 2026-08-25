@@ -4,7 +4,7 @@ go 1.25.6
 
 require (
 	d7y.io/api/v2 v2.3.3
-	d7y.io/dragonfly/v2 v2.5.2-0.20260817025753-bc9a1267534a
+	d7y.io/dragonfly/v2 v2.5.2-rc.0
 	github.com/dchest/siphash v1.2.3
 	github.com/stretchr/testify v1.12.1
 	golang.org/x/sync v0.22.0
@@ -93,5 +93,3 @@ require (
 	gorm.io/plugin/dbresolver v1.3.0 // indirect
 	gorm.io/plugin/soft_delete v1.2.1 // indirect
 )
-
-replace d7y.io/dragonfly/v2 => ../../../dragonfly
