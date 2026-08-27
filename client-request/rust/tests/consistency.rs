@@ -246,4 +246,39 @@ fn test_task_id() {
             .unwrap(),
         "b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e"
     );
+
+    assert_eq!(
+        generator
+            .task_id(TaskIDParameter::ManifestDigestBased(
+                "http://registry.example.com/v2/library/ubuntu/manifests/sha256:b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e"
+                    .to_string(),
+            ))
+            .unwrap(),
+        "b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e"
+    );
+
+    assert_eq!(
+        generator
+            .task_id(TaskIDParameter::ManifestDigestBased(
+                "http://localhost:5000/v2/myrepo/manifests/sha256:b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e?ns=docker.io"
+                    .to_string(),
+            ))
+            .unwrap(),
+        "b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e"
+    );
+
+    // A manifest url referenced by a tag falls back to the url based task id.
+    assert_eq!(
+        generator
+            .task_id(TaskIDParameter::URLBased {
+                url: "http://registry.example.com/v2/library/ubuntu/manifests/latest".to_string(),
+                piece_length: None,
+                tag: None,
+                application: None,
+                filtered_query_params: vec![],
+                revision: None,
+            })
+            .unwrap(),
+        "0b6500b31c7eea2929393e154299bc81ebbb613c24fa7f5f33e893d585f4d629"
+    );
 }

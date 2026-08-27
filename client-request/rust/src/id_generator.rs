@@ -25,6 +25,7 @@ use sha2::{Digest as Sha2Digest, Sha256};
 pub enum TaskIDParameter {
     /// Content uses the content to generate the task id.
     Content(String),
+
     /// URLBased uses the url, piece_length, tag, application and filtered_query_params to generate
     /// the task id.
     URLBased {
@@ -37,9 +38,14 @@ pub enum TaskIDParameter {
         // different revisions, such as git repository.
         revision: Option<String>,
     },
+
     /// BlobDigestBased will extract the digest in the oci blob url and use the digest's encoded as
     /// the task id.
     BlobDigestBased(String),
+
+    /// ManifestDigestBased will extract the digest in the oci manifest url and use the digest's
+    /// encoded as the task id.
+    ManifestDigestBased(String),
 }
 
 /// Used to generate the id for the resources.
@@ -126,8 +132,18 @@ impl IDGenerator {
                 // Generate the task id.
                 Ok(hex::encode(hasher.finalize()))
             }
-            TaskIDParameter::BlobDigestBased(url) => digest::extract_encoded_from_blob_url(&url)
-                .ok_or_else(|| Error::InvalidArgument(format!("invalid blob url: {url}"))),
+            TaskIDParameter::BlobDigestBased(url) => {
+                Ok(digest::Digest::extract_from_blob_url(&url)
+                    .ok_or_else(|| Error::InvalidArgument(url))?
+                    .encoded()
+                    .to_string())
+            }
+            TaskIDParameter::ManifestDigestBased(url) => {
+                Ok(digest::Digest::extract_from_manifest_url(&url)
+                    .ok_or_else(|| Error::InvalidArgument(url))?
+                    .encoded()
+                    .to_string())
+            }
         }
     }
 }
@@ -330,6 +346,30 @@ mod tests {
                 ),
                 "b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e",
             ),
+            (
+                IDGenerator::new("127.0.0.1".to_string(), "localhost".to_string(), false),
+                TaskIDParameter::ManifestDigestBased(
+                    "http://registry.example.com/v2/library/ubuntu/manifests/sha256:b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e"
+                        .to_string(),
+                ),
+                "b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e",
+            ),
+            (
+                IDGenerator::new("127.0.0.1".to_string(), "localhost".to_string(), false),
+                TaskIDParameter::ManifestDigestBased(
+                    "https://registry.example.com/v2/myorg/myrepo/manifests/sha512:94381a28e8c039fedfa78de025158a068226c3ccd041b22c2c8e73fc993584e9b167d9ae32bc8b372c66701c808ab134e0768c8f16b9a3e61eec1ccf8faa9db8"
+                        .to_string(),
+                ),
+                "94381a28e8c039fedfa78de025158a068226c3ccd041b22c2c8e73fc993584e9b167d9ae32bc8b372c66701c808ab134e0768c8f16b9a3e61eec1ccf8faa9db8",
+            ),
+            (
+                IDGenerator::new("127.0.0.1".to_string(), "localhost".to_string(), false),
+                TaskIDParameter::ManifestDigestBased(
+                    "http://localhost:5000/v2/myrepo/manifests/sha256:b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e?ns=docker.io"
+                        .to_string(),
+                ),
+                "b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e",
+            ),
         ];
 
         for (generator, parameter, expected_id) in test_cases {
@@ -345,6 +385,17 @@ mod tests {
         ] {
             assert!(generator
                 .task_id(TaskIDParameter::BlobDigestBased(url.to_string()))
+                .is_err());
+        }
+
+        for url in [
+            "https://example.com/file.txt",
+            "http://registry.example.com/v2/library/ubuntu/manifests/latest",
+            "http://registry.example.com/v2/library/ubuntu/manifests/sha256:abc",
+            "http://registry.example.com/v2/library/ubuntu/manifests/md5:8a04994a666b4e4b20a2fd9e5a44f44c",
+        ] {
+            assert!(generator
+                .task_id(TaskIDParameter::ManifestDigestBased(url.to_string()))
                 .is_err());
         }
     }

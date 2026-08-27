@@ -1,7 +1,7 @@
-d7y.io/api/v2 v2.3.3 h1:6P6vtq55hofqFrVPknTBrtCa+18kitx5R+9bSpRodp8=
-d7y.io/api/v2 v2.3.3/go.mod h1:wpH5vl1BhTm10cpzJ7dqSsDXq4eyhu8iLjouQJ6ZiBQ=
-d7y.io/dragonfly/v2 v2.5.2-rc.0 h1:IzNJb7bubl5gOazm37whMQo99wW4YWlSswY8Vr1+0ls=
-d7y.io/dragonfly/v2 v2.5.2-rc.0/go.mod h1:thFvV74pD/FpdPuRN+jgzumQ0tZ59yhlz3a21aKRGDM=
+d7y.io/api/v2 v2.3.5 h1:84L8hEhR5ColmCXIw6ZbZrlEmA1teL8CVJDLPEKa2Ds=
+d7y.io/api/v2 v2.3.5/go.mod h1:wpH5vl1BhTm10cpzJ7dqSsDXq4eyhu8iLjouQJ6ZiBQ=
+d7y.io/dragonfly/v2 v2.5.2-rc.1 h1:GCiwhUd/dul2ixp++qQNRqQgeOWqGZSNMLYOU9XSuG8=
+d7y.io/dragonfly/v2 v2.5.2-rc.1/go.mod h1:thFvV74pD/FpdPuRN+jgzumQ0tZ59yhlz3a21aKRGDM=
 filippo.io/edwards25519 v1.1.1 h1:YpjwWWlNmGIDyXOn8zLzqiD+9TyIlPhGFG96P39uBpw=
 filippo.io/edwards25519 v1.1.1/go.mod h1:BxyFTGdWcka3PhytdK4V28tE5sGfRvvvRV7EaN4VDT4=
 github.com/Azure/azure-sdk-for-go/sdk/azcore v1.0.0/go.mod h1:uGG2W01BaETf0Ozp+QxxKJdMBNRWPdstHG0Fmdwn1/U=

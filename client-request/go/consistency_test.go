@@ -140,4 +140,17 @@ func TestTaskID(t *testing.T) {
 	id, err = idgen.TaskIDV2("http://registry.example.com/v2/library/ubuntu/blobs/sha256:b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e", nil, "", "", nil, "", true)
 	assert.NoError(err)
 	assert.Equal("b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e", id)
+
+	id, err = idgen.TaskIDV2("http://registry.example.com/v2/library/ubuntu/manifests/sha256:b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e", nil, "", "", nil, "", true)
+	assert.NoError(err)
+	assert.Equal("b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e", id)
+
+	id, err = idgen.TaskIDV2("http://localhost:5000/v2/myrepo/manifests/sha256:b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e?ns=docker.io", nil, "", "", nil, "", true)
+	assert.NoError(err)
+	assert.Equal("b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e", id)
+
+	// A manifest url referenced by a tag falls back to the url based task id.
+	id, err = idgen.TaskIDV2("http://registry.example.com/v2/library/ubuntu/manifests/latest", nil, "", "", nil, "", true)
+	assert.NoError(err)
+	assert.Equal("0b6500b31c7eea2929393e154299bc81ebbb613c24fa7f5f33e893d585f4d629", id)
 }

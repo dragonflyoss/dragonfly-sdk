@@ -20,8 +20,8 @@
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use digest::is_blob_url;
-use dragonfly_api::common::v2::{Download, Priority, TaskType};
+use digest::{is_blob_url, is_manifest_digest_url};
+use dragonfly_api::common::v2::{Download, Priority, SchedulingPolicy, TaskType};
 use dragonfly_api::dfdaemon::v2::{
     dfdaemon_upload_client::DfdaemonUploadClient as DfdaemonUploadGRPCClient, DownloadTaskRequest,
 };
@@ -53,23 +53,28 @@ use tracing::{debug, warn};
 use dragonfly_api::scheduler::v2::StatImageRequest as SchedulerStatImageRequest;
 #[cfg(feature = "preheat")]
 use oci_client::{
-    client::ClientConfig, manifest::ImageIndexEntry, secrets::RegistryAuth, Client as OciClient,
-    Reference, RegistryOperation,
+    client::{current_platform_resolver, ClientConfig},
+    manifest::{
+        ImageIndexEntry, IMAGE_MANIFEST_LIST_MEDIA_TYPE, IMAGE_MANIFEST_MEDIA_TYPE,
+        OCI_IMAGE_INDEX_MEDIA_TYPE, OCI_IMAGE_MEDIA_TYPE,
+    },
+    secrets::RegistryAuth,
+    Client as OciClient, Reference, RegistryOperation,
 };
 #[cfg(feature = "preheat")]
 use oci_spec::image::{Arch, Os};
 #[cfg(feature = "preheat")]
-use reqwest::header::AUTHORIZATION;
+use reqwest::header::{ACCEPT, AUTHORIZATION};
 #[cfg(feature = "preheat")]
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::Instrument;
 
+pub mod digest;
 pub mod errors;
 pub mod hashring;
 pub mod id_generator;
 
-mod digest;
 mod http;
 mod net;
 mod pool;
@@ -110,6 +115,17 @@ const DEFAULT_REPLICAS: usize = 2;
 /// with the AllSeedPeersScope in the dragonfly manager types.
 #[cfg(feature = "preheat")]
 const STAT_IMAGE_SCOPE_ALL_SEED_PEERS: &str = "all_seed_peers";
+
+/// The media types of the manifests for the accept header, identical to the
+/// MIME_TYPES_DISTRIBUTION_MANIFEST used by the oci-client to pull manifests,
+/// so the registry returns the exact representation matching the digest.
+#[cfg(feature = "preheat")]
+const MIME_TYPES_DISTRIBUTION_MANIFEST: &[&str] = &[
+    IMAGE_MANIFEST_MEDIA_TYPE,
+    IMAGE_MANIFEST_LIST_MEDIA_TYPE,
+    OCI_IMAGE_MEDIA_TYPE,
+    OCI_IMAGE_INDEX_MEDIA_TYPE,
+];
 
 /// A specialized Result type for the proxy module.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -921,15 +937,18 @@ impl Request for Proxy {
         };
 
         // Pull image manifest. This handles multi-platform image index manifests
-        // by selecting the platform-specific manifest using our resolver.
-        let (manifest, digest) = oci_client
-            .pull_image_manifest(&reference, &auth)
-            .await
-            .map_err(|err| Error::Internal(format!("failed to pull image manifest: {err}")))?;
+        // by selecting the platform-specific manifest using our resolver. The
+        // digest of the platform manifest is used to preheat the manifest, so it
+        // can be addressed independently of the tag.
+        let (manifest, manifest_digest) =
+            oci_client
+                .pull_image_manifest(&reference, &auth)
+                .await
+                .map_err(|err| Error::Internal(format!("failed to pull image manifest: {err}")))?;
         debug!(
             "pulled manifest for image {} with digest {}, layers: {}",
             request.image,
-            digest,
+            manifest_digest,
             manifest.layers.len()
         );
 
@@ -950,20 +969,45 @@ impl Request for Proxy {
                 .map_err(|err| Error::Internal(format!("invalid auth token: {err}")))?,
         );
 
+        // Build the accept header with the manifest media types for downloading manifests,
+        // so the registry returns the exact representation matching the digest.
+        let mut manifest_header = header.clone();
+        manifest_header.insert(
+            ACCEPT,
+            HeaderValue::from_str(&MIME_TYPES_DISTRIBUTION_MANIFEST.join(","))
+                .map_err(|err| Error::Internal(format!("invalid accept header: {err}")))?,
+        );
         let registry = Self::resolve_registry(&reference);
         let repository = reference.repository();
 
-        // Preheat the blobs concurrently, limited by the concurrent task count.
-        let semaphore = Arc::new(Semaphore::new(request.concurrent_task_count));
-        let mut join_set: JoinSet<Result<()>> = JoinSet::new();
+        // Collect the preheat targets. The manifest is the platform manifest referenced by its digest,
+        // excluding the multi-platform image index. The blobs include the config and the layers of
+        // the platform manifest.
+        let mut targets = Vec::with_capacity(manifest.layers.len() + 2);
+        targets.push((
+            Self::build_manifest_url(registry, repository, &manifest_digest),
+            manifest_header.clone(),
+        ));
+
         for digest in std::iter::once(&manifest.config.digest)
             .chain(manifest.layers.iter().map(|layer| &layer.digest))
         {
+            targets.push((
+                Self::build_blob_url(registry, repository, digest),
+                header.clone(),
+            ));
+        }
+
+        // Preheat the manifests and blobs concurrently, limited by the concurrent
+        // task count.
+        let semaphore = Arc::new(Semaphore::new(request.concurrent_task_count));
+        let mut join_set: JoinSet<Result<()>> = JoinSet::new();
+        for (url, header) in targets {
             let semaphore = semaphore.clone();
             let proxy = self.clone();
             let preheat_request = PreheatRequest {
-                url: Self::build_blob_url(registry, repository, digest),
-                header: header.clone(),
+                url,
+                header,
                 piece_length: request.piece_length,
                 tag: request.tag.clone(),
                 application: request.application.clone(),
@@ -984,7 +1028,7 @@ impl Request for Proxy {
                         .map_err(|err| Error::Internal(err.to_string()))?;
 
                     proxy.preheat(&preheat_request).await?;
-                    debug!("preheated blob: {}", preheat_request.url);
+                    debug!("preheated: {}", preheat_request.url);
                     Ok(())
                 }
                 .in_current_span(),
@@ -1109,6 +1153,10 @@ impl Request for Proxy {
                     TaskIDParameter::Content(content)
                 } else if request.enable_task_id_based_blob_digest && is_blob_url(&request.url) {
                     TaskIDParameter::BlobDigestBased(request.url.clone())
+                } else if request.enable_task_id_based_blob_digest
+                    && is_manifest_digest_url(&request.url)
+                {
+                    TaskIDParameter::ManifestDigestBased(request.url.clone())
                 } else {
                     TaskIDParameter::URLBased {
                         url: request.url.clone(),
@@ -1160,6 +1208,7 @@ impl Request for Proxy {
                 content_for_calculating_task_id: request.content_for_calculating_task_id.clone(),
                 remote_ip: preferred_local_ip().map(|ip| ip.to_string()),
                 enable_task_id_based_blob_digest: request.enable_task_id_based_blob_digest,
+                scheduling_policy: SchedulingPolicy::Always as i32,
                 ..Default::default()
             }),
         };
@@ -1240,6 +1289,10 @@ impl Request for Proxy {
                     TaskIDParameter::Content(content)
                 } else if request.enable_task_id_based_blob_digest && is_blob_url(&request.url) {
                     TaskIDParameter::BlobDigestBased(request.url.clone())
+                } else if request.enable_task_id_based_blob_digest
+                    && is_manifest_digest_url(&request.url)
+                {
+                    TaskIDParameter::ManifestDigestBased(request.url.clone())
                 } else {
                     TaskIDParameter::URLBased {
                         url: request.url.clone(),
@@ -1289,6 +1342,10 @@ impl Proxy {
                     TaskIDParameter::Content(content)
                 } else if request.enable_task_id_based_blob_digest && is_blob_url(&request.url) {
                     TaskIDParameter::BlobDigestBased(request.url.clone())
+                } else if request.enable_task_id_based_blob_digest
+                    && is_manifest_digest_url(&request.url)
+                {
+                    TaskIDParameter::ManifestDigestBased(request.url.clone())
                 } else {
                     TaskIDParameter::URLBased {
                         url: request.url.clone(),
@@ -1540,29 +1597,36 @@ impl Proxy {
         }
     }
 
-    /// Builds an OCI client with a platform resolver that matches the requested os/arch.
+    /// Builds an OCI client with a platform resolver that matches the requested os/arch,
+    /// defaulting to the current platform when the platform is not specified.
     #[cfg(feature = "preheat")]
     fn oci_client(platform: Option<String>) -> Result<OciClient> {
         let mut oci_config = ClientConfig::default();
-        if let Some(platform) = platform {
-            let (os, arch) = platform
-                .split_once('/')
-                .map(|(os, arch)| (Os::from(os), Arch::from(arch)))
-                .ok_or_else(|| {
-                    Error::InvalidArgument(format!("invalid platform format '{platform}', expected 'os/arch' (e.g., 'linux/amd64')"))
-                })?;
+        match platform {
+            Some(platform) => {
+                let (os, arch) = platform
+                    .split_once('/')
+                    .map(|(os, arch)| (Os::from(os), Arch::from(arch)))
+                    .ok_or_else(|| {
+                        Error::InvalidArgument(format!("invalid platform format '{platform}', expected 'os/arch' (e.g., 'linux/amd64')"))
+                    })?;
 
-            oci_config.platform_resolver = Some(Box::new(move |manifests: &[ImageIndexEntry]| {
-                manifests
-                    .iter()
-                    .find(|entry| {
-                        entry.platform.as_ref().is_some_and(|platform| {
-                            platform.os == os && platform.architecture == arch
-                        })
-                    })
-                    .map(|entry| entry.digest.clone())
-            }))
-        };
+                oci_config.platform_resolver =
+                    Some(Box::new(move |manifests: &[ImageIndexEntry]| {
+                        manifests
+                            .iter()
+                            .find(|entry| {
+                                entry.platform.as_ref().is_some_and(|platform| {
+                                    platform.os == os && platform.architecture == arch
+                                })
+                            })
+                            .map(|entry| entry.digest.clone())
+                    }));
+            }
+            None => {
+                oci_config.platform_resolver = Some(Box::new(current_platform_resolver));
+            }
+        }
 
         Ok(OciClient::new(oci_config))
     }

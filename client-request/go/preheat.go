@@ -25,12 +25,14 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 
 	commonv2 "d7y.io/api/v2/pkg/apis/common/v2"
 	dfdaemonv2 "d7y.io/api/v2/pkg/apis/dfdaemon/v2"
 	"d7y.io/dragonfly/v2/pkg/idgen"
 	"d7y.io/dragonfly/v2/pkg/net/ip"
 	"d7y.io/dragonfly/v2/pkg/oci"
+	"github.com/docker/distribution"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -83,6 +85,7 @@ func (p *Proxy) Preheat(ctx context.Context, req *PreheatRequest) error {
 		Timeout:                     durationpb.New(req.timeout),
 		RemoteIp:                    &remoteIP,
 		EnableTaskIdBasedBlobDigest: req.enableTaskIDBasedBlobDigest,
+		SchedulingPolicy:            commonv2.SchedulingPolicy_ALWAYS,
 	}
 
 	if req.tag != "" {
@@ -141,10 +144,11 @@ func (p *Proxy) downloadTask(ctx context.Context, peer *commonv2.Host, id string
 	}
 }
 
-// PreheatImage preheats an OCI image by downloading all its blobs via the
-// Dragonfly. It parses the image reference, authenticates with the OCI
+// PreheatImage preheats an OCI image by downloading its manifests and blobs via
+// the Dragonfly. It parses the image reference, authenticates with the OCI
 // registry, resolves the image manifest (including multi-platform image
-// indexes), and triggers the seed client to download each blob (config and layers).
+// indexes), and triggers the seed client to download the matched platform
+// manifests (referenced by their digests) and each blob (config and layers).
 func (p *Proxy) PreheatImage(ctx context.Context, req *PreheatImageRequest) error {
 	if err := req.validate(); err != nil {
 		return err
@@ -155,9 +159,7 @@ func (p *Proxy) PreheatImage(ctx context.Context, req *PreheatImageRequest) erro
 		return fmt.Errorf("%w: %v", ErrInvalidArgument, err)
 	}
 
-	// Resolve the image manifests (including multi-platform image indexes) and
-	// collect the blob urls along with the authorization token.
-	blobURLs, token, err := oci.Resolve(ctx, ref,
+	manifestURLs, blobURLs, token, err := oci.Resolve(ctx, ref,
 		oci.WithAuth(req.username, req.password),
 		oci.WithPlatform(req.platform),
 		oci.WithHTTPClient(oci.DefaultHTTPClient()),
@@ -174,14 +176,39 @@ func (p *Proxy) PreheatImage(ctx context.Context, req *PreheatImageRequest) erro
 	header := make(http.Header)
 	header.Set("Authorization", token)
 
-	// Preheat the blobs concurrently, limited by the concurrent task count.
+	// Build the accept header with the manifest media types for downloading
+	// manifests, so the registry returns the exact representation matching the
+	// digest.
+	manifestHeader := header.Clone()
+	manifestHeader.Set("Accept", strings.Join(distribution.ManifestMediaTypes(), ","))
+
+	// Collect the preheat targets. The manifests are the matched platform
+	// manifests referenced by their digests, excluding the multi-platform image
+	// index. The blobs include the configs and the layers of the matched
+	// platform manifests.
+	type target struct {
+		url    string
+		header http.Header
+	}
+
+	targets := make([]target, 0, len(manifestURLs)+len(blobURLs))
+	for _, manifestURL := range manifestURLs {
+		targets = append(targets, target{url: manifestURL, header: manifestHeader})
+	}
+
+	for _, blobURL := range blobURLs {
+		targets = append(targets, target{url: blobURL, header: header})
+	}
+
+	// Preheat the manifests and blobs concurrently, limited by the concurrent
+	// task count.
 	g, ctx := errgroup.WithContext(ctx)
 	g.SetLimit(req.concurrentTaskCount)
-	for _, blobURL := range blobURLs {
+	for _, target := range targets {
 		g.Go(func() error {
 			preheatReq := &PreheatRequest{
-				url:                         blobURL,
-				header:                      header.Clone(),
+				url:                         target.url,
+				header:                      target.header.Clone(),
 				pieceLength:                 req.pieceLength,
 				tag:                         req.tag,
 				application:                 req.application,
