@@ -176,39 +176,16 @@ mod tests {
         ring.add("default-pod-1".to_string());
         ring.add("default-pod-2".to_string());
 
-        let key = "test_key";
-        let replicas = ring.get_with_replicas(&key, 3).unwrap();
-        assert_eq!(replicas.len(), 4);
-        assert!(replicas.iter().all(|vnode| {
-            (vnode.name() == "default-pod-1" || vnode.name() == "default-pod-2")
-                && (vnode.id == 0 || vnode.id == 1)
-        }));
-    }
+        let test_cases = vec![(2, 3), (3, 4), (4, 5)];
 
-    #[test]
-    fn test_get_with_replicas_exact_size() {
-        let mut ring = VNodeHashRing::new(2);
-        ring.add("default-pod-1".to_string());
-        ring.add("default-pod-2".to_string());
-
-        let key = "test_key";
-        let replicas = ring.get_with_replicas(&key, 4).unwrap();
-        assert_eq!(replicas.len(), 5);
-    }
-
-    #[test]
-    fn test_get_with_replicas_smaller_size() {
-        let mut ring = VNodeHashRing::new(2);
-        ring.add("default-pod-1".to_string());
-        ring.add("default-pod-2".to_string());
-
-        let key = "test_key";
-        let replicas = ring.get_with_replicas(&key, 2).unwrap();
-        assert_eq!(replicas.len(), 3);
-        assert!(replicas.iter().all(|vnode| {
-            (vnode.name() == "default-pod-1" || vnode.name() == "default-pod-2")
-                && (vnode.id == 0 || vnode.id == 1)
-        }));
+        for (replicas, expected_len) in test_cases {
+            let key = "test_key";            let vnodes = ring.get_with_replicas(&key, replicas).unwrap();
+            assert_eq!(vnodes.len(), expected_len, "replicas: {replicas}");
+            assert!(vnodes.iter().all(|vnode| {
+                (vnode.name() == "default-pod-1" || vnode.name() == "default-pod-2")
+                    && (vnode.id == 0 || vnode.id == 1)
+            }));
+        }
     }
 
     #[test]

@@ -346,38 +346,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_select_with_multiple_hosts() {
-        let selector = create_test_selector().await;
+    async fn test_select_replicas() {
+        // The selection returns at most the available hosts, without duplicates.
+        let test_cases = vec![(5, 3, 3), (2, 5, 2), (20, 10, 10)];
 
-        for i in 1..=5 {
-            let host = create_test_host(&i.to_string(), &format!("192.168.1.{i}"), 8080, 1);
-            add_test_host(&selector, host).await;
+        for (host_count, replicas, expected_len) in test_cases {
+            let selector = create_test_selector().await;
+            for i in 1..=host_count {
+                let host = create_test_host(&i.to_string(), &format!("192.168.1.{i}"), 8080, 1);
+                add_test_host(&selector, host).await;
+            }
+
+            let hosts = selector
+                .select("test-task".to_string(), replicas)
+                .await
+                .unwrap();
+            assert_eq!(
+                hosts.len(),
+                expected_len,
+                "host_count: {host_count}, replicas: {replicas}"
+            );
+
+            let seen: std::collections::HashSet<_> = hosts.iter().map(|host| &host.id).collect();
+            assert_eq!(
+                seen.len(),
+                expected_len,
+                "host_count: {host_count}, replicas: {replicas}"
+            );
         }
-
-        let result = selector.select("test-task".to_string(), 3).await;
-        assert!(result.is_ok());
-
-        let hosts = result.unwrap();
-        assert_eq!(hosts.len(), 3);
-
-        let seen: std::collections::HashSet<_> = hosts.iter().map(|host| &host.id).collect();
-        assert_eq!(seen.len(), 3);
-    }
-
-    #[tokio::test]
-    async fn test_select_replicas_exceeds_available() {
-        let selector = create_test_selector().await;
-
-        for i in 1..=2 {
-            let host = create_test_host(&i.to_string(), &format!("192.168.1.{i}"), 8080, 1);
-            add_test_host(&selector, host).await;
-        }
-
-        let result = selector.select("test-task".to_string(), 5).await;
-        assert!(result.is_ok());
-
-        let hosts = result.unwrap();
-        assert_eq!(hosts.len(), 2);
     }
 
     #[tokio::test]
@@ -431,31 +427,6 @@ mod tests {
 
             let hosts = result.unwrap();
             assert_eq!(hosts.len(), 2);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_no_duplicate_hosts_in_selection() {
-        let selector = create_test_selector().await;
-
-        for i in 1..=20 {
-            let host = create_test_host(&i.to_string(), &format!("192.168.1.{i}"), 8080, 1);
-            add_test_host(&selector, host).await;
-        }
-
-        let result = selector.select("unique-task".to_string(), 10).await;
-        assert!(result.is_ok());
-
-        let hosts = result.unwrap();
-        assert_eq!(hosts.len(), 10);
-
-        let mut seen_ids = std::collections::HashSet::new();
-        for host in hosts {
-            assert!(
-                seen_ids.insert(host.id.clone()),
-                "found duplicate host ID: {}",
-                host.id
-            );
         }
     }
 }

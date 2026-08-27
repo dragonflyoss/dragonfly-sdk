@@ -41,17 +41,29 @@ fn key_hash(key: &str) -> u64 {
 
 #[test]
 fn test_siphash() {
-    assert_eq!(vnode_hash(0, "seed-peer-1"), 0x1e5a582b8d945969);
-    assert_eq!(vnode_hash(1, "seed-peer-1"), 0xb5db98265419376c);
-    assert_eq!(vnode_hash(0, "seed-peer-2"), 0xf36f748c486b09ef);
-    assert_eq!(vnode_hash(511, "seed-peer-3"), 0xf0eda07426c5cac1);
+    let test_cases = vec![
+        (0, "seed-peer-1", 0x1e5a582b8d945969),
+        (1, "seed-peer-1", 0xb5db98265419376c),
+        (0, "seed-peer-2", 0xf36f748c486b09ef),
+        (511, "seed-peer-3", 0xf0eda07426c5cac1),
+    ];
 
-    assert_eq!(
-        key_hash("b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e"),
-        0xaa86f08bc4878a68
-    );
-    assert_eq!(key_hash("test-task"), 0xa78dd821b4023714);
-    assert_eq!(key_hash(""), 0x20dd4eb33d9590f2);
+    for (id, name, expected) in test_cases {
+        assert_eq!(vnode_hash(id, name), expected, "id: {id}, name: {name}");
+    }
+
+    let test_cases = vec![
+        (
+            "b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e",
+            0xaa86f08bc4878a68,
+        ),
+        ("test-task", 0xa78dd821b4023714),
+        ("", 0x20dd4eb33d9590f2),
+    ];
+
+    for (key, expected) in test_cases {
+        assert_eq!(key_hash(key), expected, "key: {key}");
+    }
 }
 
 #[test]
@@ -69,35 +81,48 @@ fn test_hashring() {
             .collect()
     };
 
-    assert_eq!(
-        select("task-a", 2),
-        ["seed-peer-3|2", "seed-peer-1|2", "seed-peer-3|0"]
-    );
-    assert_eq!(
-        select("task-b", 2),
-        ["seed-peer-2|0", "seed-peer-2|1", "seed-peer-1|0"]
-    );
-    assert_eq!(
-        select("task-c", 2),
-        ["seed-peer-2|1", "seed-peer-1|0", "seed-peer-3|2"]
-    );
-
     // Replicas larger than the ring shrink to the entire ring, starting
     // clockwise from the key's position.
-    assert_eq!(
-        select("task-a", 100),
-        [
-            "seed-peer-3|2",
-            "seed-peer-1|2",
-            "seed-peer-3|0",
-            "seed-peer-1|1",
-            "seed-peer-2|2",
-            "seed-peer-3|1",
-            "seed-peer-2|0",
-            "seed-peer-2|1",
-            "seed-peer-1|0"
-        ]
-    );
+    let test_cases = vec![
+        (
+            "task-a",
+            2,
+            vec!["seed-peer-3|2", "seed-peer-1|2", "seed-peer-3|0"],
+        ),
+        (
+            "task-b",
+            2,
+            vec!["seed-peer-2|0", "seed-peer-2|1", "seed-peer-1|0"],
+        ),
+        (
+            "task-c",
+            2,
+            vec!["seed-peer-2|1", "seed-peer-1|0", "seed-peer-3|2"],
+        ),
+        (
+            "task-a",
+            100,
+            vec![
+                "seed-peer-3|2",
+                "seed-peer-1|2",
+                "seed-peer-3|0",
+                "seed-peer-1|1",
+                "seed-peer-2|2",
+                "seed-peer-3|1",
+                "seed-peer-2|0",
+                "seed-peer-2|1",
+                "seed-peer-1|0",
+            ],
+        ),
+    ];
+
+    for (key, replicas, expected) in test_cases {
+        assert_eq!(
+            select(key, replicas),
+            expected,
+            "key: {key}, replicas: {replicas}"
+        );
+    }
 }
 
 #[test]

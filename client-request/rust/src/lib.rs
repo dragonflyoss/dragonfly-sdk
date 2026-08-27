@@ -133,6 +133,11 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// The type alias for the response body stream of zero-copy `Bytes` chunks.
 pub type Body = Box<dyn Stream<Item = Result<Bytes>> + Send + Unpin>;
 
+/// The type alias for the resolver that selects the digest of the matching manifest
+/// from a multi-platform image index.
+#[cfg(feature = "preheat")]
+type PlatformResolver = Box<dyn Fn(&[ImageIndexEntry]) -> Option<String> + Send + Sync>;
+
 /// Defines the interface for sending requests via the Dragonfly.
 ///
 /// This trait enables interaction with remote servers through the Dragonfly, providing methods
@@ -1597,36 +1602,42 @@ impl Proxy {
         }
     }
 
+    /// Builds a platform resolver that selects the digest of the manifest matching
+    /// the requested platform in the format "os/arch" (e.g., 'linux/amd64') from a
+    /// multi-platform image index.
+    #[cfg(feature = "preheat")]
+    fn platform_resolver(platform: &str) -> Result<PlatformResolver> {
+        let (os, arch) = platform
+            .split_once('/')
+            .map(|(os, arch)| (Os::from(os), Arch::from(arch)))
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!("invalid platform format '{platform}', expected 'os/arch' (e.g., 'linux/amd64')"))
+            })?;
+
+        Ok(Box::new(move |manifests: &[ImageIndexEntry]| {
+            manifests
+                .iter()
+                .find(|entry| {
+                    entry
+                        .platform
+                        .as_ref()
+                        .is_some_and(|platform| platform.os == os && platform.architecture == arch)
+                })
+                .map(|entry| entry.digest.clone())
+        }))
+    }
+
     /// Builds an OCI client with a platform resolver that matches the requested os/arch,
     /// defaulting to the current platform when the platform is not specified.
     #[cfg(feature = "preheat")]
     fn oci_client(platform: Option<String>) -> Result<OciClient> {
-        let mut oci_config = ClientConfig::default();
-        match platform {
-            Some(platform) => {
-                let (os, arch) = platform
-                    .split_once('/')
-                    .map(|(os, arch)| (Os::from(os), Arch::from(arch)))
-                    .ok_or_else(|| {
-                        Error::InvalidArgument(format!("invalid platform format '{platform}', expected 'os/arch' (e.g., 'linux/amd64')"))
-                    })?;
-
-                oci_config.platform_resolver =
-                    Some(Box::new(move |manifests: &[ImageIndexEntry]| {
-                        manifests
-                            .iter()
-                            .find(|entry| {
-                                entry.platform.as_ref().is_some_and(|platform| {
-                                    platform.os == os && platform.architecture == arch
-                                })
-                            })
-                            .map(|entry| entry.digest.clone())
-                    }));
-            }
-            None => {
-                oci_config.platform_resolver = Some(Box::new(current_platform_resolver));
-            }
-        }
+        let oci_config = ClientConfig {
+            platform_resolver: match platform {
+                Some(platform) => Some(Self::platform_resolver(&platform)?),
+                None => Some(Box::new(current_platform_resolver)),
+            },
+            ..ClientConfig::default()
+        };
 
         Ok(OciClient::new(oci_config))
     }
@@ -2051,6 +2062,25 @@ mod tests {
         })?;
 
         Ok(server)
+    }
+
+    #[cfg(feature = "preheat")]
+    fn image_index_entry(digest: &str, platform: Option<(Os, Arch)>) -> ImageIndexEntry {
+        ImageIndexEntry {
+            media_type: IMAGE_MANIFEST_MEDIA_TYPE.to_string(),
+            digest: digest.to_string(),
+            size: 0,
+            platform: platform.map(|(os, architecture)| oci_client::manifest::Platform {
+                architecture,
+                os,
+                os_version: None,
+                os_features: None,
+                variant: None,
+                features: None,
+            }),
+            annotations: None,
+            artifact_type: None,
+        }
     }
 
     #[tokio::test]
@@ -3251,6 +3281,44 @@ mod tests {
 
         let reference: Reference = "example.com/foo/bar:1.0".parse().unwrap();
         assert_eq!(Proxy::resolve_registry(&reference), "example.com");
+    }
+
+    #[cfg(feature = "preheat")]
+    #[test]
+    fn test_platform_resolver() {
+        let manifests = vec![
+            image_index_entry("sha256:amd64", Some((Os::Linux, Arch::Amd64))),
+            image_index_entry("sha256:arm64", Some((Os::Linux, Arch::ARM64))),
+            image_index_entry("sha256:no-platform", None),
+        ];
+
+        let test_cases = vec![
+            ("linux/amd64", Ok(Some("sha256:amd64"))),
+            ("linux/arm64", Ok(Some("sha256:arm64"))),
+            ("windows/amd64", Ok(None)),
+            ("linux/riscv64", Ok(None)),
+            ("linux-amd64", Err("invalid platform format")),
+            ("", Err("invalid platform format")),
+        ];
+
+        for (platform, expected) in test_cases {
+            match expected {
+                Ok(expected_digest) => {
+                    let resolver = Proxy::platform_resolver(platform).unwrap();
+                    assert_eq!(
+                        resolver(&manifests),
+                        expected_digest.map(|digest| digest.to_string()),
+                        "platform: {platform}"
+                    );
+                }
+                Err(expected_message) => {
+                    assert!(
+                        matches!(Proxy::platform_resolver(platform), Err(Error::InvalidArgument(message)) if message.contains(expected_message)),
+                        "platform: {platform}"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
