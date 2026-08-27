@@ -148,43 +148,42 @@ impl FromStr for Digest {
 
     /// Parses a digest string.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let parts: Vec<&str> = s.splitn(2, SEPARATOR).collect();
-        if parts.len() != 2 {
-            return Err(format!("invalid digest: {s}"));
-        }
+        let (algorithm, encoded) = s
+            .split_once(SEPARATOR)
+            .ok_or_else(|| format!("invalid digest: {s}"))?;
 
-        let algorithm = match parts[0] {
+        let algorithm = match algorithm {
             "crc32" => {
-                if parts[1].is_empty() {
+                if encoded.is_empty() {
                     return Err(format!("invalid crc32 digest: {s}"));
                 }
 
                 Algorithm::Crc32
             }
             "sha256" => {
-                if parts[1].len() != 64 {
+                if encoded.len() != 64 {
                     return Err(format!(
                         "invalid sha256 digest length: {}, expected 64",
-                        parts[1].len()
+                        encoded.len()
                     ));
                 }
 
                 Algorithm::Sha256
             }
             "sha512" => {
-                if parts[1].len() != 128 {
+                if encoded.len() != 128 {
                     return Err(format!(
                         "invalid sha512 digest length: {}, expected 128",
-                        parts[1].len()
+                        encoded.len()
                     ));
                 }
 
                 Algorithm::Sha512
             }
-            _ => return Err(format!("invalid digest algorithm: {}", parts[0])),
+            _ => return Err(format!("invalid digest algorithm: {algorithm}")),
         };
 
-        Ok(Digest::new(algorithm, parts[1].to_string()))
+        Ok(Digest::new(algorithm, encoded.to_string()))
     }
 }
 
