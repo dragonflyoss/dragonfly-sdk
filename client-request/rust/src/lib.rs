@@ -20,8 +20,8 @@
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use digest::is_blob_url;
-use dragonfly_api::common::v2::{Download, Priority, TaskType};
+use digest::{is_blob_url, is_manifest_digest_url};
+use dragonfly_api::common::v2::{Download, Priority, SchedulingPolicy, TaskType};
 use dragonfly_api::dfdaemon::v2::{
     dfdaemon_upload_client::DfdaemonUploadClient as DfdaemonUploadGRPCClient, DownloadTaskRequest,
 };
@@ -53,23 +53,28 @@ use tracing::{debug, warn};
 use dragonfly_api::scheduler::v2::StatImageRequest as SchedulerStatImageRequest;
 #[cfg(feature = "preheat")]
 use oci_client::{
-    client::ClientConfig, manifest::ImageIndexEntry, secrets::RegistryAuth, Client as OciClient,
-    Reference, RegistryOperation,
+    client::{current_platform_resolver, ClientConfig},
+    manifest::{
+        ImageIndexEntry, IMAGE_MANIFEST_LIST_MEDIA_TYPE, IMAGE_MANIFEST_MEDIA_TYPE,
+        OCI_IMAGE_INDEX_MEDIA_TYPE, OCI_IMAGE_MEDIA_TYPE,
+    },
+    secrets::RegistryAuth,
+    Client as OciClient, Reference, RegistryOperation,
 };
 #[cfg(feature = "preheat")]
 use oci_spec::image::{Arch, Os};
 #[cfg(feature = "preheat")]
-use reqwest::header::AUTHORIZATION;
+use reqwest::header::{ACCEPT, AUTHORIZATION};
 #[cfg(feature = "preheat")]
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::Instrument;
 
+pub mod digest;
 pub mod errors;
 pub mod hashring;
 pub mod id_generator;
 
-mod digest;
 mod http;
 mod net;
 mod pool;
@@ -111,11 +116,27 @@ const DEFAULT_REPLICAS: usize = 2;
 #[cfg(feature = "preheat")]
 const STAT_IMAGE_SCOPE_ALL_SEED_PEERS: &str = "all_seed_peers";
 
+/// The media types of the manifests for the accept header, identical to the
+/// MIME_TYPES_DISTRIBUTION_MANIFEST used by the oci-client to pull manifests,
+/// so the registry returns the exact representation matching the digest.
+#[cfg(feature = "preheat")]
+const MIME_TYPES_DISTRIBUTION_MANIFEST: &[&str] = &[
+    IMAGE_MANIFEST_MEDIA_TYPE,
+    IMAGE_MANIFEST_LIST_MEDIA_TYPE,
+    OCI_IMAGE_MEDIA_TYPE,
+    OCI_IMAGE_INDEX_MEDIA_TYPE,
+];
+
 /// A specialized Result type for the proxy module.
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// The type alias for the response body stream of zero-copy `Bytes` chunks.
 pub type Body = Box<dyn Stream<Item = Result<Bytes>> + Send + Unpin>;
+
+/// The type alias for the resolver that selects the digest of the matching manifest
+/// from a multi-platform image index.
+#[cfg(feature = "preheat")]
+type PlatformResolver = Box<dyn Fn(&[ImageIndexEntry]) -> Option<String> + Send + Sync>;
 
 /// Defines the interface for sending requests via the Dragonfly.
 ///
@@ -921,15 +942,18 @@ impl Request for Proxy {
         };
 
         // Pull image manifest. This handles multi-platform image index manifests
-        // by selecting the platform-specific manifest using our resolver.
-        let (manifest, digest) = oci_client
-            .pull_image_manifest(&reference, &auth)
-            .await
-            .map_err(|err| Error::Internal(format!("failed to pull image manifest: {err}")))?;
+        // by selecting the platform-specific manifest using our resolver. The
+        // digest of the platform manifest is used to preheat the manifest, so it
+        // can be addressed independently of the tag.
+        let (manifest, manifest_digest) =
+            oci_client
+                .pull_image_manifest(&reference, &auth)
+                .await
+                .map_err(|err| Error::Internal(format!("failed to pull image manifest: {err}")))?;
         debug!(
             "pulled manifest for image {} with digest {}, layers: {}",
             request.image,
-            digest,
+            manifest_digest,
             manifest.layers.len()
         );
 
@@ -950,20 +974,45 @@ impl Request for Proxy {
                 .map_err(|err| Error::Internal(format!("invalid auth token: {err}")))?,
         );
 
+        // Build the accept header with the manifest media types for downloading manifests,
+        // so the registry returns the exact representation matching the digest.
+        let mut manifest_header = header.clone();
+        manifest_header.insert(
+            ACCEPT,
+            HeaderValue::from_str(&MIME_TYPES_DISTRIBUTION_MANIFEST.join(","))
+                .map_err(|err| Error::Internal(format!("invalid accept header: {err}")))?,
+        );
         let registry = Self::resolve_registry(&reference);
         let repository = reference.repository();
 
-        // Preheat the blobs concurrently, limited by the concurrent task count.
-        let semaphore = Arc::new(Semaphore::new(request.concurrent_task_count));
-        let mut join_set: JoinSet<Result<()>> = JoinSet::new();
+        // Collect the preheat targets. The manifest is the platform manifest referenced by its digest,
+        // excluding the multi-platform image index. The blobs include the config and the layers of
+        // the platform manifest.
+        let mut targets = Vec::with_capacity(manifest.layers.len() + 2);
+        targets.push((
+            Self::build_manifest_url(registry, repository, &manifest_digest),
+            manifest_header.clone(),
+        ));
+
         for digest in std::iter::once(&manifest.config.digest)
             .chain(manifest.layers.iter().map(|layer| &layer.digest))
         {
+            targets.push((
+                Self::build_blob_url(registry, repository, digest),
+                header.clone(),
+            ));
+        }
+
+        // Preheat the manifests and blobs concurrently, limited by the concurrent
+        // task count.
+        let semaphore = Arc::new(Semaphore::new(request.concurrent_task_count));
+        let mut join_set: JoinSet<Result<()>> = JoinSet::new();
+        for (url, header) in targets {
             let semaphore = semaphore.clone();
             let proxy = self.clone();
             let preheat_request = PreheatRequest {
-                url: Self::build_blob_url(registry, repository, digest),
-                header: header.clone(),
+                url,
+                header,
                 piece_length: request.piece_length,
                 tag: request.tag.clone(),
                 application: request.application.clone(),
@@ -984,7 +1033,7 @@ impl Request for Proxy {
                         .map_err(|err| Error::Internal(err.to_string()))?;
 
                     proxy.preheat(&preheat_request).await?;
-                    debug!("preheated blob: {}", preheat_request.url);
+                    debug!("preheated: {}", preheat_request.url);
                     Ok(())
                 }
                 .in_current_span(),
@@ -1109,6 +1158,10 @@ impl Request for Proxy {
                     TaskIDParameter::Content(content)
                 } else if request.enable_task_id_based_blob_digest && is_blob_url(&request.url) {
                     TaskIDParameter::BlobDigestBased(request.url.clone())
+                } else if request.enable_task_id_based_blob_digest
+                    && is_manifest_digest_url(&request.url)
+                {
+                    TaskIDParameter::ManifestDigestBased(request.url.clone())
                 } else {
                     TaskIDParameter::URLBased {
                         url: request.url.clone(),
@@ -1160,6 +1213,7 @@ impl Request for Proxy {
                 content_for_calculating_task_id: request.content_for_calculating_task_id.clone(),
                 remote_ip: preferred_local_ip().map(|ip| ip.to_string()),
                 enable_task_id_based_blob_digest: request.enable_task_id_based_blob_digest,
+                scheduling_policy: SchedulingPolicy::Always as i32,
                 ..Default::default()
             }),
         };
@@ -1240,6 +1294,10 @@ impl Request for Proxy {
                     TaskIDParameter::Content(content)
                 } else if request.enable_task_id_based_blob_digest && is_blob_url(&request.url) {
                     TaskIDParameter::BlobDigestBased(request.url.clone())
+                } else if request.enable_task_id_based_blob_digest
+                    && is_manifest_digest_url(&request.url)
+                {
+                    TaskIDParameter::ManifestDigestBased(request.url.clone())
                 } else {
                     TaskIDParameter::URLBased {
                         url: request.url.clone(),
@@ -1289,6 +1347,10 @@ impl Proxy {
                     TaskIDParameter::Content(content)
                 } else if request.enable_task_id_based_blob_digest && is_blob_url(&request.url) {
                     TaskIDParameter::BlobDigestBased(request.url.clone())
+                } else if request.enable_task_id_based_blob_digest
+                    && is_manifest_digest_url(&request.url)
+                {
+                    TaskIDParameter::ManifestDigestBased(request.url.clone())
                 } else {
                     TaskIDParameter::URLBased {
                         url: request.url.clone(),
@@ -1540,28 +1602,41 @@ impl Proxy {
         }
     }
 
-    /// Builds an OCI client with a platform resolver that matches the requested os/arch.
+    /// Builds a platform resolver that selects the digest of the manifest matching
+    /// the requested platform in the format "os/arch" (e.g., 'linux/amd64') from a
+    /// multi-platform image index.
+    #[cfg(feature = "preheat")]
+    fn platform_resolver(platform: &str) -> Result<PlatformResolver> {
+        let (os, arch) = platform
+            .split_once('/')
+            .map(|(os, arch)| (Os::from(os), Arch::from(arch)))
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!("invalid platform format '{platform}', expected 'os/arch' (e.g., 'linux/amd64')"))
+            })?;
+
+        Ok(Box::new(move |manifests: &[ImageIndexEntry]| {
+            manifests
+                .iter()
+                .find(|entry| {
+                    entry
+                        .platform
+                        .as_ref()
+                        .is_some_and(|platform| platform.os == os && platform.architecture == arch)
+                })
+                .map(|entry| entry.digest.clone())
+        }))
+    }
+
+    /// Builds an OCI client with a platform resolver that matches the requested os/arch,
+    /// defaulting to the current platform when the platform is not specified.
     #[cfg(feature = "preheat")]
     fn oci_client(platform: Option<String>) -> Result<OciClient> {
-        let mut oci_config = ClientConfig::default();
-        if let Some(platform) = platform {
-            let (os, arch) = platform
-                .split_once('/')
-                .map(|(os, arch)| (Os::from(os), Arch::from(arch)))
-                .ok_or_else(|| {
-                    Error::InvalidArgument(format!("invalid platform format '{platform}', expected 'os/arch' (e.g., 'linux/amd64')"))
-                })?;
-
-            oci_config.platform_resolver = Some(Box::new(move |manifests: &[ImageIndexEntry]| {
-                manifests
-                    .iter()
-                    .find(|entry| {
-                        entry.platform.as_ref().is_some_and(|platform| {
-                            platform.os == os && platform.architecture == arch
-                        })
-                    })
-                    .map(|entry| entry.digest.clone())
-            }))
+        let oci_config = ClientConfig {
+            platform_resolver: match platform {
+                Some(platform) => Some(Self::platform_resolver(&platform)?),
+                None => Some(Box::new(current_platform_resolver)),
+            },
+            ..ClientConfig::default()
         };
 
         Ok(OciClient::new(oci_config))
@@ -1989,6 +2064,25 @@ mod tests {
         Ok(server)
     }
 
+    #[cfg(feature = "preheat")]
+    fn image_index_entry(digest: &str, platform: Option<(Os, Arch)>) -> ImageIndexEntry {
+        ImageIndexEntry {
+            media_type: IMAGE_MANIFEST_MEDIA_TYPE.to_string(),
+            digest: digest.to_string(),
+            size: 0,
+            platform: platform.map(|(os, architecture)| oci_client::manifest::Platform {
+                architecture,
+                os,
+                os_version: None,
+                os_features: None,
+                variant: None,
+                features: None,
+            }),
+            annotations: None,
+            artifact_type: None,
+        }
+    }
+
     #[tokio::test]
     async fn test_new_success() {
         let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
@@ -2003,44 +2097,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_new_empty_endpoint() {
-        let result = Proxy::builder()
-            .scheduler_endpoint("".to_string())
-            .build()
-            .await;
+    async fn test_new_invalid_params() {
+        let test_cases = vec![
+            ("", None, None),
+            ("http://0.0.0.0:4000", Some(11), None),
+            ("http://0.0.0.0:4000", None, Some(Duration::from_secs(0))),
+            ("http://0.0.0.0:4000", None, Some(Duration::from_secs(601))),
+        ];
 
-        assert!(result.is_err());
-        assert!(matches!(result, Err(Error::InvalidArgument(_))));
-    }
+        for (endpoint, max_retries, health_check_interval) in test_cases {
+            let mut builder = Proxy::builder().scheduler_endpoint(endpoint.to_string());
+            if let Some(max_retries) = max_retries {
+                builder = builder.max_retries(max_retries);
+            }
+            if let Some(health_check_interval) = health_check_interval {
+                builder = builder.health_check_interval(health_check_interval);
+            }
 
-    #[tokio::test]
-    async fn test_new_invalid_retry_times() {
-        let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
-
-        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
-        let result = Proxy::builder()
-            .scheduler_endpoint(scheduler_endpoint)
-            .max_retries(11)
-            .build()
-            .await;
-
-        assert!(result.is_err());
-        assert!(matches!(result, Err(Error::InvalidArgument(_))));
-    }
-
-    #[tokio::test]
-    async fn test_new_invalid_health_check_interval() {
-        let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
-
-        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
-        let result = Proxy::builder()
-            .scheduler_endpoint(scheduler_endpoint)
-            .max_retries(11)
-            .build()
-            .await;
-
-        assert!(result.is_err());
-        assert!(matches!(result, Err(Error::InvalidArgument(_))));
+            let result = builder.build().await;
+            assert!(
+                matches!(result, Err(Error::InvalidArgument(_))),
+                "endpoint: {endpoint}, max_retries: {max_retries:?}, health_check_interval: {health_check_interval:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2319,12 +2398,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_new_with_endpoints_empty() {
-        let result = ProxyWithEndpoints::builder()
-            .endpoints(vec![])
-            .build()
-            .await;
-        assert!(matches!(result, Err(Error::InvalidArgument(_))));
+    async fn test_new_with_endpoints_invalid_params() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+        let test_cases = vec![
+            (vec![], 1, true),
+            (vec!["http://127.0.0.1:4001".to_string()], 11, true),
+            (vec!["://".to_string()], 1, false),
+        ];
+
+        for (endpoints, max_retries, expected_invalid_argument) in test_cases {
+            let result = ProxyWithEndpoints::builder()
+                .endpoints(endpoints.clone())
+                .max_retries(max_retries)
+                .build()
+                .await;
+            if expected_invalid_argument {
+                assert!(
+                    matches!(result, Err(Error::InvalidArgument(_))),
+                    "endpoints: {endpoints:?}, max_retries: {max_retries}"
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(Error::Internal(_))),
+                    "endpoints: {endpoints:?}, max_retries: {max_retries}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -2378,26 +2478,6 @@ mod tests {
         assert_eq!(proxy.clients.len(), 2);
         assert!(proxy.clients.contains_key("http://127.0.0.1:4001"));
         assert!(proxy.clients.contains_key("http://127.0.0.1:4002"));
-    }
-
-    #[tokio::test]
-    async fn test_new_with_endpoints_invalid_max_retries() {
-        let result = ProxyWithEndpoints::builder()
-            .endpoints(vec!["http://127.0.0.1:4001".to_string()])
-            .max_retries(11)
-            .build()
-            .await;
-        assert!(matches!(result, Err(Error::InvalidArgument(_))));
-    }
-
-    #[tokio::test]
-    async fn test_new_with_endpoints_invalid_endpoint() {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let result = ProxyWithEndpoints::builder()
-            .endpoints(vec!["://".to_string()])
-            .build()
-            .await;
-        assert!(matches!(result, Err(Error::Internal(_))));
     }
 
     #[tokio::test]
@@ -3182,11 +3262,53 @@ mod tests {
     #[cfg(feature = "preheat")]
     #[test]
     fn test_resolve_registry_maps_docker_hub() {
-        let reference: Reference = "nginx".parse().unwrap();
-        assert_eq!(Proxy::resolve_registry(&reference), "registry-1.docker.io");
+        let test_cases = vec![
+            ("nginx", "registry-1.docker.io"),
+            ("example.com/foo/bar:1.0", "example.com"),
+        ];
 
-        let reference: Reference = "example.com/foo/bar:1.0".parse().unwrap();
-        assert_eq!(Proxy::resolve_registry(&reference), "example.com");
+        for (image, expected) in test_cases {
+            let reference: Reference = image.parse().unwrap();
+            assert_eq!(Proxy::resolve_registry(&reference), expected);
+        }
+    }
+
+    #[cfg(feature = "preheat")]
+    #[test]
+    fn test_platform_resolver() {
+        let manifests = vec![
+            image_index_entry("sha256:amd64", Some((Os::Linux, Arch::Amd64))),
+            image_index_entry("sha256:arm64", Some((Os::Linux, Arch::ARM64))),
+            image_index_entry("sha256:no-platform", None),
+        ];
+
+        let test_cases = vec![
+            ("linux/amd64", Ok(Some("sha256:amd64"))),
+            ("linux/arm64", Ok(Some("sha256:arm64"))),
+            ("windows/amd64", Ok(None)),
+            ("linux/riscv64", Ok(None)),
+            ("linux-amd64", Err("invalid platform format")),
+            ("", Err("invalid platform format")),
+        ];
+
+        for (platform, expected) in test_cases {
+            match expected {
+                Ok(expected_digest) => {
+                    let resolver = Proxy::platform_resolver(platform).unwrap();
+                    assert_eq!(
+                        resolver(&manifests),
+                        expected_digest.map(|digest| digest.to_string()),
+                        "platform: {platform}"
+                    );
+                }
+                Err(expected_message) => {
+                    assert!(
+                        matches!(Proxy::platform_resolver(platform), Err(Error::InvalidArgument(message)) if message.contains(expected_message)),
+                        "platform: {platform}"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]

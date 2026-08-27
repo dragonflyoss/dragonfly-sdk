@@ -95,11 +95,17 @@ mod tests {
 
     #[test]
     fn should_escape_query() {
-        assert_eq!(query_escape("a b"), "a+b");
-        assert_eq!(query_escape("x*y"), "x%2Ay");
-        assert_eq!(query_escape("c~d"), "c~d");
-        assert_eq!(query_escape("1+1"), "1%2B1");
-        assert_eq!(query_escape("中"), "%E4%B8%AD");
+        let test_cases = vec![
+            ("a b", "a+b"),
+            ("x*y", "x%2Ay"),
+            ("c~d", "c~d"),
+            ("1+1", "1%2B1"),
+            ("中", "%E4%B8%AD"),
+        ];
+
+        for (s, expected) in test_cases {
+            assert_eq!(query_escape(s), expected);
+        }
     }
 
     #[test]
