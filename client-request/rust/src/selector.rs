@@ -347,7 +347,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_select_replicas() {
-        // The selection returns at most the available hosts, without duplicates.
         let test_cases = vec![(5, 3, 3), (2, 5, 2), (20, 10, 10)];
 
         for (host_count, replicas, expected_len) in test_cases {

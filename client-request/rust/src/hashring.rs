@@ -179,7 +179,8 @@ mod tests {
         let test_cases = vec![(2, 3), (3, 4), (4, 5)];
 
         for (replicas, expected_len) in test_cases {
-            let key = "test_key";            let vnodes = ring.get_with_replicas(&key, replicas).unwrap();
+            let key = "test_key";
+            let vnodes = ring.get_with_replicas(&key, replicas).unwrap();
             assert_eq!(vnodes.len(), expected_len, "replicas: {replicas}");
             assert!(vnodes.iter().all(|vnode| {
                 (vnode.name() == "default-pod-1" || vnode.name() == "default-pod-2")

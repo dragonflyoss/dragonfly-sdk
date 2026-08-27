@@ -2097,44 +2097,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_new_empty_endpoint() {
-        let result = Proxy::builder()
-            .scheduler_endpoint("".to_string())
-            .build()
-            .await;
+    async fn test_new_invalid_params() {
+        let test_cases = vec![
+            ("", None, None),
+            ("http://0.0.0.0:4000", Some(11), None),
+            ("http://0.0.0.0:4000", None, Some(Duration::from_secs(0))),
+            ("http://0.0.0.0:4000", None, Some(Duration::from_secs(601))),
+        ];
 
-        assert!(result.is_err());
-        assert!(matches!(result, Err(Error::InvalidArgument(_))));
-    }
+        for (endpoint, max_retries, health_check_interval) in test_cases {
+            let mut builder = Proxy::builder().scheduler_endpoint(endpoint.to_string());
+            if let Some(max_retries) = max_retries {
+                builder = builder.max_retries(max_retries);
+            }
+            if let Some(health_check_interval) = health_check_interval {
+                builder = builder.health_check_interval(health_check_interval);
+            }
 
-    #[tokio::test]
-    async fn test_new_invalid_retry_times() {
-        let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
-
-        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
-        let result = Proxy::builder()
-            .scheduler_endpoint(scheduler_endpoint)
-            .max_retries(11)
-            .build()
-            .await;
-
-        assert!(result.is_err());
-        assert!(matches!(result, Err(Error::InvalidArgument(_))));
-    }
-
-    #[tokio::test]
-    async fn test_new_invalid_health_check_interval() {
-        let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
-
-        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
-        let result = Proxy::builder()
-            .scheduler_endpoint(scheduler_endpoint)
-            .max_retries(11)
-            .build()
-            .await;
-
-        assert!(result.is_err());
-        assert!(matches!(result, Err(Error::InvalidArgument(_))));
+            let result = builder.build().await;
+            assert!(
+                matches!(result, Err(Error::InvalidArgument(_))),
+                "endpoint: {endpoint}, max_retries: {max_retries:?}, health_check_interval: {health_check_interval:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2413,12 +2398,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_new_with_endpoints_empty() {
-        let result = ProxyWithEndpoints::builder()
-            .endpoints(vec![])
-            .build()
-            .await;
-        assert!(matches!(result, Err(Error::InvalidArgument(_))));
+    async fn test_new_with_endpoints_invalid_params() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+        let test_cases = vec![
+            (vec![], 1, true),
+            (vec!["http://127.0.0.1:4001".to_string()], 11, true),
+            (vec!["://".to_string()], 1, false),
+        ];
+
+        for (endpoints, max_retries, expected_invalid_argument) in test_cases {
+            let result = ProxyWithEndpoints::builder()
+                .endpoints(endpoints.clone())
+                .max_retries(max_retries)
+                .build()
+                .await;
+            if expected_invalid_argument {
+                assert!(
+                    matches!(result, Err(Error::InvalidArgument(_))),
+                    "endpoints: {endpoints:?}, max_retries: {max_retries}"
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(Error::Internal(_))),
+                    "endpoints: {endpoints:?}, max_retries: {max_retries}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -2472,26 +2478,6 @@ mod tests {
         assert_eq!(proxy.clients.len(), 2);
         assert!(proxy.clients.contains_key("http://127.0.0.1:4001"));
         assert!(proxy.clients.contains_key("http://127.0.0.1:4002"));
-    }
-
-    #[tokio::test]
-    async fn test_new_with_endpoints_invalid_max_retries() {
-        let result = ProxyWithEndpoints::builder()
-            .endpoints(vec!["http://127.0.0.1:4001".to_string()])
-            .max_retries(11)
-            .build()
-            .await;
-        assert!(matches!(result, Err(Error::InvalidArgument(_))));
-    }
-
-    #[tokio::test]
-    async fn test_new_with_endpoints_invalid_endpoint() {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let result = ProxyWithEndpoints::builder()
-            .endpoints(vec!["://".to_string()])
-            .build()
-            .await;
-        assert!(matches!(result, Err(Error::Internal(_))));
     }
 
     #[tokio::test]
@@ -3276,11 +3262,15 @@ mod tests {
     #[cfg(feature = "preheat")]
     #[test]
     fn test_resolve_registry_maps_docker_hub() {
-        let reference: Reference = "nginx".parse().unwrap();
-        assert_eq!(Proxy::resolve_registry(&reference), "registry-1.docker.io");
+        let test_cases = vec![
+            ("nginx", "registry-1.docker.io"),
+            ("example.com/foo/bar:1.0", "example.com"),
+        ];
 
-        let reference: Reference = "example.com/foo/bar:1.0".parse().unwrap();
-        assert_eq!(Proxy::resolve_registry(&reference), "example.com");
+        for (image, expected) in test_cases {
+            let reference: Reference = image.parse().unwrap();
+            assert_eq!(Proxy::resolve_registry(&reference), expected);
+        }
     }
 
     #[cfg(feature = "preheat")]
