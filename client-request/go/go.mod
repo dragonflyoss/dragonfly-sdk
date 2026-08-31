@@ -3,7 +3,7 @@ module d7y.io/dragonfly-sdk/client-request/go
 go 1.25.6
 
 require (
-	d7y.io/api/v2 v2.3.5
+	d7y.io/api/v2 v2.3.6
 	d7y.io/dragonfly/v2 v2.5.2-rc.1
 	github.com/dchest/siphash v1.2.3
 	github.com/docker/distribution v2.8.3+incompatible
