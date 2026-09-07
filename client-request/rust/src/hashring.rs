@@ -112,20 +112,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_vnode_new() {
+    fn vnode_new() {
         let vnode = VNode::new(1, "default-pod-1".to_string());
         assert_eq!(vnode.id, 1);
         assert_eq!(vnode.name, "default-pod-1");
     }
 
     #[test]
-    fn test_vnode_to_string() {
+    fn vnode_to_string() {
         let vnode = VNode::new(1, "default-pod-1".to_string());
         assert_eq!(vnode.to_string(), "default-pod-1|1");
     }
 
     #[test]
-    fn test_hashring_new() {
+    fn hashring_new() {
         let ring = VNodeHashRing::new(3);
         assert_eq!(ring.replica_count, 3);
         assert!(ring.is_empty());
@@ -133,7 +133,7 @@ mod tests {
     }
 
     #[test]
-    fn test_add_and_len() {
+    fn add_and_len() {
         let mut ring = VNodeHashRing::new(2);
         ring.add("default-pod-1".to_string());
         assert_eq!(ring.len(), 2); // 1 node * 2 virtual nodes
@@ -143,14 +143,14 @@ mod tests {
     }
 
     #[test]
-    fn test_get_empty_ring() {
+    fn get_empty_ring() {
         let ring = VNodeHashRing::new(2);
         let key = "test_key";
         assert!(ring.get(&key).is_none());
     }
 
     #[test]
-    fn test_get_with_nodes() {
+    fn get_with_nodes() {
         let mut ring = VNodeHashRing::new(2);
         ring.add("default-pod-1".to_string());
         ring.add("default-pod-2".to_string());
@@ -164,14 +164,14 @@ mod tests {
     }
 
     #[test]
-    fn test_get_with_replicas_empty() {
+    fn get_with_replicas_empty() {
         let ring = VNodeHashRing::new(2);
         let key = "test_key";
         assert!(ring.get_with_replicas(&key, 2).is_none());
     }
 
     #[test]
-    fn test_get_with_replicas() {
+    fn get_with_replicas_spans_the_nodes() {
         let mut ring = VNodeHashRing::new(2);
         ring.add("default-pod-1".to_string());
         ring.add("default-pod-2".to_string());
@@ -190,7 +190,7 @@ mod tests {
     }
 
     #[test]
-    fn test_add_order_does_not_affect_get_result_many_keys() {
+    fn add_order_does_not_affect_get_result_many_keys() {
         use uuid::Uuid;
 
         let nodes_a = vec![

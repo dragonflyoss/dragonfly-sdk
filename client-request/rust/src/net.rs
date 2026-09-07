@@ -21,7 +21,7 @@ use std::net::IpAddr;
 ///
 /// IPv4 addresses are formatted as `ip:port` (e.g., "192.168.1.1:8080")
 /// IPv6 addresses are formatted as `[ip]:port` (e.g., "[::1]:8080")
-pub fn format_socket_addr(ip: IpAddr, port: u16) -> String {
+pub(crate) fn format_socket_addr(ip: IpAddr, port: u16) -> String {
     match ip {
         IpAddr::V4(v4) => format!("{v4}:{port}"),
         IpAddr::V6(v6) => format!("[{v6}]:{port}"),
@@ -29,7 +29,7 @@ pub fn format_socket_addr(ip: IpAddr, port: u16) -> String {
 }
 
 /// Formats a complete URL with scheme, IP address, and port.
-pub fn format_url(scheme: &str, ip: IpAddr, port: u16) -> String {
+pub(crate) fn format_url(scheme: &str, ip: IpAddr, port: u16) -> String {
     format!("{}://{}", scheme, format_socket_addr(ip, port))
 }
 
@@ -37,7 +37,7 @@ pub fn format_url(scheme: &str, ip: IpAddr, port: u16) -> String {
 ///
 /// Attempts to retrieve the local IPv4 address first. If unavailable or if the
 /// operation fails, falls back to attempting IPv6 address retrieval.
-pub fn preferred_local_ip() -> Option<IpAddr> {
+pub(crate) fn preferred_local_ip() -> Option<IpAddr> {
     local_ip().ok().or_else(|| local_ipv6().ok())
 }
 
@@ -47,7 +47,7 @@ mod tests {
     use std::str::FromStr;
 
     #[test]
-    fn test_format_socket_addr() {
+    fn format_socket_addr_brackets_ipv6() {
         let test_cases = vec![
             ("127.0.0.1", 80, "127.0.0.1:80"),
             ("192.168.1.1", 8080, "192.168.1.1:8080"),
@@ -64,7 +64,7 @@ mod tests {
     }
 
     #[test]
-    fn test_format_url() {
+    fn format_url_brackets_ipv6() {
         let test_cases = vec![
             ("http", "127.0.0.1", 80, "http://127.0.0.1:80"),
             ("https", "192.168.1.1", 443, "https://192.168.1.1:443"),
@@ -81,7 +81,7 @@ mod tests {
     }
 
     #[test]
-    fn test_preferred_local_ip() {
+    fn preferred_local_ip_is_found() {
         let ip = preferred_local_ip();
         assert!(ip.is_some());
     }

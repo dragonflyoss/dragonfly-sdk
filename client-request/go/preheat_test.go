@@ -21,10 +21,12 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	commonv2 "d7y.io/api/v2/pkg/apis/common/v2"
+	"github.com/cenkalti/backoff/v5"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -87,6 +89,72 @@ func TestPreheatFailsWhenSeedPeerDownloadFails(t *testing.T) {
 
 	err = proxy.Preheat(context.Background(), req)
 	assert.ErrorContains(err, "failed to download task")
+}
+
+func TestPreheatRetriesOnTheSameSeedPeer(t *testing.T) {
+	assert := assert.New(t)
+
+	var failingHits, healthyHits atomic.Int32
+	failingPort := setupMockSeedPeerServer(t, &mockSeedPeer{
+		downloadErr: status.Error(codes.Unavailable, "seed peer is busy"),
+		onDownload:  func() { failingHits.Add(1) },
+	})
+	healthyPort := setupMockSeedPeerServer(t, &mockSeedPeer{onDownload: func() { healthyHits.Add(1) }})
+	endpoint := setupMockScheduler(t, []*commonv2.Host{
+		createSeedPeerHost("seed-peer-1", failingPort, 0),
+		createSeedPeerHost("seed-peer-2", healthyPort, 0),
+	})
+
+	proxy, err := New(context.Background(), endpoint, WithProxyMaxRetries(2))
+	assert.NoError(err)
+	defer proxy.Close()
+
+	err = proxy.Preheat(context.Background(), NewPreheatRequest("http://example.com/payload.txt", WithPreheatRequestReplicas(2)))
+	assert.Equal(codes.Unavailable, status.Code(err))
+	assert.Equal(int32(3), failingHits.Load())
+	assert.Equal(int32(1), healthyHits.Load())
+}
+
+func TestPreheatRetriesOnlyTransientDownloadFailures(t *testing.T) {
+	expectCode := func(code codes.Code, hits int32) func(t *testing.T, hits int32, err error) {
+		return func(t *testing.T, got int32, err error) {
+			assert := assert.New(t)
+			assert.Equal(code, status.Code(err))
+			assert.Equal(hits, got)
+		}
+	}
+	tests := []struct {
+		name       string
+		code       codes.Code
+		maxRetries uint8
+		expect     func(t *testing.T, hits int32, err error)
+	}{
+		{"internal", codes.Internal, 1, expectCode(codes.Internal, 2)},
+		{"unavailable", codes.Unavailable, 2, expectCode(codes.Unavailable, 3)},
+		{"deadline exceeded", codes.DeadlineExceeded, 1, expectCode(codes.DeadlineExceeded, 2)},
+		{"not found", codes.NotFound, 3, expectCode(codes.NotFound, 1)},
+		{"permission denied", codes.PermissionDenied, 3, expectCode(codes.PermissionDenied, 1)},
+		{"invalid argument", codes.InvalidArgument, 3, expectCode(codes.InvalidArgument, 1)},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var hits atomic.Int32
+			port := setupMockSeedPeerServer(t, &mockSeedPeer{
+				downloadErr: status.Error(tc.code, "download failed"),
+				onDownload:  func() { hits.Add(1) },
+			})
+			endpoint := setupMockScheduler(t, []*commonv2.Host{createSeedPeerHost("seed-peer-1", port, 0)})
+
+			exponential := &backoff.ExponentialBackOff{InitialInterval: time.Millisecond, Multiplier: 2, MaxInterval: 2 * time.Millisecond}
+			proxy, err := New(context.Background(), endpoint, WithProxyMaxRetries(tc.maxRetries), WithProxyBackoff(exponential))
+			assert.NoError(t, err)
+			defer proxy.Close()
+
+			err = proxy.Preheat(context.Background(), NewPreheatRequest("http://example.com/payload.txt", WithPreheatRequestReplicas(1)))
+			tc.expect(t, hits.Load(), err)
+		})
+	}
 }
 
 func TestPreheatImageInvalidReference(t *testing.T) {

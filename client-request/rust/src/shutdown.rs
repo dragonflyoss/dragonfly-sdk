@@ -19,7 +19,7 @@ use tracing::info;
 
 /// Returns a future that will resolve when a SIGINT, SIGTERM or SIGQUIT signal is
 /// received by the process.
-pub async fn shutdown_signal() {
+pub(crate) async fn shutdown_signal() {
     let mut sigint = signal(SignalKind::interrupt()).unwrap();
     let mut sigterm = signal(SignalKind::terminate()).unwrap();
     let mut sigquit = signal(SignalKind::quit()).unwrap();

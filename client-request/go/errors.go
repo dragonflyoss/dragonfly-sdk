@@ -20,6 +20,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 var (
@@ -32,6 +35,37 @@ var (
 	// ErrInternal indicates a request internal error.
 	ErrInternal = errors.New("request internal error")
 )
+
+// isRetryable reports whether a failed attempt is worth another: the seed peer
+// could not be reached or answered too slowly, the dfdaemon failed, or the
+// proxy or backend answered 5xx, 408 or 429, since another seed peer may not
+// be rate limited. Every other answer is definitive for the request, so
+// retrying would only repeat it.
+func isRetryable(err error) bool {
+	var answer interface{ retryable() bool }
+	if errors.As(err, &answer) {
+		return answer.retryable()
+	}
+
+	if st, ok := status.FromError(err); ok {
+		switch st.Code() {
+		case codes.Internal, codes.Unavailable, codes.Unknown, codes.Aborted, codes.DeadlineExceeded:
+			return true
+		}
+
+		return false
+	}
+
+	return errors.Is(err, ErrRequestTimeout) || errors.Is(err, ErrInternal)
+}
+
+// isRetryableStatus reports whether the status code of a proxy or backend
+// answer marks a transient failure: 5xx, 408 or 429.
+func isRetryableStatus(status int) bool {
+	return status >= http.StatusInternalServerError ||
+		status == http.StatusRequestTimeout ||
+		status == http.StatusTooManyRequests
+}
 
 // BackendError is the error detail returned by the backend server.
 type BackendError struct {
@@ -48,6 +82,11 @@ type BackendError struct {
 // Error implements the error interface.
 func (e *BackendError) Error() string {
 	return fmt.Sprintf("backend server error, message: %q, header: %v, status_code: %d", e.Message, e.Header, e.StatusCode)
+}
+
+// retryable reports whether the answer marks a transient failure.
+func (e *BackendError) retryable() bool {
+	return isRetryableStatus(e.StatusCode)
 }
 
 // ProxyError is the error detail returned by the proxy server.
@@ -67,6 +106,11 @@ func (e *ProxyError) Error() string {
 	return fmt.Sprintf("proxy server error, message: %q, header: %v, status_code: %d", e.Message, e.Header, e.StatusCode)
 }
 
+// retryable reports whether the answer marks a transient failure.
+func (e *ProxyError) retryable() bool {
+	return isRetryableStatus(e.StatusCode)
+}
+
 // DfdaemonError is the error detail returned by the dfdaemon.
 type DfdaemonError struct {
 	// Message is the dfdaemon error message.
@@ -76,4 +120,9 @@ type DfdaemonError struct {
 // Error implements the error interface.
 func (e *DfdaemonError) Error() string {
 	return fmt.Sprintf("dfdaemon error, message: %q", e.Message)
+}
+
+// retryable reports that a dfdaemon failure is transient.
+func (e *DfdaemonError) retryable() bool {
+	return true
 }

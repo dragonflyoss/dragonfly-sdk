@@ -57,6 +57,31 @@ let response = proxy
     .await?;
 ```
 
+Retry transient failures. A request is retried on another seed peer when the
+peer cannot be reached or answers too slowly, the dfdaemon fails, or the proxy
+or backend answers `5xx`, `408` or `429`, since another seed peer may not be rate
+limited. Any other answer, such as `404`, is definitive and returns at once.
+Preheating retries the same way on each replica seed peer. The default is one
+retry at once, `max_retries(0)` disables retries, and a `backon` exponential
+backoff spreads the retries out. The request timeout applies to each attempt:
+
+```rust
+use dragonfly_client_request::ExponentialBuilder;
+use std::time::Duration;
+
+let proxy = Proxy::builder()
+    .scheduler_endpoint("http://127.0.0.1:8002".to_string())
+    .max_retries(3)
+    .backoff(
+        ExponentialBuilder::new()
+            .with_min_delay(Duration::from_millis(100))
+            .with_max_delay(Duration::from_secs(1))
+            .with_jitter(),
+    )
+    .build()
+    .await?;
+```
+
 Look up the endpoints of the seed peers serving a request, then create a proxy
 bound to those endpoints and download from them directly, scattering the
 request across them. The endpoints proxy keeps a client with a reusable

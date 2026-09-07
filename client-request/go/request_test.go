@@ -26,7 +26,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	commonv2 "d7y.io/api/v2/pkg/apis/common/v2"
 	dfdaemonv2 "d7y.io/api/v2/pkg/apis/dfdaemon/v2"
@@ -161,23 +160,23 @@ func TestNewRequestDefaults(t *testing.T) {
 	assert.NotEmpty(get.filteredQueryParams)
 	assert.True(get.enableTaskIDBasedBlobDigest)
 	assert.Equal(2, get.replicas)
-	assert.Equal(30*time.Minute, get.timeout)
+	assert.Equal(defaultRequestTimeout, get.timeout)
 
 	preheat := NewPreheatRequest("https://example.com/file.txt")
 	assert.NotEmpty(preheat.filteredQueryParams)
 	assert.True(preheat.enableTaskIDBasedBlobDigest)
 	assert.Equal(2, preheat.replicas)
-	assert.Equal(30*time.Minute, preheat.timeout)
+	assert.Equal(defaultRequestTimeout, preheat.timeout)
 
 	image := NewPreheatImageRequest("docker.io/library/nginx:latest")
 	assert.Equal(2, image.replicas)
 	assert.Equal(4, image.concurrentTaskCount)
-	assert.Equal(30*time.Minute, image.timeout)
+	assert.Equal(defaultRequestTimeout, image.timeout)
 
 	stat := NewStatImageRequest("docker.io/library/nginx:latest")
 	assert.NotEmpty(stat.filteredQueryParams)
 	assert.True(stat.enableTaskIDBasedBlobDigest)
-	assert.Equal(30*time.Minute, stat.timeout)
+	assert.Equal(defaultRequestTimeout, stat.timeout)
 }
 
 func setupBenchProxy(b *testing.B, body []byte) (*Proxy, string) {

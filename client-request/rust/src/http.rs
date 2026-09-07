@@ -93,12 +93,12 @@ static DEFAULT_PROXY_RULE_FILTERED_QUERY_PARAMS: LazyLock<Vec<String>> = LazyLoc
 
 /// The default filtered query params to generate the task id.
 #[inline]
-pub fn default_proxy_rule_filtered_query_params() -> Vec<String> {
+pub(crate) fn default_proxy_rule_filtered_query_params() -> Vec<String> {
     DEFAULT_PROXY_RULE_FILTERED_QUERY_PARAMS.clone()
 }
 
 /// Converts a headermap to a hashmap.
-pub fn headermap_to_hashmap(header: &HeaderMap<HeaderValue>) -> HashMap<String, String> {
+pub(crate) fn headermap_to_hashmap(header: &HeaderMap<HeaderValue>) -> HashMap<String, String> {
     let mut hashmap: HashMap<String, String> = HashMap::with_capacity(header.len());
     for (k, v) in header {
         if let Ok(v) = v.to_str() {
