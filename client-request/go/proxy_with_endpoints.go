@@ -182,7 +182,7 @@ func (p *ProxyWithEndpoints) send(ctx context.Context, client *http.Client, req 
 	case "proxy":
 		return nil, &ProxyError{Message: string(message), Header: header, StatusCode: resp.StatusCode}
 	case "dfdaemon":
-		return nil, &DfdaemonError{Message: string(message)}
+		return nil, &DfdaemonError{Message: string(message), Header: header, StatusCode: resp.StatusCode}
 	case "":
 		return nil, &ProxyError{
 			Message:    fmt.Sprintf("unexpected status code from proxy: %d", resp.StatusCode),

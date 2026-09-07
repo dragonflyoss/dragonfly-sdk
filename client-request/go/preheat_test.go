@@ -116,25 +116,72 @@ func TestPreheatRetriesOnTheSameSeedPeer(t *testing.T) {
 }
 
 func TestPreheatRetriesOnlyTransientDownloadFailures(t *testing.T) {
-	expectCode := func(code codes.Code, hits int32) func(t *testing.T, hits int32, err error) {
-		return func(t *testing.T, got int32, err error) {
-			assert := assert.New(t)
-			assert.Equal(code, status.Code(err))
-			assert.Equal(hits, got)
-		}
-	}
 	tests := []struct {
 		name       string
 		code       codes.Code
 		maxRetries uint8
 		expect     func(t *testing.T, hits int32, err error)
 	}{
-		{"internal", codes.Internal, 1, expectCode(codes.Internal, 2)},
-		{"unavailable", codes.Unavailable, 2, expectCode(codes.Unavailable, 3)},
-		{"deadline exceeded", codes.DeadlineExceeded, 1, expectCode(codes.DeadlineExceeded, 2)},
-		{"not found", codes.NotFound, 3, expectCode(codes.NotFound, 1)},
-		{"permission denied", codes.PermissionDenied, 3, expectCode(codes.PermissionDenied, 1)},
-		{"invalid argument", codes.InvalidArgument, 3, expectCode(codes.InvalidArgument, 1)},
+		{
+			name:       "internal",
+			code:       codes.Internal,
+			maxRetries: 1,
+			expect: func(t *testing.T, hits int32, err error) {
+				assert := assert.New(t)
+				assert.Equal(codes.Internal, status.Code(err))
+				assert.Equal(int32(2), hits)
+			},
+		},
+		{
+			name:       "unavailable",
+			code:       codes.Unavailable,
+			maxRetries: 2,
+			expect: func(t *testing.T, hits int32, err error) {
+				assert := assert.New(t)
+				assert.Equal(codes.Unavailable, status.Code(err))
+				assert.Equal(int32(3), hits)
+			},
+		},
+		{
+			name:       "deadline exceeded",
+			code:       codes.DeadlineExceeded,
+			maxRetries: 1,
+			expect: func(t *testing.T, hits int32, err error) {
+				assert := assert.New(t)
+				assert.Equal(codes.DeadlineExceeded, status.Code(err))
+				assert.Equal(int32(2), hits)
+			},
+		},
+		{
+			name:       "not found",
+			code:       codes.NotFound,
+			maxRetries: 3,
+			expect: func(t *testing.T, hits int32, err error) {
+				assert := assert.New(t)
+				assert.Equal(codes.NotFound, status.Code(err))
+				assert.Equal(int32(1), hits)
+			},
+		},
+		{
+			name:       "permission denied",
+			code:       codes.PermissionDenied,
+			maxRetries: 3,
+			expect: func(t *testing.T, hits int32, err error) {
+				assert := assert.New(t)
+				assert.Equal(codes.PermissionDenied, status.Code(err))
+				assert.Equal(int32(1), hits)
+			},
+		},
+		{
+			name:       "invalid argument",
+			code:       codes.InvalidArgument,
+			maxRetries: 3,
+			expect: func(t *testing.T, hits int32, err error) {
+				assert := assert.New(t)
+				assert.Equal(codes.InvalidArgument, status.Code(err))
+				assert.Equal(int32(1), hits)
+			},
+		},
 	}
 
 	for _, tc := range tests {

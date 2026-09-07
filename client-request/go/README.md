@@ -55,10 +55,10 @@ req := request.NewGetRequest(
 ```
 
 Retry transient failures. A request is retried on another seed peer when the
-peer cannot be reached or answers too slowly, the dfdaemon fails, or the proxy
-or backend answers `5xx`, `408` or `429`, since another seed peer may not be
-rate limited. Any other answer, such as `404`, is definitive and returns at
-once. Preheating retries the same way on each replica seed peer. The default is
+peer cannot be reached or answers too slowly, or the proxy, backend or dfdaemon
+answers `5xx`, `408` or `429`, since another seed peer may not be rate limited
+or out of space. Any other answer, such as `404` or a dfdaemon `422`, is
+definitive and returns at once. Preheating retries the same way on each replica seed peer. The default is
 one retry at once, `WithProxyMaxRetries(0)` disables retries, and a
 `cenkalti/backoff` exponential backoff spreads the retries out. The request
 timeout applies to each attempt:

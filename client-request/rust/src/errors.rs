@@ -60,14 +60,16 @@ pub enum Error {
 /// Implements the error.
 impl Error {
     /// Whether a failed attempt is worth another: the seed peer could not be reached
-    /// or answered too slowly, the dfdaemon failed, or the proxy or backend answered
-    /// `5xx`, `408` or `429`, since another seed peer may not be rate limited. Every
-    /// other answer is definitive for the request, so retrying would only repeat it.
+    /// or answered too slowly, or the proxy, backend or dfdaemon answered `5xx`, `408`
+    /// or `429`, since another seed peer may not be rate limited or out of space.
+    /// Every other answer is definitive for the request, so retrying would only
+    /// repeat it.
     pub(crate) fn is_retryable(&self) -> bool {
         match self {
-            Error::RequestTimeout(_) | Error::Internal(_) | Error::DfdaemonError(_) => true,
+            Error::RequestTimeout(_) | Error::Internal(_) => true,
             Error::ProxyError(ProxyError { status_code, .. })
-            | Error::BackendError(BackendError { status_code, .. }) => {
+            | Error::BackendError(BackendError { status_code, .. })
+            | Error::DfdaemonError(DfdaemonError { status_code, .. }) => {
                 status_code.is_none_or(|status| {
                     status.is_server_error()
                         || status == reqwest::StatusCode::REQUEST_TIMEOUT
@@ -142,10 +144,16 @@ pub struct ProxyError {
 
 /// The error detail for Dfdaemon.
 #[derive(Debug, thiserror::Error)]
-#[error("dfdaemon error, message: {message:?}")]
+#[error("dfdaemon error, message: {message:?}, header: {header:?}, status_code: {status_code:?}")]
 pub struct DfdaemonError {
     /// Dfdaemon error message.
     pub message: Option<String>,
+
+    /// Dfdaemon HTTP response header.
+    pub header: HashMap<String, String>,
+
+    /// Dfdaemon HTTP status code.
+    pub status_code: Option<reqwest::StatusCode>,
 }
 
 #[cfg(test)]
@@ -169,6 +177,14 @@ mod tests {
         })
     }
 
+    fn dfdaemon(status_code: Option<StatusCode>) -> Error {
+        Error::DfdaemonError(DfdaemonError {
+            message: None,
+            header: HashMap::new(),
+            status_code,
+        })
+    }
+
     fn status(code: Code) -> Error {
         Error::TonicStatus(tonic::Status::new(code, "status"))
     }
@@ -178,7 +194,11 @@ mod tests {
         let test_cases = vec![
             (Error::RequestTimeout("timeout".to_string()), true),
             (Error::Internal("boom".to_string()), true),
-            (Error::DfdaemonError(DfdaemonError { message: None }), true),
+            (dfdaemon(None), true),
+            (dfdaemon(Some(StatusCode::INTERNAL_SERVER_ERROR)), true),
+            (dfdaemon(Some(StatusCode::INSUFFICIENT_STORAGE)), true),
+            (dfdaemon(Some(StatusCode::UNPROCESSABLE_ENTITY)), false),
+            (dfdaemon(Some(StatusCode::BAD_REQUEST)), false),
             (proxy(None), true),
             (backend(None), true),
             (proxy(Some(StatusCode::INTERNAL_SERVER_ERROR)), true),

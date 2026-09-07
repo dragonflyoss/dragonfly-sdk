@@ -1469,7 +1469,11 @@ impl Proxy {
                 header: header_map,
                 status_code: Some(status),
             })),
-            Some("dfdaemon") => Err(Error::DfdaemonError(DfdaemonError { message })),
+            Some("dfdaemon") => Err(Error::DfdaemonError(DfdaemonError {
+                message,
+                header: header_map,
+                status_code: Some(status),
+            })),
             Some(other) => Err(Error::ProxyError(ProxyError {
                 message: Some(format!("unknown error type from proxy: {other}")),
                 header: header_map,
@@ -1808,7 +1812,11 @@ impl ProxyWithEndpoints {
                 header: header_map,
                 status_code: Some(status),
             })),
-            Some("dfdaemon") => Err(Error::DfdaemonError(DfdaemonError { message })),
+            Some("dfdaemon") => Err(Error::DfdaemonError(DfdaemonError {
+                message,
+                header: header_map,
+                status_code: Some(status),
+            })),
             Some(other) => Err(Error::ProxyError(ProxyError {
                 message: Some(format!("unknown error type from proxy: {other}")),
                 header: header_map,
@@ -2115,34 +2123,7 @@ mod tests {
         TruncateBody,
     }
 
-    fn flaky_test_cases() -> Vec<(FlakyFirstConnection, Duration, Option<Duration>)> {
-        let timeout = Duration::from_millis(300);
-        vec![
-            (
-                FlakyFirstConnection::TruncateBody,
-                DEFAULT_REQUEST_TIMEOUT,
-                None,
-            ),
-            (FlakyFirstConnection::Hang, timeout, Some(timeout)),
-        ]
-    }
-
-    fn assert_flaky_retry(
-        first: FlakyFirstConnection,
-        buf: &BytesMut,
-        connections: usize,
-        elapsed: Duration,
-        expected_wait: Option<Duration>,
-    ) {
-        assert_eq!(&buf[..], b"prefix:hello dragonfly", "first: {first:?}");
-        assert_eq!(connections, 2, "first: {first:?}");
-        if let Some(expected_wait) = expected_wait {
-            assert!(
-                (expected_wait..expected_wait * 3).contains(&elapsed),
-                "first: {first:?}, elapsed: {elapsed:?}"
-            );
-        }
-    }
+    type ExpectElapsed = fn(Duration);
 
     #[cfg(feature = "preheat")]
     fn image_index_entry(digest: &str, platform: Option<(Os, Arch)>) -> ImageIndexEntry {
@@ -2467,6 +2448,9 @@ mod tests {
             (reqwest::StatusCode::SERVICE_UNAVAILABLE, "proxy", 2, 3),
             (reqwest::StatusCode::INTERNAL_SERVER_ERROR, "backend", 1, 2),
             (reqwest::StatusCode::INTERNAL_SERVER_ERROR, "proxy", 1, 2),
+            (reqwest::StatusCode::INTERNAL_SERVER_ERROR, "dfdaemon", 1, 2),
+            (reqwest::StatusCode::INSUFFICIENT_STORAGE, "dfdaemon", 2, 3),
+            (reqwest::StatusCode::UNPROCESSABLE_ENTITY, "dfdaemon", 3, 1),
             (reqwest::StatusCode::REQUEST_TIMEOUT, "backend", 1, 2),
             (reqwest::StatusCode::REQUEST_TIMEOUT, "proxy", 1, 2),
             (reqwest::StatusCode::TOO_MANY_REQUESTS, "backend", 3, 4),
@@ -2533,7 +2517,25 @@ mod tests {
 
     #[tokio::test]
     async fn get_into_retries_a_flaky_first_attempt() {
-        for (first, timeout, expected_wait) in flaky_test_cases() {
+        let test_cases: Vec<(FlakyFirstConnection, Duration, ExpectElapsed)> = vec![
+            (
+                FlakyFirstConnection::TruncateBody,
+                DEFAULT_REQUEST_TIMEOUT,
+                |_elapsed| {},
+            ),
+            (
+                FlakyFirstConnection::Hang,
+                Duration::from_millis(300),
+                |elapsed| {
+                    assert!(
+                        (Duration::from_millis(300)..Duration::from_millis(900)).contains(&elapsed),
+                        "elapsed: {elapsed:?}"
+                    );
+                },
+            ),
+        ];
+
+        for (first, timeout, expect) in test_cases {
             let (port, connections) = setup_flaky_seed_peer_proxy(first, "hello dragonfly").await;
             let mock_seed_peer = setup_mock_seed_peer(MockSet::new()).await.unwrap();
             let mock_scheduler = setup_mock_scheduler(vec![create_seed_peer_host(
@@ -2562,20 +2564,38 @@ mod tests {
             let mut buf = BytesMut::from(&b"prefix:"[..]);
             let response = proxy.get_into(&request, &mut buf).await.unwrap();
             assert!(response.success, "first: {first:?}");
-            assert_flaky_retry(
-                first,
-                &buf,
+            assert_eq!(&buf[..], b"prefix:hello dragonfly", "first: {first:?}");
+            assert_eq!(
                 connections.load(std::sync::atomic::Ordering::SeqCst),
-                start.elapsed(),
-                expected_wait,
+                2,
+                "first: {first:?}"
             );
+            expect(start.elapsed());
         }
     }
 
     #[tokio::test]
     async fn get_into_with_endpoints_retries_a_flaky_first_attempt() {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        for (first, timeout, expected_wait) in flaky_test_cases() {
+        let test_cases: Vec<(FlakyFirstConnection, Duration, ExpectElapsed)> = vec![
+            (
+                FlakyFirstConnection::TruncateBody,
+                DEFAULT_REQUEST_TIMEOUT,
+                |_elapsed| {},
+            ),
+            (
+                FlakyFirstConnection::Hang,
+                Duration::from_millis(300),
+                |elapsed| {
+                    assert!(
+                        (Duration::from_millis(300)..Duration::from_millis(900)).contains(&elapsed),
+                        "elapsed: {elapsed:?}"
+                    );
+                },
+            ),
+        ];
+
+        for (first, timeout, expect) in test_cases {
             let (port, connections) = setup_flaky_seed_peer_proxy(first, "hello dragonfly").await;
             let proxy = ProxyWithEndpoints::builder()
                 .endpoints(vec![format!("http://127.0.0.1:{port}")])
@@ -2593,13 +2613,13 @@ mod tests {
             let mut buf = BytesMut::from(&b"prefix:"[..]);
             let response = proxy.get_into(&request, &mut buf).await.unwrap();
             assert!(response.success, "first: {first:?}");
-            assert_flaky_retry(
-                first,
-                &buf,
+            assert_eq!(&buf[..], b"prefix:hello dragonfly", "first: {first:?}");
+            assert_eq!(
                 connections.load(std::sync::atomic::Ordering::SeqCst),
-                start.elapsed(),
-                expected_wait,
+                2,
+                "first: {first:?}"
             );
+            expect(start.elapsed());
         }
     }
 
@@ -2644,6 +2664,8 @@ mod tests {
         let test_cases = vec![
             (reqwest::StatusCode::SERVICE_UNAVAILABLE, "backend", 2, 3),
             (reqwest::StatusCode::SERVICE_UNAVAILABLE, "proxy", 2, 3),
+            (reqwest::StatusCode::INSUFFICIENT_STORAGE, "dfdaemon", 2, 3),
+            (reqwest::StatusCode::UNPROCESSABLE_ENTITY, "dfdaemon", 3, 1),
             (reqwest::StatusCode::REQUEST_TIMEOUT, "proxy", 1, 2),
             (reqwest::StatusCode::TOO_MANY_REQUESTS, "backend", 3, 4),
             (reqwest::StatusCode::TOO_MANY_REQUESTS, "proxy", 3, 4),
