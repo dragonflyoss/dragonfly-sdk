@@ -31,27 +31,36 @@ func TestRetryPolicyNewBackOff(t *testing.T) {
 	tests := []struct {
 		name        string
 		exponential *backoff.ExponentialBackOff
-		expected    []time.Duration
+		expect      func(t *testing.T, b backoff.BackOff)
 	}{
-		{"nil", nil, []time.Duration{0, 0, 0}},
 		{
-			"exponential",
-			&backoff.ExponentialBackOff{InitialInterval: time.Millisecond, MaxInterval: 3 * time.Millisecond, Multiplier: 2},
-			[]time.Duration{time.Millisecond, 2 * time.Millisecond, 3 * time.Millisecond},
+			name: "nil",
+			expect: func(t *testing.T, b backoff.BackOff) {
+				assert := assert.New(t)
+				for range 3 {
+					assert.Equal(time.Duration(0), b.NextBackOff())
+				}
+			},
+		},
+		{
+			name:        "exponential",
+			exponential: &backoff.ExponentialBackOff{InitialInterval: time.Millisecond, MaxInterval: 3 * time.Millisecond, Multiplier: 2},
+			expect: func(t *testing.T, b backoff.BackOff) {
+				assert := assert.New(t)
+				assert.Equal(time.Millisecond, b.NextBackOff())
+				assert.Equal(2*time.Millisecond, b.NextBackOff())
+				assert.Equal(3*time.Millisecond, b.NextBackOff())
+			},
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			assert := assert.New(t)
-
-			// Every request gets a fresh copy, so two in a row start over.
+			policy := retryPolicy{backoff: tc.exponential}
 			for range 2 {
-				b := retryPolicy{backoff: tc.exponential}.newBackOff()
+				b := policy.newBackOff()
 				b.Reset()
-				for _, expected := range tc.expected {
-					assert.Equal(expected, b.NextBackOff())
-				}
+				tc.expect(t, b)
 			}
 		})
 	}
@@ -61,23 +70,64 @@ func TestRetry(t *testing.T) {
 	transient := fmt.Errorf("%w: boom", ErrInternal)
 	definitive := &BackendError{StatusCode: http.StatusNotFound}
 	tests := []struct {
-		name             string
-		maxRetries       uint8
-		failures         []error
-		expectedAttempts int
-		expectedErr      error
+		name       string
+		maxRetries uint8
+		failures   []error
+		expect     func(t *testing.T, attempts int, err error)
 	}{
-		{"succeeds at once", 3, nil, 1, nil},
-		{"retries transient failures", 3, []error{transient, transient}, 3, nil},
-		{"stops at a definitive failure", 3, []error{definitive}, 1, definitive},
-		{"exhausts the retries", 2, []error{transient, transient, transient}, 3, transient},
-		{"no retries", 0, []error{transient}, 1, transient},
+		{
+			name:       "succeeds at once",
+			maxRetries: 3,
+			expect: func(t *testing.T, attempts int, err error) {
+				assert := assert.New(t)
+				assert.NoError(err)
+				assert.Equal(1, attempts)
+			},
+		},
+		{
+			name:       "retries transient failures",
+			maxRetries: 3,
+			failures:   []error{transient, transient},
+			expect: func(t *testing.T, attempts int, err error) {
+				assert := assert.New(t)
+				assert.NoError(err)
+				assert.Equal(3, attempts)
+			},
+		},
+		{
+			name:       "stops at a definitive failure",
+			maxRetries: 3,
+			failures:   []error{definitive},
+			expect: func(t *testing.T, attempts int, err error) {
+				assert := assert.New(t)
+				assert.ErrorIs(err, definitive)
+				assert.Equal(1, attempts)
+			},
+		},
+		{
+			name:       "exhausts the retries",
+			maxRetries: 2,
+			failures:   []error{transient, transient, transient},
+			expect: func(t *testing.T, attempts int, err error) {
+				assert := assert.New(t)
+				assert.ErrorIs(err, transient)
+				assert.Equal(3, attempts)
+			},
+		},
+		{
+			name:       "no retries",
+			maxRetries: 0,
+			failures:   []error{transient},
+			expect: func(t *testing.T, attempts int, err error) {
+				assert := assert.New(t)
+				assert.ErrorIs(err, transient)
+				assert.Equal(1, attempts)
+			},
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			assert := assert.New(t)
-
 			attempts := 0
 			policy := retryPolicy{
 				maxRetries: tc.maxRetries,
@@ -91,13 +141,7 @@ func TestRetry(t *testing.T) {
 
 				return struct{}{}, nil
 			})
-
-			if tc.expectedErr == nil {
-				assert.NoError(err)
-			} else {
-				assert.ErrorIs(err, tc.expectedErr)
-			}
-			assert.Equal(tc.expectedAttempts, attempts)
+			tc.expect(t, attempts, err)
 		})
 	}
 }
@@ -107,11 +151,23 @@ func TestRetryWaitsTheBackoffDelays(t *testing.T) {
 	tests := []struct {
 		name    string
 		backoff *backoff.ExponentialBackOff
-		atLeast time.Duration
-		atMost  time.Duration
+		expect  func(t *testing.T, elapsed time.Duration)
 	}{
-		{"without backoff", nil, 0, delay},
-		{"exponential", &backoff.ExponentialBackOff{InitialInterval: delay, MaxInterval: 2 * delay, Multiplier: 2}, 3 * delay, 6 * delay},
+		{
+			name: "without backoff",
+			expect: func(t *testing.T, elapsed time.Duration) {
+				assert.Less(t, elapsed, delay)
+			},
+		},
+		{
+			name:    "exponential",
+			backoff: &backoff.ExponentialBackOff{InitialInterval: delay, MaxInterval: 2 * delay, Multiplier: 2},
+			expect: func(t *testing.T, elapsed time.Duration) {
+				assert := assert.New(t)
+				assert.GreaterOrEqual(elapsed, 3*delay)
+				assert.Less(elapsed, 6*delay)
+			},
+		},
 	}
 
 	for _, tc := range tests {
@@ -123,52 +179,61 @@ func TestRetryWaitsTheBackoffDelays(t *testing.T) {
 			_, err := retry(context.Background(), policy, func() (struct{}, error) {
 				return struct{}{}, fmt.Errorf("%w: boom", ErrInternal)
 			})
-			elapsed := time.Since(start)
 			assert.ErrorIs(err, ErrInternal)
-			assert.GreaterOrEqual(elapsed, tc.atLeast)
-			assert.Less(elapsed, tc.atMost)
+			tc.expect(t, time.Since(start))
 
 			start = time.Now()
 			_, _, err = retryWithEndpoints(context.Background(), policy, []string{"a"}, time.Second, func(context.Context, string) (*http.Response, error) {
 				return nil, fmt.Errorf("%w: boom", ErrInternal)
 			})
-			elapsed = time.Since(start)
 			assert.ErrorIs(err, ErrInternal)
-			assert.GreaterOrEqual(elapsed, tc.atLeast)
-			assert.Less(elapsed, tc.atMost)
+			tc.expect(t, time.Since(start))
 		})
 	}
 }
 
 func TestRetryStopsWhenTheContextEnds(t *testing.T) {
 	tests := []struct {
-		name        string
-		end         func(context.CancelFunc, context.CancelFunc)
-		expectedErr error
+		name   string
+		cause  error
+		expect func(t *testing.T, attempts int, err error)
 	}{
-		{"cancelled", func(cancel, _ context.CancelFunc) { cancel() }, ErrInternal},
-		{"deadline exceeded", func(_, expire context.CancelFunc) { expire() }, ErrRequestTimeout},
+		{
+			name:  "cancelled",
+			cause: context.Canceled,
+			expect: func(t *testing.T, attempts int, err error) {
+				assert := assert.New(t)
+				assert.ErrorIs(err, ErrInternal)
+				assert.Equal(1, attempts)
+			},
+		},
+		{
+			name:  "deadline exceeded",
+			cause: context.DeadlineExceeded,
+			expect: func(t *testing.T, attempts int, err error) {
+				assert := assert.New(t)
+				assert.ErrorIs(err, ErrRequestTimeout)
+				assert.Equal(1, attempts)
+			},
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			assert := assert.New(t)
-
 			ctx, cancel := context.WithCancelCause(context.Background())
 			defer cancel(nil)
-			expire := func() { cancel(context.DeadlineExceeded) }
-			cancelPlain := func() { cancel(context.Canceled) }
 
 			attempts := 0
-			policy := retryPolicy{maxRetries: 5, backoff: &backoff.ExponentialBackOff{InitialInterval: time.Second, MaxInterval: time.Second, Multiplier: 1}}
+			policy := retryPolicy{
+				maxRetries: 5,
+				backoff:    &backoff.ExponentialBackOff{InitialInterval: time.Second, MaxInterval: time.Second, Multiplier: 1},
+			}
 			_, err := retry(ctx, policy, func() (struct{}, error) {
 				attempts++
-				tc.end(cancelPlain, expire)
+				cancel(tc.cause)
 				return struct{}{}, fmt.Errorf("%w: boom", ErrInternal)
 			})
-
-			assert.ErrorIs(err, tc.expectedErr)
-			assert.Equal(1, attempts)
+			tc.expect(t, attempts, err)
 		})
 	}
 }
@@ -177,25 +242,85 @@ func TestRetryWithEndpoints(t *testing.T) {
 	transient := fmt.Errorf("%w: boom", ErrInternal)
 	definitive := &BackendError{StatusCode: http.StatusNotFound}
 	tests := []struct {
-		name             string
-		endpoints        []string
-		maxRetries       uint8
-		failures         []error
-		expectedAttempts int
-		expectedErr      error
+		name       string
+		endpoints  []string
+		maxRetries uint8
+		failures   []error
+		expect     func(t *testing.T, attempts []string, err error)
 	}{
-		{"no endpoints", nil, 3, nil, 0, ErrInvalidArgument},
-		{"succeeds at once", []string{"a"}, 3, nil, 1, nil},
-		{"retries transient failures on the next endpoint", []string{"a", "b"}, 3, []error{transient, transient}, 3, nil},
-		{"wraps around the endpoints", []string{"a", "b", "c"}, 3, []error{transient, transient, transient}, 4, nil},
-		{"stops at a definitive failure", []string{"a"}, 3, []error{definitive}, 1, definitive},
-		{"exhausts the retries", []string{"a", "b"}, 2, []error{transient, transient, transient}, 3, transient},
+		{
+			name:       "no endpoints",
+			maxRetries: 3,
+			expect: func(t *testing.T, attempts []string, err error) {
+				assert := assert.New(t)
+				assert.ErrorIs(err, ErrInvalidArgument)
+				assert.Empty(attempts)
+			},
+		},
+		{
+			name:       "succeeds at once",
+			endpoints:  []string{"a"},
+			maxRetries: 3,
+			expect: func(t *testing.T, attempts []string, err error) {
+				assert := assert.New(t)
+				assert.NoError(err)
+				assert.Equal([]string{"a"}, attempts)
+			},
+		},
+		{
+			name:       "retries transient failures on the next endpoint",
+			endpoints:  []string{"a", "b"},
+			maxRetries: 3,
+			failures:   []error{transient, transient},
+			expect: func(t *testing.T, attempts []string, err error) {
+				assert := assert.New(t)
+				assert.NoError(err)
+				assert.Len(attempts, 3)
+				assert.NotEqual(attempts[0], attempts[1])
+				assert.Equal(attempts[0], attempts[2])
+			},
+		},
+		{
+			name:       "wraps around the endpoints",
+			endpoints:  []string{"a", "b", "c"},
+			maxRetries: 3,
+			failures:   []error{transient, transient, transient},
+			expect: func(t *testing.T, attempts []string, err error) {
+				assert := assert.New(t)
+				assert.NoError(err)
+				assert.Len(attempts, 4)
+				assert.ElementsMatch([]string{"a", "b", "c"}, attempts[:3])
+				assert.Equal(attempts[0], attempts[3])
+			},
+		},
+		{
+			name:       "stops at a definitive failure",
+			endpoints:  []string{"a"},
+			maxRetries: 3,
+			failures:   []error{definitive},
+			expect: func(t *testing.T, attempts []string, err error) {
+				assert := assert.New(t)
+				assert.ErrorIs(err, definitive)
+				assert.Len(attempts, 1)
+			},
+		},
+		{
+			name:       "exhausts the retries",
+			endpoints:  []string{"a", "b"},
+			maxRetries: 2,
+			failures:   []error{transient, transient, transient},
+			expect: func(t *testing.T, attempts []string, err error) {
+				assert := assert.New(t)
+				assert.ErrorIs(err, transient)
+				assert.Len(attempts, 3)
+				assert.NotEqual(attempts[0], attempts[1])
+				assert.Equal(attempts[0], attempts[2])
+			},
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			assert := assert.New(t)
-
 			var attempts []string
 			resp, cancel, err := retryWithEndpoints(context.Background(), retryPolicy{maxRetries: tc.maxRetries}, tc.endpoints, time.Second, func(_ context.Context, endpoint string) (*http.Response, error) {
 				attempts = append(attempts, endpoint)
@@ -205,27 +330,11 @@ func TestRetryWithEndpoints(t *testing.T) {
 
 				return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
 			})
-
-			if tc.expectedErr == nil {
-				assert.NoError(err)
-				assert.Equal(http.StatusOK, resp.StatusCode)
+			if err == nil {
+				assert.Equal(t, http.StatusOK, resp.StatusCode)
 				cancel()
-			} else {
-				assert.ErrorIs(err, tc.expectedErr)
 			}
-			assert.Len(attempts, tc.expectedAttempts)
-
-			// The first attempts spread over distinct endpoints, later ones
-			// wrap around in the same order.
-			distinct := min(len(attempts), len(tc.endpoints))
-			seen := make(map[string]bool, distinct)
-			for _, endpoint := range attempts[:distinct] {
-				seen[endpoint] = true
-			}
-			assert.Len(seen, distinct)
-			for i := len(tc.endpoints); i < len(attempts); i++ {
-				assert.Equal(attempts[i-len(tc.endpoints)], attempts[i])
-			}
+			tc.expect(t, attempts, err)
 		})
 	}
 }

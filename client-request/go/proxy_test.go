@@ -209,34 +209,50 @@ func TestGetScattersAcrossReplicas(t *testing.T) {
 }
 
 func TestGetRetriesOnlyTransientAnswers(t *testing.T) {
+	expectBackend := func(status int, hits int32) func(t *testing.T, hits int32, err error) {
+		return func(t *testing.T, got int32, err error) {
+			assert := assert.New(t)
+			var backendErr *BackendError
+			assert.ErrorAs(err, &backendErr)
+			assert.Equal(status, backendErr.StatusCode)
+			assert.Equal(hits, got)
+		}
+	}
+	expectProxy := func(status int, hits int32) func(t *testing.T, hits int32, err error) {
+		return func(t *testing.T, got int32, err error) {
+			assert := assert.New(t)
+			var proxyErr *ProxyError
+			assert.ErrorAs(err, &proxyErr)
+			assert.Equal(status, proxyErr.StatusCode)
+			assert.Equal(hits, got)
+		}
+	}
 	tests := []struct {
-		name         string
-		status       int
-		errorType    string
-		maxRetries   uint8
-		expectedHits int32
+		name       string
+		status     int
+		errorType  string
+		maxRetries uint8
+		expect     func(t *testing.T, hits int32, err error)
 	}{
-		{"503 backend", http.StatusServiceUnavailable, "backend", 2, 3},
-		{"503 proxy", http.StatusServiceUnavailable, "proxy", 2, 3},
-		{"500 backend", http.StatusInternalServerError, "backend", 1, 2},
-		{"500 proxy", http.StatusInternalServerError, "proxy", 1, 2},
-		{"408 backend", http.StatusRequestTimeout, "backend", 1, 2},
-		{"408 proxy", http.StatusRequestTimeout, "proxy", 1, 2},
-		{"429 backend", http.StatusTooManyRequests, "backend", 3, 4},
-		{"429 proxy", http.StatusTooManyRequests, "proxy", 3, 4},
-		{"429 proxy without retries", http.StatusTooManyRequests, "proxy", 0, 1},
-		{"401 backend", http.StatusUnauthorized, "backend", 3, 1},
-		{"401 proxy", http.StatusUnauthorized, "proxy", 3, 1},
-		{"403 backend", http.StatusForbidden, "backend", 3, 1},
-		{"403 proxy", http.StatusForbidden, "proxy", 3, 1},
-		{"404 backend", http.StatusNotFound, "backend", 3, 1},
-		{"404 proxy", http.StatusNotFound, "proxy", 3, 1},
+		{"503 backend", http.StatusServiceUnavailable, "backend", 2, expectBackend(http.StatusServiceUnavailable, 3)},
+		{"503 proxy", http.StatusServiceUnavailable, "proxy", 2, expectProxy(http.StatusServiceUnavailable, 3)},
+		{"500 backend", http.StatusInternalServerError, "backend", 1, expectBackend(http.StatusInternalServerError, 2)},
+		{"500 proxy", http.StatusInternalServerError, "proxy", 1, expectProxy(http.StatusInternalServerError, 2)},
+		{"408 backend", http.StatusRequestTimeout, "backend", 1, expectBackend(http.StatusRequestTimeout, 2)},
+		{"408 proxy", http.StatusRequestTimeout, "proxy", 1, expectProxy(http.StatusRequestTimeout, 2)},
+		{"429 backend", http.StatusTooManyRequests, "backend", 3, expectBackend(http.StatusTooManyRequests, 4)},
+		{"429 proxy", http.StatusTooManyRequests, "proxy", 3, expectProxy(http.StatusTooManyRequests, 4)},
+		{"429 proxy without retries", http.StatusTooManyRequests, "proxy", 0, expectProxy(http.StatusTooManyRequests, 1)},
+		{"401 backend", http.StatusUnauthorized, "backend", 3, expectBackend(http.StatusUnauthorized, 1)},
+		{"401 proxy", http.StatusUnauthorized, "proxy", 3, expectProxy(http.StatusUnauthorized, 1)},
+		{"403 backend", http.StatusForbidden, "backend", 3, expectBackend(http.StatusForbidden, 1)},
+		{"403 proxy", http.StatusForbidden, "proxy", 3, expectProxy(http.StatusForbidden, 1)},
+		{"404 backend", http.StatusNotFound, "backend", 3, expectBackend(http.StatusNotFound, 1)},
+		{"404 proxy", http.StatusNotFound, "proxy", 3, expectProxy(http.StatusNotFound, 1)},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			assert := assert.New(t)
-
 			var hits atomic.Int32
 			proxyPort := setupMockSeedPeerProxy(t, func(w http.ResponseWriter, r *http.Request) {
 				hits.Add(1)
@@ -248,21 +264,11 @@ func TestGetRetriesOnlyTransientAnswers(t *testing.T) {
 
 			exponential := &backoff.ExponentialBackOff{InitialInterval: time.Millisecond, RandomizationFactor: 0.5, Multiplier: 2, MaxInterval: 2 * time.Millisecond}
 			proxy, err := New(context.Background(), endpoint, WithProxyMaxRetries(tc.maxRetries), WithProxyBackoff(exponential))
-			assert.NoError(err)
+			assert.NoError(t, err)
 			defer proxy.Close()
 
 			_, err = proxy.Get(context.Background(), NewGetRequest("http://example.com/file.txt", WithGetRequestReplicas(1)))
-			var backendErr *BackendError
-			var proxyErr *ProxyError
-			switch tc.errorType {
-			case "backend":
-				assert.ErrorAs(err, &backendErr)
-				assert.Equal(tc.status, backendErr.StatusCode)
-			case "proxy":
-				assert.ErrorAs(err, &proxyErr)
-				assert.Equal(tc.status, proxyErr.StatusCode)
-			}
-			assert.Equal(tc.expectedHits, hits.Load())
+			tc.expect(t, hits.Load(), err)
 		})
 	}
 }

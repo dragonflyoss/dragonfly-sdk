@@ -2514,15 +2514,10 @@ mod tests {
             };
 
             let err = proxy.get(&request).await.err().unwrap();
-            let got = match &err {
-                Error::BackendError(BackendError { status_code, .. })
-                | Error::ProxyError(ProxyError { status_code, .. }) => *status_code,
-                other => panic!("status: {status}, unexpected error: {other:?}"),
-            };
-            assert_eq!(
-                got,
-                Some(status),
-                "status: {status}, error_type: {error_type}"
+            assert!(
+                err.to_string()
+                    .contains(&format!("status_code: Some({status:?})")),
+                "status: {status}, error_type: {error_type}, error: {err}"
             );
             assert_eq!(
                 mock_proxy
@@ -2684,15 +2679,10 @@ mod tests {
             };
 
             let err = proxy.get(&request).await.err().unwrap();
-            let got = match &err {
-                Error::BackendError(BackendError { status_code, .. })
-                | Error::ProxyError(ProxyError { status_code, .. }) => *status_code,
-                other => panic!("status: {status}, unexpected error: {other:?}"),
-            };
-            assert_eq!(
-                got,
-                Some(status),
-                "status: {status}, error_type: {error_type}"
+            assert!(
+                err.to_string()
+                    .contains(&format!("status_code: Some({status:?})")),
+                "status: {status}, error_type: {error_type}, error: {err}"
             );
             assert_eq!(
                 mock_proxy

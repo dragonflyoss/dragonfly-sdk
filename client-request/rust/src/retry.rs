@@ -124,9 +124,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
 
-    /// The scripted failures of the attempts, the attempts after them succeeding.
-    type Failures = Vec<fn() -> Error>;
+    type ExpectElapsed = fn(Duration);
+    type ExpectAttempts = fn(usize, Result<()>);
+    type ExpectEndpoints = fn(&[String], Result<()>);
 
     fn internal() -> Error {
         Error::Internal("boom".to_string())
@@ -185,35 +187,36 @@ mod tests {
     #[tokio::test]
     async fn retries_wait_the_backoff_delays() {
         let delay = Duration::from_millis(20);
-        let test_cases = vec![
-            (None, 2, Duration::ZERO, delay),
+        let test_cases: Vec<(Option<ExponentialBuilder>, ExpectElapsed)> = vec![
+            (None, |elapsed| {
+                assert!(elapsed < Duration::from_millis(20), "elapsed: {elapsed:?}");
+            }),
             (
                 Some(
                     ExponentialBuilder::new()
                         .with_min_delay(delay)
                         .with_max_delay(delay * 2),
                 ),
-                2,
-                delay * 3,
-                delay * 6,
+                |elapsed| {
+                    assert!(
+                        (Duration::from_millis(60)..Duration::from_millis(120)).contains(&elapsed),
+                        "elapsed: {elapsed:?}"
+                    );
+                },
             ),
         ];
 
-        for (backoff, max_retries, at_least, at_most) in test_cases {
+        for (backoff, expect) in test_cases {
             let policy = RetryPolicy {
-                max_retries,
+                max_retries: 2,
                 backoff,
             };
             let endpoints = vec!["a".to_string()];
 
             let start = tokio::time::Instant::now();
             let result: Result<()> = retry(policy, || async { Err(internal()) }).await;
-            let elapsed = start.elapsed();
             assert!(result.is_err(), "policy: {policy:?}");
-            assert!(
-                (at_least..at_most).contains(&elapsed),
-                "policy: {policy:?}, elapsed: {elapsed:?}"
-            );
+            expect(start.elapsed());
 
             let start = tokio::time::Instant::now();
             let ((), result) =
@@ -221,112 +224,128 @@ mod tests {
                     ((), Err::<(), _>(internal()))
                 })
                 .await;
-            let elapsed = start.elapsed();
             assert!(result.is_err(), "policy: {policy:?}");
-            assert!(
-                (at_least..at_most).contains(&elapsed),
-                "policy: {policy:?}, elapsed: {elapsed:?}"
-            );
+            expect(start.elapsed());
         }
     }
 
     #[tokio::test]
     async fn retry_stops_on_success_definitive_failure_or_exhausted_retries() {
-        let test_cases: Vec<(u8, Failures, usize, bool)> = vec![
-            (3, vec![], 1, true),
-            (3, vec![internal, internal], 3, true),
-            (3, vec![invalid_argument], 1, false),
-            (2, vec![internal, internal, internal], 3, false),
-            (0, vec![internal], 1, false),
+        let test_cases: Vec<(u8, Vec<Error>, ExpectAttempts)> = vec![
+            (3, vec![], |attempts, result| {
+                assert!(result.is_ok(), "result: {result:?}");
+                assert_eq!(attempts, 1);
+            }),
+            (3, vec![internal(), internal()], |attempts, result| {
+                assert!(result.is_ok(), "result: {result:?}");
+                assert_eq!(attempts, 3);
+            }),
+            (3, vec![invalid_argument()], |attempts, result| {
+                assert!(matches!(result, Err(Error::InvalidArgument(_))));
+                assert_eq!(attempts, 1);
+            }),
+            (
+                2,
+                vec![internal(), internal(), internal()],
+                |attempts, result| {
+                    assert!(matches!(result, Err(Error::Internal(_))));
+                    assert_eq!(attempts, 3);
+                },
+            ),
+            (0, vec![internal()], |attempts, result| {
+                assert!(matches!(result, Err(Error::Internal(_))));
+                assert_eq!(attempts, 1);
+            }),
         ];
 
-        for (max_retries, failures, expected_attempts, expected_ok) in test_cases {
-            let mut failures = failures.into_iter();
+        for (max_retries, failures, expect) in test_cases {
+            let mut failures = VecDeque::from(failures);
             let mut attempts = 0usize;
             let result = retry(policy(max_retries), || {
                 attempts += 1;
-                let failure = failures.next();
-                async move { failure.map_or(Ok(()), |failure| Err(failure())) }
+                let failure = failures.pop_front();
+                async move { failure.map_or(Ok(()), Err) }
             })
             .await;
-
-            assert_eq!(
-                result.is_ok(),
-                expected_ok,
-                "max_retries: {max_retries}, result: {result:?}"
-            );
-            assert_eq!(attempts, expected_attempts, "max_retries: {max_retries}");
+            expect(attempts, result);
         }
     }
 
     #[tokio::test]
     async fn retry_with_endpoints_rotates_the_endpoints_and_stops_like_retry() {
-        let test_cases: Vec<(Vec<&str>, u8, Failures, usize, bool)> = vec![
-            (vec![], 3, vec![], 0, false),
-            (vec!["a"], 3, vec![], 1, true),
-            (vec!["a", "b"], 3, vec![internal, internal], 3, true),
+        let test_cases: Vec<(Vec<&str>, u8, Vec<Error>, ExpectEndpoints)> = vec![
+            (vec![], 3, vec![], |attempts, result| {
+                assert!(matches!(result, Err(Error::InvalidArgument(_))));
+                assert!(attempts.is_empty());
+            }),
+            (vec!["a"], 3, vec![], |attempts, result| {
+                assert!(result.is_ok(), "result: {result:?}");
+                assert_eq!(attempts, ["a"]);
+            }),
+            (
+                vec!["a", "b"],
+                3,
+                vec![internal(), internal()],
+                |attempts, result| {
+                    assert!(result.is_ok(), "result: {result:?}");
+                    assert_eq!(attempts.len(), 3);
+                    assert_ne!(attempts[0], attempts[1]);
+                    assert_eq!(attempts[0], attempts[2]);
+                },
+            ),
             (
                 vec!["a", "b", "c"],
                 3,
-                vec![internal, internal, internal],
-                4,
-                true,
+                vec![internal(), internal(), internal()],
+                |attempts, result| {
+                    assert!(result.is_ok(), "result: {result:?}");
+                    assert_eq!(attempts.len(), 4);
+                    let mut first: Vec<&str> = attempts[..3].iter().map(String::as_str).collect();
+                    first.sort_unstable();
+                    assert_eq!(first, ["a", "b", "c"]);
+                    assert_eq!(attempts[0], attempts[3]);
+                },
             ),
-            (vec!["a"], 3, vec![invalid_argument], 1, false),
+            (
+                vec!["a"],
+                3,
+                vec![invalid_argument()],
+                |attempts, result| {
+                    assert!(matches!(result, Err(Error::InvalidArgument(_))));
+                    assert_eq!(attempts.len(), 1);
+                },
+            ),
             (
                 vec!["a", "b"],
                 2,
-                vec![internal, internal, internal],
-                3,
-                false,
+                vec![internal(), internal(), internal()],
+                |attempts, result| {
+                    assert!(matches!(result, Err(Error::Internal(_))));
+                    assert_eq!(attempts.len(), 3);
+                    assert_ne!(attempts[0], attempts[1]);
+                    assert_eq!(attempts[0], attempts[2]);
+                },
             ),
         ];
 
-        for (endpoints, max_retries, failures, expected_attempts, expected_ok) in test_cases {
+        for (endpoints, max_retries, failures, expect) in test_cases {
             let endpoints: Vec<String> = endpoints
                 .iter()
                 .map(|endpoint| endpoint.to_string())
                 .collect();
-            let mut failures = failures.into_iter();
+            let mut failures = VecDeque::from(failures);
             let (attempts, result) = retry_with_endpoints(
                 policy(max_retries),
                 &endpoints,
                 Vec::new(),
                 |mut attempts: Vec<String>, endpoint| {
                     attempts.push(endpoint);
-                    let failure = failures.next();
-                    async move { (attempts, failure.map_or(Ok(()), |failure| Err(failure()))) }
+                    let failure = failures.pop_front();
+                    async move { (attempts, failure.map_or(Ok(()), Err)) }
                 },
             )
             .await;
-
-            assert_eq!(
-                result.is_ok(),
-                expected_ok,
-                "endpoints: {endpoints:?}, result: {result:?}"
-            );
-            assert_eq!(
-                attempts.len(),
-                expected_attempts,
-                "endpoints: {endpoints:?}"
-            );
-
-            let distinct = attempts.len().min(endpoints.len());
-            let mut first: Vec<&String> = attempts.iter().take(distinct).collect();
-            first.sort();
-            first.dedup();
-            assert_eq!(
-                first.len(),
-                distinct,
-                "endpoints: {endpoints:?}, attempts: {attempts:?}"
-            );
-            for (i, attempt) in attempts.iter().enumerate().skip(endpoints.len()) {
-                assert_eq!(
-                    *attempt,
-                    attempts[i - endpoints.len()],
-                    "endpoints: {endpoints:?}, attempts: {attempts:?}"
-                );
-            }
+            expect(&attempts, result);
         }
     }
 }

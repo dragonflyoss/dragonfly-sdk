@@ -27,53 +27,55 @@ import (
 )
 
 func TestIsRetryable(t *testing.T) {
+	retryable := func(t *testing.T, retryable bool) { assert.True(t, retryable) }
+	definitive := func(t *testing.T, retryable bool) { assert.False(t, retryable) }
 	tests := []struct {
-		name     string
-		err      error
-		expected bool
+		name   string
+		err    error
+		expect func(t *testing.T, retryable bool)
 	}{
-		{"request timeout", fmt.Errorf("%w: deadline", ErrRequestTimeout), true},
-		{"internal", fmt.Errorf("%w: boom", ErrInternal), true},
-		{"dfdaemon error", &DfdaemonError{}, true},
-		{"backend 500", &BackendError{StatusCode: http.StatusInternalServerError}, true},
-		{"backend 502", &BackendError{StatusCode: http.StatusBadGateway}, true},
-		{"backend 503", &BackendError{StatusCode: http.StatusServiceUnavailable}, true},
-		{"backend 408", &BackendError{StatusCode: http.StatusRequestTimeout}, true},
-		{"backend 429", &BackendError{StatusCode: http.StatusTooManyRequests}, true},
-		{"proxy 500", &ProxyError{StatusCode: http.StatusInternalServerError}, true},
-		{"proxy 502", &ProxyError{StatusCode: http.StatusBadGateway}, true},
-		{"proxy 503", &ProxyError{StatusCode: http.StatusServiceUnavailable}, true},
-		{"proxy 408", &ProxyError{StatusCode: http.StatusRequestTimeout}, true},
-		{"proxy 429", &ProxyError{StatusCode: http.StatusTooManyRequests}, true},
-		{"wrapped proxy 429", fmt.Errorf("wrapped: %w", &ProxyError{StatusCode: http.StatusTooManyRequests}), true},
-		{"backend 400", &BackendError{StatusCode: http.StatusBadRequest}, false},
-		{"backend 401", &BackendError{StatusCode: http.StatusUnauthorized}, false},
-		{"backend 403", &BackendError{StatusCode: http.StatusForbidden}, false},
-		{"backend 404", &BackendError{StatusCode: http.StatusNotFound}, false},
-		{"backend 416", &BackendError{StatusCode: http.StatusRequestedRangeNotSatisfiable}, false},
-		{"proxy 400", &ProxyError{StatusCode: http.StatusBadRequest}, false},
-		{"proxy 401", &ProxyError{StatusCode: http.StatusUnauthorized}, false},
-		{"proxy 403", &ProxyError{StatusCode: http.StatusForbidden}, false},
-		{"proxy 404", &ProxyError{StatusCode: http.StatusNotFound}, false},
-		{"proxy 416", &ProxyError{StatusCode: http.StatusRequestedRangeNotSatisfiable}, false},
-		{"grpc internal", status.Error(codes.Internal, "boom"), true},
-		{"grpc unavailable", status.Error(codes.Unavailable, "boom"), true},
-		{"grpc unknown", status.Error(codes.Unknown, "boom"), true},
-		{"grpc aborted", status.Error(codes.Aborted, "boom"), true},
-		{"grpc deadline exceeded", status.Error(codes.DeadlineExceeded, "boom"), true},
-		{"wrapped grpc internal", fmt.Errorf("%w: failed to download task: %w", ErrInternal, status.Error(codes.Internal, "boom")), true},
-		{"grpc invalid argument", status.Error(codes.InvalidArgument, "no"), false},
-		{"grpc not found", status.Error(codes.NotFound, "no"), false},
-		{"grpc permission denied", status.Error(codes.PermissionDenied, "no"), false},
-		{"grpc unauthenticated", status.Error(codes.Unauthenticated, "no"), false},
-		{"grpc resource exhausted", status.Error(codes.ResourceExhausted, "no"), false},
-		{"wrapped grpc not found", fmt.Errorf("%w: failed to download task: %w", ErrInternal, status.Error(codes.NotFound, "no")), false},
-		{"invalid argument", fmt.Errorf("%w: bad", ErrInvalidArgument), false},
+		{"request timeout", fmt.Errorf("%w: deadline", ErrRequestTimeout), retryable},
+		{"internal", fmt.Errorf("%w: boom", ErrInternal), retryable},
+		{"dfdaemon error", &DfdaemonError{}, retryable},
+		{"backend 500", &BackendError{StatusCode: http.StatusInternalServerError}, retryable},
+		{"backend 502", &BackendError{StatusCode: http.StatusBadGateway}, retryable},
+		{"backend 503", &BackendError{StatusCode: http.StatusServiceUnavailable}, retryable},
+		{"backend 408", &BackendError{StatusCode: http.StatusRequestTimeout}, retryable},
+		{"backend 429", &BackendError{StatusCode: http.StatusTooManyRequests}, retryable},
+		{"proxy 500", &ProxyError{StatusCode: http.StatusInternalServerError}, retryable},
+		{"proxy 502", &ProxyError{StatusCode: http.StatusBadGateway}, retryable},
+		{"proxy 503", &ProxyError{StatusCode: http.StatusServiceUnavailable}, retryable},
+		{"proxy 408", &ProxyError{StatusCode: http.StatusRequestTimeout}, retryable},
+		{"proxy 429", &ProxyError{StatusCode: http.StatusTooManyRequests}, retryable},
+		{"wrapped proxy 429", fmt.Errorf("wrapped: %w", &ProxyError{StatusCode: http.StatusTooManyRequests}), retryable},
+		{"backend 400", &BackendError{StatusCode: http.StatusBadRequest}, definitive},
+		{"backend 401", &BackendError{StatusCode: http.StatusUnauthorized}, definitive},
+		{"backend 403", &BackendError{StatusCode: http.StatusForbidden}, definitive},
+		{"backend 404", &BackendError{StatusCode: http.StatusNotFound}, definitive},
+		{"backend 416", &BackendError{StatusCode: http.StatusRequestedRangeNotSatisfiable}, definitive},
+		{"proxy 400", &ProxyError{StatusCode: http.StatusBadRequest}, definitive},
+		{"proxy 401", &ProxyError{StatusCode: http.StatusUnauthorized}, definitive},
+		{"proxy 403", &ProxyError{StatusCode: http.StatusForbidden}, definitive},
+		{"proxy 404", &ProxyError{StatusCode: http.StatusNotFound}, definitive},
+		{"proxy 416", &ProxyError{StatusCode: http.StatusRequestedRangeNotSatisfiable}, definitive},
+		{"grpc internal", status.Error(codes.Internal, "boom"), retryable},
+		{"grpc unavailable", status.Error(codes.Unavailable, "boom"), retryable},
+		{"grpc unknown", status.Error(codes.Unknown, "boom"), retryable},
+		{"grpc aborted", status.Error(codes.Aborted, "boom"), retryable},
+		{"grpc deadline exceeded", status.Error(codes.DeadlineExceeded, "boom"), retryable},
+		{"wrapped grpc internal", fmt.Errorf("%w: failed to download task: %w", ErrInternal, status.Error(codes.Internal, "boom")), retryable},
+		{"grpc invalid argument", status.Error(codes.InvalidArgument, "no"), definitive},
+		{"grpc not found", status.Error(codes.NotFound, "no"), definitive},
+		{"grpc permission denied", status.Error(codes.PermissionDenied, "no"), definitive},
+		{"grpc unauthenticated", status.Error(codes.Unauthenticated, "no"), definitive},
+		{"grpc resource exhausted", status.Error(codes.ResourceExhausted, "no"), definitive},
+		{"wrapped grpc not found", fmt.Errorf("%w: failed to download task: %w", ErrInternal, status.Error(codes.NotFound, "no")), definitive},
+		{"invalid argument", fmt.Errorf("%w: bad", ErrInvalidArgument), definitive},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.expected, isRetryable(tc.err))
+			tc.expect(t, isRetryable(tc.err))
 		})
 	}
 }

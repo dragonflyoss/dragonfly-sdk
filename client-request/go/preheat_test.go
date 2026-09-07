@@ -116,23 +116,29 @@ func TestPreheatRetriesOnTheSameSeedPeer(t *testing.T) {
 }
 
 func TestPreheatRetriesOnlyTransientDownloadFailures(t *testing.T) {
+	expectCode := func(code codes.Code, hits int32) func(t *testing.T, hits int32, err error) {
+		return func(t *testing.T, got int32, err error) {
+			assert := assert.New(t)
+			assert.Equal(code, status.Code(err))
+			assert.Equal(hits, got)
+		}
+	}
 	tests := []struct {
-		code         codes.Code
-		maxRetries   uint8
-		expectedHits int32
+		name       string
+		code       codes.Code
+		maxRetries uint8
+		expect     func(t *testing.T, hits int32, err error)
 	}{
-		{codes.Internal, 1, 2},
-		{codes.Unavailable, 2, 3},
-		{codes.DeadlineExceeded, 1, 2},
-		{codes.NotFound, 3, 1},
-		{codes.PermissionDenied, 3, 1},
-		{codes.InvalidArgument, 3, 1},
+		{"internal", codes.Internal, 1, expectCode(codes.Internal, 2)},
+		{"unavailable", codes.Unavailable, 2, expectCode(codes.Unavailable, 3)},
+		{"deadline exceeded", codes.DeadlineExceeded, 1, expectCode(codes.DeadlineExceeded, 2)},
+		{"not found", codes.NotFound, 3, expectCode(codes.NotFound, 1)},
+		{"permission denied", codes.PermissionDenied, 3, expectCode(codes.PermissionDenied, 1)},
+		{"invalid argument", codes.InvalidArgument, 3, expectCode(codes.InvalidArgument, 1)},
 	}
 
 	for _, tc := range tests {
-		t.Run(tc.code.String(), func(t *testing.T) {
-			assert := assert.New(t)
-
+		t.Run(tc.name, func(t *testing.T) {
 			var hits atomic.Int32
 			port := setupMockSeedPeerServer(t, &mockSeedPeer{
 				downloadErr: status.Error(tc.code, "download failed"),
@@ -142,12 +148,11 @@ func TestPreheatRetriesOnlyTransientDownloadFailures(t *testing.T) {
 
 			exponential := &backoff.ExponentialBackOff{InitialInterval: time.Millisecond, Multiplier: 2, MaxInterval: 2 * time.Millisecond}
 			proxy, err := New(context.Background(), endpoint, WithProxyMaxRetries(tc.maxRetries), WithProxyBackoff(exponential))
-			assert.NoError(err)
+			assert.NoError(t, err)
 			defer proxy.Close()
 
 			err = proxy.Preheat(context.Background(), NewPreheatRequest("http://example.com/payload.txt", WithPreheatRequestReplicas(1)))
-			assert.Equal(tc.code, status.Code(err))
-			assert.Equal(tc.expectedHits, hits.Load())
+			tc.expect(t, hits.Load(), err)
 		})
 	}
 }

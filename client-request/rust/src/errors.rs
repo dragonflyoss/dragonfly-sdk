@@ -153,9 +153,6 @@ mod tests {
     use super::*;
     use reqwest::StatusCode;
 
-    /// The check of the error a status converts into.
-    type Expected = fn(&Error) -> bool;
-
     fn proxy(status_code: Option<StatusCode>) -> Error {
         Error::ProxyError(ProxyError {
             message: None,
@@ -218,108 +215,90 @@ mod tests {
 
     #[test]
     fn from_status_keeps_the_backend_status_and_retryability() {
-        let backend_details = |status_code: Option<i32>| {
-            serde_json::to_vec(&Backend {
-                message: "origin said no".to_string(),
-                header: HashMap::from([("x-served-by".to_string(), "origin".to_string())]),
-                status_code,
-            })
-            .unwrap()
-            .into()
+        let backend_status = |status_code: Option<i32>| {
+            tonic::Status::with_details(
+                Code::Internal,
+                "backend error",
+                serde_json::to_vec(&Backend {
+                    message: "origin said no".to_string(),
+                    header: HashMap::from([("x-served-by".to_string(), "origin".to_string())]),
+                    status_code,
+                })
+                .unwrap()
+                .into(),
+            )
         };
-        let test_cases: Vec<(tonic::Status, Expected, bool)> = vec![
-            (
-                tonic::Status::with_details(
-                    Code::Internal,
-                    "backend error",
-                    backend_details(Some(404)),
-                ),
-                |err| {
-                    matches!(
-                        err,
-                        Error::BackendError(BackendError {
-                            message: Some(message),
-                            header,
-                            status_code: Some(StatusCode::NOT_FOUND),
-                        }) if message == "origin said no" && header["x-served-by"] == "origin"
-                    )
-                },
-                false,
-            ),
-            (
-                tonic::Status::with_details(
-                    Code::Internal,
-                    "backend error",
-                    backend_details(Some(503)),
-                ),
-                |err| {
-                    matches!(
-                        err,
-                        Error::BackendError(BackendError {
-                            status_code: Some(StatusCode::SERVICE_UNAVAILABLE),
-                            ..
-                        })
-                    )
-                },
-                true,
-            ),
-            (
-                tonic::Status::with_details(Code::Internal, "backend error", backend_details(None)),
-                |err| {
-                    matches!(
-                        err,
-                        Error::BackendError(BackendError {
-                            status_code: None,
-                            ..
-                        })
-                    )
-                },
-                true,
-            ),
-            (
-                tonic::Status::with_details(
-                    Code::Internal,
-                    "backend error",
-                    backend_details(Some(99999)),
-                ),
-                |err| {
-                    matches!(
-                        err,
-                        Error::BackendError(BackendError {
-                            status_code: None,
-                            ..
-                        })
-                    )
-                },
-                true,
-            ),
+        let test_cases: Vec<(tonic::Status, fn(Error))> = vec![
+            (backend_status(Some(404)), |err| {
+                assert!(matches!(
+                    &err,
+                    Error::BackendError(BackendError {
+                        message: Some(message),
+                        header,
+                        status_code: Some(StatusCode::NOT_FOUND),
+                    }) if message == "origin said no" && header["x-served-by"] == "origin"
+                ));
+                assert!(!err.is_retryable());
+            }),
+            (backend_status(Some(503)), |err| {
+                assert!(matches!(
+                    err,
+                    Error::BackendError(BackendError {
+                        status_code: Some(StatusCode::SERVICE_UNAVAILABLE),
+                        ..
+                    })
+                ));
+                assert!(err.is_retryable());
+            }),
+            (backend_status(None), |err| {
+                assert!(matches!(
+                    err,
+                    Error::BackendError(BackendError {
+                        status_code: None,
+                        ..
+                    })
+                ));
+                assert!(err.is_retryable());
+            }),
+            (backend_status(Some(99999)), |err| {
+                assert!(matches!(
+                    err,
+                    Error::BackendError(BackendError {
+                        status_code: None,
+                        ..
+                    })
+                ));
+                assert!(err.is_retryable());
+            }),
             (
                 tonic::Status::with_details(Code::Internal, "not json", b"{".to_vec().into()),
-                |err| matches!(err, Error::TonicStatus(status) if status.code() == Code::Internal),
-                true,
+                |err| {
+                    assert!(
+                        matches!(&err, Error::TonicStatus(status) if status.code() == Code::Internal)
+                    );
+                    assert!(err.is_retryable());
+                },
             ),
-            (
-                tonic::Status::deadline_exceeded("too slow"),
-                |err| matches!(err, Error::RequestTimeout(_)),
-                true,
-            ),
-            (
-                tonic::Status::internal("storage is full"),
-                |err| matches!(err, Error::TonicStatus(status) if status.code() == Code::Internal),
-                true,
-            ),
-            (
-                tonic::Status::not_found("no task"),
-                |err| matches!(err, Error::TonicStatus(status) if status.code() == Code::NotFound),
-                false,
-            ),
+            (tonic::Status::deadline_exceeded("too slow"), |err| {
+                assert!(matches!(err, Error::RequestTimeout(_)));
+                assert!(err.is_retryable());
+            }),
+            (tonic::Status::internal("storage is full"), |err| {
+                assert!(
+                    matches!(&err, Error::TonicStatus(status) if status.code() == Code::Internal)
+                );
+                assert!(err.is_retryable());
+            }),
+            (tonic::Status::not_found("no task"), |err| {
+                assert!(
+                    matches!(&err, Error::TonicStatus(status) if status.code() == Code::NotFound)
+                );
+                assert!(!err.is_retryable());
+            }),
         ];
 
-        for (status, expected, expected_retryable) in test_cases {
-            let message = status.message().to_string();
-            let err = Error::from_status(status);
-            assert!(expected(&err), "status: {message}, error: {err:?}");
-            assert_eq!(err.is_retryable(), expected_retryable, "status: {message}");
+        for (status, expect) in test_cases {
+            expect(Error::from_status(status));
         }
     }
 }
