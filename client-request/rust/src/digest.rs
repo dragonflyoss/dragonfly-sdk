@@ -27,7 +27,7 @@ use std::sync::LazyLock;
 /// The separator character for digest formatting.
 pub const SEPARATOR: &str = ":";
 
-/// Regex pattern for OCI blob URLs, e.g. http(s)://<registry>/v2/<repository>/blobs/<digest>.
+/// Regex pattern for OCI blob URLs, e.g. `http(s)://<registry>/v2/<repository>/blobs/<digest>`.
 static BLOB_URL_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(.*)://(.*)/v2/(.*)/blobs/([^?]+)(?:\?.*)?$").unwrap());
 
@@ -36,7 +36,7 @@ pub fn is_blob_url(url: &str) -> bool {
     BLOB_URL_REGEX.is_match(url)
 }
 
-/// Regex pattern for OCI manifest URLs, e.g. http(s)://<registry>/v2/<repository>/manifests/<reference>.
+/// Regex pattern for OCI manifest URLs, e.g. `http(s)://<registry>/v2/<repository>/manifests/<reference>`.
 static MANIFEST_URL_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(.*)://(.*)/v2/(.*)/manifests/([^?]+)(?:\?.*)?$").unwrap());
 
@@ -103,7 +103,7 @@ impl Digest {
         Self { algorithm, encoded }
     }
 
-    /// Extracts the digest from an OCI blob URL, e.g. http(s)://<registry>/v2/<repository>/blobs/<digest>.
+    /// Extracts the digest from an OCI blob URL, e.g. `http(s)://<registry>/v2/<repository>/blobs/<digest>`.
     pub fn extract_from_blob_url(url: &str) -> Option<Self> {
         BLOB_URL_REGEX
             .captures(url)
@@ -113,7 +113,7 @@ impl Digest {
             .ok()
     }
 
-    /// Extracts the digest from an OCI manifest URL, e.g. http(s)://<registry>/v2/<repository>/manifests/<digest>.
+    /// Extracts the digest from an OCI manifest URL, e.g. `http(s)://<registry>/v2/<repository>/manifests/<digest>`.
     pub fn extract_from_manifest_url(url: &str) -> Option<Self> {
         MANIFEST_URL_REGEX
             .captures(url)

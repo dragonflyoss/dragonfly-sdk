@@ -14,6 +14,24 @@
  * limitations under the License.
  */
 
+//! Retries of a request across the seed peers serving it.
+//!
+//! A request makes at most `1 + max_retries` attempts. The endpoints are shuffled
+//! once, then every attempt targets the next one, wrapping around when there are
+//! fewer endpoints than attempts:
+//!
+//! ```text
+//! endpoints [B, A]                  max_retries 3
+//!
+//! attempt 1 ──▶ B ──▶ 503 transient  ── sleep(delay 1)
+//! attempt 2 ──▶ A ──▶ timeout        ── sleep(delay 2)
+//! attempt 3 ──▶ B ──▶ 404 definitive ──▶ Err(404)
+//! ```
+//!
+//! [`Error::is_retryable`] decides what is transient, [`RetryPolicy::delays`] how
+//! long each retry waits. [`retry`] runs the same loop against one fixed target
+//! and serves the preheat of a single seed peer.
+
 use crate::errors::Error;
 use crate::Result;
 use backon::{Backoff, BackoffBuilder, ExponentialBuilder, Retryable, RetryableWithContext};
@@ -21,20 +39,28 @@ use rand::seq::SliceRandom;
 use std::future::Future;
 use std::time::Duration;
 
-/// The retry policy of the requests of a client.
+/// The retry policy of a client: how often a request is retried and how long
+/// each retry waits.
+///
+/// | Field         | Default | Meaning                                                     |
+/// |---------------|---------|-------------------------------------------------------------|
+/// | `max_retries` | `1`     | retries after the first attempt, each on the next seed peer |
+/// | `backoff`     | `None`  | exponential delay before each retry, `None` retries at once |
+///
+/// The backoff's own `max_times` is ignored in favor of `max_retries`, so the
+/// two knobs cannot disagree.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RetryPolicy {
-    /// The maximum number of retries of a request on a transient failure, each sent
-    /// to the next seed peer.
+    /// The retries after the first attempt, each on the next seed peer.
     pub(crate) max_retries: u8,
 
-    /// The exponential backoff between the retries, none retrying at once.
+    /// The exponential delay before each retry, `None` retrying at once.
     pub(crate) backoff: Option<ExponentialBuilder>,
 }
 
 /// Implements Default trait.
 impl Default for RetryPolicy {
-    /// Returns a policy retrying once at once.
+    /// Returns the default policy: one retry, at once.
     fn default() -> Self {
         Self {
             max_retries: 1,
@@ -45,8 +71,8 @@ impl Default for RetryPolicy {
 
 /// Implements the retry policy.
 impl RetryPolicy {
-    /// Returns the delays before each of the `max_retries` retries: the exponential
-    /// sequence of the backoff, or zero delays when no backoff is set.
+    /// Returns the delay before each retry, `max_retries` of them: the backoff's
+    /// exponential sequence when set, otherwise zero delays.
     fn delays(&self) -> Box<dyn Backoff> {
         match self.backoff {
             Some(backoff) => Box::new(backoff.with_max_times(self.max_retries as usize).build()),
@@ -66,8 +92,18 @@ async fn sleep(delay: Duration) {
     }
 }
 
-/// Retries a failure the policy deems transient up to its max retries after the
-/// backoff delay. A definitive failure returns at once.
+/// Runs `attempt` until it succeeds, fails definitively, or has been retried
+/// `max_retries` times, that is at most `1 + max_retries` attempts in total.
+///
+/// ```text
+/// attempt ──Ok(v)─────────────────────────────────────────▶ Ok(v)
+///    │
+///    └─Err(e)──▶ is_retryable(e)? ──no────────────────────▶ Err(e)
+///                      │ yes
+///                      └─▶ retried < max_retries? ──no────▶ Err(e)
+///                               │ yes
+///                               └─▶ retried += 1, sleep(delay) ──▶ attempt
+/// ```
 pub(crate) async fn retry<T, F, Fut>(policy: RetryPolicy, attempt: F) -> Result<T>
 where
     F: FnMut() -> Fut,
@@ -80,12 +116,13 @@ where
         .await
 }
 
-/// Scatters a request across the endpoints: each attempt targets the next endpoint
-/// of a shuffled order, wrapping around when the endpoints are fewer than the
-/// attempts, and a failure the policy deems transient is retried up to its max
-/// retries after the backoff delay. A definitive failure returns at once. The
-/// context is handed to every attempt and back to the caller, so a buffer can
-/// survive across attempts.
+/// Runs `attempt` like [`retry`], every attempt aimed at the next endpoint of a
+/// shuffled order, wrapping around when the endpoints run out before the
+/// retries do.
+///
+/// `ctx` is threaded through each attempt and handed back with the result, so
+/// state such as a partially filled buffer survives across attempts. Fails with
+/// [`Error::InvalidArgument`] when `endpoints` is empty.
 pub(crate) async fn retry_with_endpoints<Ctx, T, F, Fut>(
     policy: RetryPolicy,
     endpoints: &[String],

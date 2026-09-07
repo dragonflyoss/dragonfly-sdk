@@ -99,8 +99,8 @@ func (p *Proxy) Preheat(ctx context.Context, req *PreheatRequest) error {
 	}
 
 	// Trigger every replica seed peer to download the task concurrently and
-	// wait for the download tasks to finish. A transient failure on a seed peer
-	// is retried on that same seed peer, so the file lands on every replica.
+	// wait for the download tasks to finish. A transient failure is retried on
+	// the same seed peer, so the file lands on every replica.
 	g, ctx := errgroup.WithContext(ctx)
 	for _, peer := range seedPeers {
 		g.Go(func() error {
@@ -111,8 +111,9 @@ func (p *Proxy) Preheat(ctx context.Context, req *PreheatRequest) error {
 	return g.Wait()
 }
 
-// downloadTask triggers the seed peer to download the task, retrying a
-// transient failure up to the max retries. Each attempt runs under the timeout.
+// downloadTask has the seed peer download the task, retrying a transient
+// failure on the same seed peer so the file lands on every replica. Each
+// attempt runs under the timeout.
 func (p *Proxy) downloadTask(ctx context.Context, peer *commonv2.Host, id string, download *commonv2.Download, timeout time.Duration) error {
 	addr := net.JoinHostPort(peer.Ip, strconv.Itoa(int(peer.Port)))
 	conn, err := grpc.NewClient(
@@ -139,9 +140,9 @@ func (p *Proxy) downloadTask(ctx context.Context, peer *commonv2.Host, id string
 	return err
 }
 
-// downloadTask triggers the seed peer to download the task once and drains the
-// response stream, so it returns once the download finished. The status of a
-// failed call is kept in the error, so a definitive failure is not retried.
+// downloadTask has the seed peer download the task once and drains the
+// response stream, returning once the download finished. The gRPC status of a
+// failure stays in the error, so isRetryable can tell a definitive one apart.
 func downloadTask(ctx context.Context, client dfdaemonv2.DfdaemonUploadClient, id string, download *commonv2.Download) error {
 	stream, err := client.DownloadTask(ctx, &dfdaemonv2.DownloadTaskRequest{Download: download})
 	if err != nil {

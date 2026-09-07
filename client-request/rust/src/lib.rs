@@ -141,87 +141,76 @@ pub type Body = Box<dyn Stream<Item = Result<Bytes>> + Send + Unpin>;
 #[cfg(feature = "preheat")]
 type PlatformResolver = Box<dyn Fn(&[ImageIndexEntry]) -> Option<String> + Send + Sync>;
 
-/// Defines the interface for sending requests via the Dragonfly.
+/// The interface for sending requests via the Dragonfly.
 ///
-/// This trait enables interaction with remote servers through the Dragonfly, providing methods
-/// for performing GET requests with flexible response handling. It is designed for clients that
-/// need to communicate with Dragonfly seed client efficiently, supporting both streaming and buffered
-/// response processing. The trait shields the complex request logic between the client and the
-/// Dragonfly seed client's proxy, abstracting the underlying communication details to simplify
-/// client implementation and usage.
+/// A request is served by the seed peers the scheduler picks for its task, and a
+/// seed peer's dfdaemon fetches from the origin only what the P2P network does
+/// not hold yet:
+///
+/// ```text
+/// client ──lookup──▶ scheduler ──▶ seed peers [B, A]
+///   │
+///   └──GET──▶ B (seed peer proxy) ──miss──▶ origin
+///                 │
+///                 └──5xx / timeout──▶ retry on A
+/// ```
+///
+/// Implemented by [`Proxy`].
 #[async_trait]
 pub trait Request {
-    /// Sends an GET request to a remote server via the Dragonfly and returns a response
-    /// with a streaming body.
-    ///
-    /// This method is designed for scenarios where the response body is expected to be processed as a
-    /// stream, allowing efficient handling of large or continuous data. The response includes metadata
-    /// such as status codes and headers, along with a streaming `Body` for accessing the response content.
+    /// Sends a GET request via the Dragonfly and returns a response with a
+    /// streaming body. A transient failure before the body starts is retried on
+    /// the next seed peer, a failure while streaming it is not.
     async fn get(&self, request: &GetRequest) -> Result<GetResponse<Body>>;
 
-    /// Sends an GET request to a remote server via the Dragonfly and writes the response
-    /// body directly into the provided buffer.
-    ///
-    /// This method is optimized for scenarios where the response body needs to be stored directly in
-    /// memory, avoiding the overhead of streaming for smaller or fixed-size responses. The provided
-    /// `BytesMut` buffer is used to store the response content, and the response metadata (e.g., status
-    /// and headers) is returned separately.
+    /// Sends a GET request via the Dragonfly and appends the response body to
+    /// `buf`. A transient failure, a failed body read included, is retried on the
+    /// next seed peer after `buf` is truncated back to its previous length.
     async fn get_into(&self, request: &GetRequest, buf: &mut BytesMut) -> Result<GetResponse>;
 
-    /// Preheats an OCI image by downloading all its blobs via the Dragonfly.
-    ///
-    /// This method is designed for scenarios where OCI image content needs to be pre-cached in
-    /// the seed client before actual consumption, ensuring faster subsequent access across the
-    /// cluster. It parses the image reference, authenticates with the OCI registry, resolves
-    /// the image manifest (including multi-platform image indexes), and triggers the seed
-    /// client to download each blob (config and layers), without streaming the blob content
-    /// back to the client.
+    /// Preheats an OCI image: resolves its manifest, multi-platform indexes
+    /// included, and has the seed peers download every config and layer blob
+    /// without streaming them back.
     #[cfg(feature = "preheat")]
     async fn preheat_image(&self, request: &PreheatImageRequest) -> Result<()>;
 
-    /// Provides detailed status for an OCI image's distribution in the Dragonfly.
-    ///
-    /// This method is designed for scenarios where clients need to know which peers have
-    /// cached the image layers, such as verifying a preheat. It parses the image reference
-    /// and requests the scheduler to resolve the image manifest and collect the cached
-    /// layers on each peer. It only queries the seed peers.
+    /// Reports which seed peers hold which layers of an OCI image, as resolved by
+    /// the scheduler. Useful to verify a preheat.
     #[cfg(feature = "preheat")]
     async fn stat_image(&self, request: &StatImageRequest) -> Result<StatImageResponse>;
 
-    /// Preheats a file by downloading it to the replicas of seed peers via the Dragonfly.
-    ///
-    /// This method is designed for scenarios where file content needs to be pre-cached in
-    /// the seed client before actual consumption, ensuring faster subsequent access across
-    /// the cluster. It triggers every replica seed peer to download the file by the
-    /// dfdaemon download task API.
+    /// Preheats a file: has every replica seed peer download it through the
+    /// dfdaemon download task API without streaming it back. A transient failure
+    /// is retried on the same seed peer, so the file lands on every replica.
+    /// Fails when fewer seed peers than replicas are available.
     async fn preheat(&self, request: &PreheatRequest) -> Result<()>;
 
-    /// Looks up the endpoints of the seed peers serving the request, in the consistent
-    /// hash ring selection order for the request's task id.
-    ///
-    /// This method is designed for scenarios where clients need to know which seed peers
-    /// would serve the request without sending it. It returns up to the replicas of the
-    /// request distinct endpoints, clamped to the number of available seed peers.
+    /// Returns the endpoints of the seed peers that would serve the request, in
+    /// consistent hash ring order for its task id, up to `replicas` of them and
+    /// clamped to the available seed peers.
     async fn lookup_endpoints(&self, request: &GetRequest) -> Result<Vec<String>>;
 }
 
-/// Defines the interface for sending requests via fixed seed peer endpoints of the Dragonfly.
+/// The interface for sending requests via fixed seed peer endpoints.
 ///
-/// Unlike `Request`, implementations send requests to the seed peer endpoints given at
-/// construction (e.g., the ones returned by `Request::lookup_endpoints`), without selecting
-/// seed peers by the consistent hash ring or syncing them from the scheduler.
+/// The endpoints are given at construction, typically from
+/// [`Request::lookup_endpoints`], so no scheduler is consulted:
+///
+/// ```text
+/// client ──GET──▶ endpoint B ──5xx / timeout──▶ retry on endpoint A
+/// ```
+///
+/// Implemented by [`ProxyWithEndpoints`].
 #[async_trait]
 pub trait RequestWithEndpoints {
-    /// Sends an GET request to a remote server via the seed peer endpoints of the
-    /// Dragonfly and returns a response with a streaming body. The request is sent to a
-    /// randomly picked endpoint and a transient failure is retried on the others up to
-    /// the max retries.
+    /// Sends a GET request to the endpoints and returns a response with a
+    /// streaming body. A transient failure before the body starts is retried on
+    /// the next endpoint, a failure while streaming it is not.
     async fn get(&self, request: &GetRequest) -> Result<GetResponse<Body>>;
 
-    /// Sends an GET request to a remote server via the seed peer endpoints of the
-    /// Dragonfly and writes the response body directly into the provided buffer. The
-    /// request is sent to a randomly picked endpoint and a transient failure, including
-    /// a failed body read, is retried on the others up to the max retries.
+    /// Sends a GET request to the endpoints and appends the response body to
+    /// `buf`. A transient failure, a failed body read included, is retried on the
+    /// next endpoint after `buf` is truncated back to its previous length.
     async fn get_into(&self, request: &GetRequest, buf: &mut BytesMut) -> Result<GetResponse>;
 }
 
@@ -244,8 +233,8 @@ pub struct GetRequest {
 
     /// Filtered query params to generate the task id.
     /// When filter is ["Signature", "Expires", "ns"], for example:
-    /// http://example.com/xyz?Expires=e1&Signature=s1&ns=docker.io and http://example.com/xyz?Expires=e2&Signature=s2&ns=docker.io
-    /// will generate the same task id.
+    /// `http://example.com/xyz?Expires=e1&Signature=s1&ns=docker.io` and
+    /// `http://example.com/xyz?Expires=e2&Signature=s2&ns=docker.io` will generate the same task id.
     /// Default value includes the filtered query params of s3, gcs, oss, obs, cos.
     pub filtered_query_params: Vec<String>,
 
@@ -255,13 +244,13 @@ pub struct GetRequest {
     pub content_for_calculating_task_id: Option<String>,
 
     /// Enable task id based blob digest. It indicates whether to use the blob digest for task ID calculation
-    /// when downloading from OCI registries. When enabled for OCI blob URLs (e.g., /v2/<name>/blobs/sha256:<digest>),
+    /// when downloading from OCI registries. When enabled for OCI blob URLs (e.g., `/v2/<name>/blobs/sha256:<digest>`),
     /// the task ID is derived from the blob digest rather than the full URL. This enables deduplication across
     /// registries - the same blob from different registries shares one task ID, eliminating redundant downloads
     /// and storage, default is true.
     pub enable_task_id_based_blob_digest: bool,
 
-    /// Refer to https://github.com/dragonflyoss/api/blob/main/proto/common.proto#L67
+    /// Refer to <https://github.com/dragonflyoss/api/blob/main/proto/common.proto#L67>.
     pub priority: Option<i32>,
 
     /// The number of seed peers serving the task, default is 2.
@@ -355,8 +344,8 @@ pub struct PreheatImageRequest {
 
     /// Filtered query params to generate the task id.
     /// When filter is ["Signature", "Expires", "ns"], for example:
-    /// http://example.com/xyz?Expires=e1&Signature=s1&ns=docker.io and http://example.com/xyz?Expires=e2&Signature=s2&ns=docker.io
-    /// will generate the same task id.
+    /// `http://example.com/xyz?Expires=e1&Signature=s1&ns=docker.io` and
+    /// `http://example.com/xyz?Expires=e2&Signature=s2&ns=docker.io` will generate the same task id.
     /// Default value includes the filtered query params of s3, gcs, oss, obs, cos.
     pub filtered_query_params: Vec<String>,
 
@@ -366,13 +355,13 @@ pub struct PreheatImageRequest {
     pub content_for_calculating_task_id: Option<String>,
 
     /// Enable task id based blob digest. It indicates whether to use the blob digest for task ID calculation
-    /// when downloading from OCI registries. When enabled for OCI blob URLs (e.g., /v2/<name>/blobs/sha256:<digest>),
+    /// when downloading from OCI registries. When enabled for OCI blob URLs (e.g., `/v2/<name>/blobs/sha256:<digest>`),
     /// the task ID is derived from the blob digest rather than the full URL. This enables deduplication across
     /// registries - the same blob from different registries shares one task ID, eliminating redundant downloads
     /// and storage, default is true.
     pub enable_task_id_based_blob_digest: bool,
 
-    /// Refer to https://github.com/dragonflyoss/api/blob/main/proto/common.proto#L67
+    /// Refer to <https://github.com/dragonflyoss/api/blob/main/proto/common.proto#L67>.
     pub priority: Option<i32>,
 
     /// The number of seed peers serving the task, default is 2.
@@ -456,8 +445,8 @@ pub struct PreheatRequest {
 
     /// Filtered query params to generate the task id.
     /// When filter is ["Signature", "Expires", "ns"], for example:
-    /// http://example.com/xyz?Expires=e1&Signature=s1&ns=docker.io and http://example.com/xyz?Expires=e2&Signature=s2&ns=docker.io
-    /// will generate the same task id.
+    /// `http://example.com/xyz?Expires=e1&Signature=s1&ns=docker.io` and
+    /// `http://example.com/xyz?Expires=e2&Signature=s2&ns=docker.io` will generate the same task id.
     /// Default value includes the filtered query params of s3, gcs, oss, obs, cos.
     pub filtered_query_params: Vec<String>,
 
@@ -467,13 +456,13 @@ pub struct PreheatRequest {
     pub content_for_calculating_task_id: Option<String>,
 
     /// Enable task id based blob digest. It indicates whether to use the blob digest for task ID calculation
-    /// when downloading from OCI registries. When enabled for OCI blob URLs (e.g., /v2/<name>/blobs/sha256:<digest>),
+    /// when downloading from OCI registries. When enabled for OCI blob URLs (e.g., `/v2/<name>/blobs/sha256:<digest>`),
     /// the task ID is derived from the blob digest rather than the full URL. This enables deduplication across
     /// registries - the same blob from different registries shares one task ID, eliminating redundant downloads
     /// and storage, default is true.
     pub enable_task_id_based_blob_digest: bool,
 
-    /// Refer to https://github.com/dragonflyoss/api/blob/main/proto/common.proto#L67
+    /// Refer to <https://github.com/dragonflyoss/api/blob/main/proto/common.proto#L67>.
     pub priority: Option<i32>,
 
     /// The number of seed peers serving the task, default is 2.
@@ -553,8 +542,8 @@ pub struct StatImageRequest {
 
     /// Filtered query params to generate the task id.
     /// When filter is ["Signature", "Expires", "ns"], for example:
-    /// http://example.com/xyz?Expires=e1&Signature=s1&ns=docker.io and http://example.com/xyz?Expires=e2&Signature=s2&ns=docker.io
-    /// will generate the same task id.
+    /// `http://example.com/xyz?Expires=e1&Signature=s1&ns=docker.io` and
+    /// `http://example.com/xyz?Expires=e2&Signature=s2&ns=docker.io` will generate the same task id.
     /// Default value includes the filtered query params of s3, gcs, oss, obs, cos.
     pub filtered_query_params: Vec<String>,
 
@@ -702,16 +691,19 @@ impl ProxyBuilder {
         self
     }
 
-    /// Sets the maximum number of retries of a request on a transient failure: a
-    /// timeout, a connection or transport error, a dfdaemon error, or a `5xx` or `408`
-    /// answer. Each retry goes to the next seed peer, any other answer returns at once.
+    /// Sets how many times a request is retried after a transient failure, each
+    /// retry on the next seed peer. Default `1`, at most `10`.
+    ///
+    /// A transient failure is a timeout, a connection error, or a `5xx`, `408` or
+    /// `429` answer. Any other answer returns at once.
     pub fn max_retries(mut self, retries: u8) -> Self {
         self.retry.max_retries = retries;
         self
     }
 
-    /// Sets the exponential backoff between the retries. Without it retries go at
-    /// once. The max times of the backoff is overridden by the max retries.
+    /// Sets the exponential backoff between retries, none retrying at once. The
+    /// builder's own `max_times` is ignored in favor of
+    /// [`max_retries`](Self::max_retries).
     pub fn backoff(mut self, backoff: ExponentialBuilder) -> Self {
         self.retry.backoff = Some(backoff);
         self
@@ -849,13 +841,8 @@ impl Proxy {
 /// client implementation and usage.
 #[async_trait]
 impl Request for Proxy {
-    /// Sends an GET request to a remote server via the Dragonfly and returns a response
-    /// with a streaming body.
-    ///
-    /// This method is designed for scenarios where the response body is expected to be processed as a
-    /// stream, allowing efficient handling of large or continuous data. The response includes metadata
-    /// such as status codes and headers, along with a streaming `Body` of `Bytes` chunks
-    /// for accessing the response content.
+    /// Sends a GET request via the Dragonfly and returns a response with a
+    /// streaming body, see [`Request::get`].
     async fn get(&self, request: &GetRequest) -> Result<GetResponse> {
         request.validate()?;
         let response = self.try_send(request).await?;
@@ -875,13 +862,8 @@ impl Request for Proxy {
         })
     }
 
-    /// Sends an GET request to a remote server via the Dragonfly and writes the response
-    /// body directly into the provided buffer.
-    ///
-    /// This method is optimized for scenarios where the response body needs to be stored directly in
-    /// memory, avoiding the overhead of streaming for smaller or fixed-size responses. The provided
-    /// `BytesMut` buffer is used to store the response content, and the response metadata (e.g., status
-    /// and headers) is returned separately.
+    /// Sends a GET request via the Dragonfly and appends the response body to
+    /// `buf`, see [`Request::get_into`].
     async fn get_into(&self, request: &GetRequest, buf: &mut BytesMut) -> Result<GetResponse> {
         request.validate()?;
         let endpoints = self.lookup_proxy_endpoints(request).await?;
@@ -1239,8 +1221,8 @@ impl Request for Proxy {
 
         // Trigger every replica seed peer to download the task concurrently and
         // wait for the download tasks to finish, without streaming the file
-        // content back to the client. A transient failure on a seed peer is
-        // retried on that same seed peer, so the file lands on every replica.
+        // content back to the client. A transient failure is retried on the same
+        // seed peer, so the file lands on every replica.
         let mut join_set: JoinSet<Result<()>> = JoinSet::new();
         for peer in seed_peers.iter() {
             let addr = format_url(
@@ -1408,8 +1390,8 @@ impl Proxy {
         Ok(endpoints)
     }
 
-    /// Scatters the request across the seed peers serving it, retrying a transient
-    /// failure on the next seed peer up to the max retries.
+    /// Sends the request to the seed peers serving it, retrying a transient failure
+    /// on the next one, see [`retry_with_endpoints`].
     async fn try_send(&self, request: &GetRequest) -> Result<reqwest::Response> {
         let endpoints = self.lookup_proxy_endpoints(request).await?;
         let ((), result) =
@@ -1669,16 +1651,19 @@ impl ProxyWithEndpointsBuilder {
         self
     }
 
-    /// Sets the maximum number of retries of a request on a transient failure: a
-    /// timeout, a connection or transport error, a dfdaemon error, or a `5xx` or `408`
-    /// answer. Each retry goes to the next seed peer, any other answer returns at once.
+    /// Sets how many times a request is retried after a transient failure, each
+    /// retry on the next seed peer. Default `1`, at most `10`.
+    ///
+    /// A transient failure is a timeout, a connection error, or a `5xx`, `408` or
+    /// `429` answer. Any other answer returns at once.
     pub fn max_retries(mut self, retries: u8) -> Self {
         self.retry.max_retries = retries;
         self
     }
 
-    /// Sets the exponential backoff between the retries. Without it retries go at
-    /// once. The max times of the backoff is overridden by the max retries.
+    /// Sets the exponential backoff between retries, none retrying at once. The
+    /// builder's own `max_times` is ignored in favor of
+    /// [`max_retries`](Self::max_retries).
     pub fn backoff(mut self, backoff: ExponentialBuilder) -> Self {
         self.retry.backoff = Some(backoff);
         self
@@ -1749,8 +1734,8 @@ impl ProxyWithEndpoints {
         ProxyWithEndpointsBuilder::default()
     }
 
-    /// Scatters the request across the endpoints, retrying a transient failure on the
-    /// next endpoint up to the max retries.
+    /// Sends the request to the endpoints, retrying a transient failure on the next
+    /// one, see [`retry_with_endpoints`].
     async fn try_send(&self, request: &GetRequest) -> Result<reqwest::Response> {
         let ((), result) =
             retry_with_endpoints(self.retry, &self.endpoints, (), |(), endpoint| async move {
@@ -1920,10 +1905,8 @@ impl ProxyWithEndpoints {
 /// ring or syncing them from the scheduler.
 #[async_trait]
 impl RequestWithEndpoints for ProxyWithEndpoints {
-    /// Sends an GET request to a remote server via the seed peer endpoints of the
-    /// Dragonfly and returns a response with a streaming body. The request is sent to a
-    /// randomly picked endpoint and a transient failure is retried on the others up to
-    /// the max retries.
+    /// Sends a GET request to the endpoints and returns a response with a
+    /// streaming body, see [`RequestWithEndpoints::get`].
     async fn get(&self, request: &GetRequest) -> Result<GetResponse> {
         request.validate()?;
         let response = self.try_send(request).await?;
@@ -1943,10 +1926,8 @@ impl RequestWithEndpoints for ProxyWithEndpoints {
         })
     }
 
-    /// Sends an GET request to a remote server via the seed peer endpoints of the
-    /// Dragonfly and writes the response body directly into the provided buffer. The
-    /// request is sent to a randomly picked endpoint and a transient failure, including
-    /// a failed body read, is retried on the others up to the max retries.
+    /// Sends a GET request to the endpoints and appends the response body to
+    /// `buf`, see [`RequestWithEndpoints::get_into`].
     async fn get_into(&self, request: &GetRequest, buf: &mut BytesMut) -> Result<GetResponse> {
         request.validate()?;
         let (body, result) = retry_with_endpoints(
