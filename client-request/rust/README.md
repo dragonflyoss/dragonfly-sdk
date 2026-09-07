@@ -61,10 +61,14 @@ Retry transient failures. A request is retried on another seed peer when the
 peer cannot be reached or answers too slowly, or the proxy, backend or dfdaemon
 answers `5xx`, `408` or `429`, since another seed peer may not be rate limited or
 out of space. Any other answer, such as `404` or a dfdaemon `422`, is definitive
-and returns at once.
-Preheating retries the same way on each replica seed peer. The default is one
-retry at once, `max_retries(0)` disables retries, and a `backon` exponential
-backoff spreads the retries out. The request timeout applies to each attempt:
+and returns at once. `get_into` also retries a failed body read, `get` cannot
+once the body is streaming. Preheating retries the same way on each replica
+seed peer.
+
+The default is one retry at once and `max_retries(0)` disables retries. An
+exponential backoff spreads the retries out, `ExponentialBuilder` being
+re-exported from [backon](https://docs.rs/backon). The request timeout applies
+to each attempt:
 
 ```rust
 use dragonfly_client_request::ExponentialBuilder;
