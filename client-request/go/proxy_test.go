@@ -26,10 +26,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cenkalti/backoff/v5"
-
 	commonv2 "d7y.io/api/v2/pkg/apis/common/v2"
 	"d7y.io/dragonfly/v2/pkg/idgen"
+	"github.com/cenkalti/backoff/v5"
 	"github.com/stretchr/testify/assert"
 )
 

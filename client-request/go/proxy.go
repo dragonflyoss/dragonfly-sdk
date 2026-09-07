@@ -31,12 +31,12 @@ import (
 
 	schedulerv2 "d7y.io/api/v2/pkg/apis/scheduler/v2"
 	"d7y.io/dragonfly/v2/pkg/idgen"
+	"github.com/cenkalti/backoff/v5"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
 	"d7y.io/dragonfly-sdk/client-request/go/internal/pool"
 	"d7y.io/dragonfly-sdk/client-request/go/internal/selector"
-	"github.com/cenkalti/backoff/v5"
 )
 
 const (

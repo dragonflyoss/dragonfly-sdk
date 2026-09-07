@@ -218,18 +218,21 @@ mod tests {
 
     #[test]
     fn from_status_keeps_the_backend_status_and_retryability() {
-        let backend_details = serde_json::to_vec(&Backend {
-            message: "origin said no".to_string(),
-            header: HashMap::from([("x-served-by".to_string(), "origin".to_string())]),
-            status_code: Some(404),
-        })
-        .unwrap();
+        let backend_details = |status_code: Option<i32>| {
+            serde_json::to_vec(&Backend {
+                message: "origin said no".to_string(),
+                header: HashMap::from([("x-served-by".to_string(), "origin".to_string())]),
+                status_code,
+            })
+            .unwrap()
+            .into()
+        };
         let test_cases: Vec<(tonic::Status, Expected, bool)> = vec![
             (
                 tonic::Status::with_details(
                     Code::Internal,
                     "backend error",
-                    backend_details.into(),
+                    backend_details(Some(404)),
                 ),
                 |err| {
                     matches!(
@@ -242,6 +245,58 @@ mod tests {
                     )
                 },
                 false,
+            ),
+            (
+                tonic::Status::with_details(
+                    Code::Internal,
+                    "backend error",
+                    backend_details(Some(503)),
+                ),
+                |err| {
+                    matches!(
+                        err,
+                        Error::BackendError(BackendError {
+                            status_code: Some(StatusCode::SERVICE_UNAVAILABLE),
+                            ..
+                        })
+                    )
+                },
+                true,
+            ),
+            (
+                tonic::Status::with_details(Code::Internal, "backend error", backend_details(None)),
+                |err| {
+                    matches!(
+                        err,
+                        Error::BackendError(BackendError {
+                            status_code: None,
+                            ..
+                        })
+                    )
+                },
+                true,
+            ),
+            (
+                tonic::Status::with_details(
+                    Code::Internal,
+                    "backend error",
+                    backend_details(Some(99999)),
+                ),
+                |err| {
+                    matches!(
+                        err,
+                        Error::BackendError(BackendError {
+                            status_code: None,
+                            ..
+                        })
+                    )
+                },
+                true,
+            ),
+            (
+                tonic::Status::with_details(Code::Internal, "not json", b"{".to_vec().into()),
+                |err| matches!(err, Error::TonicStatus(status) if status.code() == Code::Internal),
+                true,
             ),
             (
                 tonic::Status::deadline_exceeded("too slow"),

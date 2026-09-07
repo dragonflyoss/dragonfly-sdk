@@ -28,8 +28,9 @@ import (
 	"os/signal"
 	"syscall"
 
-	request "d7y.io/dragonfly-sdk/client-request/go"
 	"github.com/cenkalti/backoff/v5"
+
+	request "d7y.io/dragonfly-sdk/client-request/go"
 )
 
 func main() {

@@ -102,6 +102,77 @@ func TestRetry(t *testing.T) {
 	}
 }
 
+func TestRetryWaitsTheBackoffDelays(t *testing.T) {
+	delay := 20 * time.Millisecond
+	tests := []struct {
+		name    string
+		backoff *backoff.ExponentialBackOff
+		atLeast time.Duration
+		atMost  time.Duration
+	}{
+		{"without backoff", nil, 0, delay},
+		{"exponential", &backoff.ExponentialBackOff{InitialInterval: delay, MaxInterval: 2 * delay, Multiplier: 2}, 3 * delay, 6 * delay},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
+			policy := retryPolicy{maxRetries: 2, backoff: tc.backoff}
+
+			start := time.Now()
+			_, err := retry(context.Background(), policy, func() (struct{}, error) {
+				return struct{}{}, fmt.Errorf("%w: boom", ErrInternal)
+			})
+			elapsed := time.Since(start)
+			assert.ErrorIs(err, ErrInternal)
+			assert.GreaterOrEqual(elapsed, tc.atLeast)
+			assert.Less(elapsed, tc.atMost)
+
+			start = time.Now()
+			_, _, err = retryWithEndpoints(context.Background(), policy, []string{"a"}, time.Second, func(context.Context, string) (*http.Response, error) {
+				return nil, fmt.Errorf("%w: boom", ErrInternal)
+			})
+			elapsed = time.Since(start)
+			assert.ErrorIs(err, ErrInternal)
+			assert.GreaterOrEqual(elapsed, tc.atLeast)
+			assert.Less(elapsed, tc.atMost)
+		})
+	}
+}
+
+func TestRetryStopsWhenTheContextEnds(t *testing.T) {
+	tests := []struct {
+		name        string
+		end         func(context.CancelFunc, context.CancelFunc)
+		expectedErr error
+	}{
+		{"cancelled", func(cancel, _ context.CancelFunc) { cancel() }, ErrInternal},
+		{"deadline exceeded", func(_, expire context.CancelFunc) { expire() }, ErrRequestTimeout},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
+
+			ctx, cancel := context.WithCancelCause(context.Background())
+			defer cancel(nil)
+			expire := func() { cancel(context.DeadlineExceeded) }
+			cancelPlain := func() { cancel(context.Canceled) }
+
+			attempts := 0
+			policy := retryPolicy{maxRetries: 5, backoff: &backoff.ExponentialBackOff{InitialInterval: time.Second, MaxInterval: time.Second, Multiplier: 1}}
+			_, err := retry(ctx, policy, func() (struct{}, error) {
+				attempts++
+				tc.end(cancelPlain, expire)
+				return struct{}{}, fmt.Errorf("%w: boom", ErrInternal)
+			})
+
+			assert.ErrorIs(err, tc.expectedErr)
+			assert.Equal(1, attempts)
+		})
+	}
+}
+
 func TestRetryWithEndpoints(t *testing.T) {
 	transient := fmt.Errorf("%w: boom", ErrInternal)
 	definitive := &BackendError{StatusCode: http.StatusNotFound}

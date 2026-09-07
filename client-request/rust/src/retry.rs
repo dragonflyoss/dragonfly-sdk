@@ -183,6 +183,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retries_wait_the_backoff_delays() {
+        let delay = Duration::from_millis(20);
+        let test_cases = vec![
+            (None, 2, Duration::ZERO, delay),
+            (
+                Some(
+                    ExponentialBuilder::new()
+                        .with_min_delay(delay)
+                        .with_max_delay(delay * 2),
+                ),
+                2,
+                delay * 3,
+                delay * 6,
+            ),
+        ];
+
+        for (backoff, max_retries, at_least, at_most) in test_cases {
+            let policy = RetryPolicy {
+                max_retries,
+                backoff,
+            };
+            let endpoints = vec!["a".to_string()];
+
+            let start = tokio::time::Instant::now();
+            let result: Result<()> = retry(policy, || async { Err(internal()) }).await;
+            let elapsed = start.elapsed();
+            assert!(result.is_err(), "policy: {policy:?}");
+            assert!(
+                (at_least..at_most).contains(&elapsed),
+                "policy: {policy:?}, elapsed: {elapsed:?}"
+            );
+
+            let start = tokio::time::Instant::now();
+            let ((), result) =
+                retry_with_endpoints(policy, &endpoints, (), |(), _endpoint| async {
+                    ((), Err::<(), _>(internal()))
+                })
+                .await;
+            let elapsed = start.elapsed();
+            assert!(result.is_err(), "policy: {policy:?}");
+            assert!(
+                (at_least..at_most).contains(&elapsed),
+                "policy: {policy:?}, elapsed: {elapsed:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn retry_stops_on_success_definitive_failure_or_exhausted_retries() {
         let test_cases: Vec<(u8, Failures, usize, bool)> = vec![
             (3, vec![], 1, true),

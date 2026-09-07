@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -194,6 +195,74 @@ func TestGetWithEndpointsErrorTypes(t *testing.T) {
 		assert.ErrorAs(t, err, &proxyErr)
 		assert.Contains(t, proxyErr.Message, "unexpected status code")
 	})
+}
+
+func TestGetWithEndpointsRetriesOnlyTransientAnswers(t *testing.T) {
+	tests := []struct {
+		name         string
+		status       int
+		errorType    string
+		maxRetries   uint8
+		expectedHits int32
+	}{
+		{"503 backend", http.StatusServiceUnavailable, "backend", 2, 3},
+		{"503 proxy", http.StatusServiceUnavailable, "proxy", 2, 3},
+		{"408 proxy", http.StatusRequestTimeout, "proxy", 1, 2},
+		{"429 backend", http.StatusTooManyRequests, "backend", 3, 4},
+		{"429 proxy", http.StatusTooManyRequests, "proxy", 3, 4},
+		{"429 proxy without retries", http.StatusTooManyRequests, "proxy", 0, 1},
+		{"401 proxy", http.StatusUnauthorized, "proxy", 3, 1},
+		{"403 proxy", http.StatusForbidden, "proxy", 3, 1},
+		{"404 backend", http.StatusNotFound, "backend", 3, 1},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
+
+			var hits atomic.Int32
+			proxyPort := setupMockSeedPeerProxy(t, func(w http.ResponseWriter, r *http.Request) {
+				hits.Add(1)
+				w.Header().Set("X-Dragonfly-Error-Type", tc.errorType)
+				w.WriteHeader(tc.status)
+			})
+
+			proxy, err := NewWithEndpoints([]string{fmt.Sprintf("http://127.0.0.1:%d", proxyPort)}, WithProxyWithEndpointsMaxRetries(tc.maxRetries))
+			assert.NoError(err)
+
+			_, err = proxy.Get(context.Background(), NewGetRequest("http://example.com/file.txt"))
+			var backendErr *BackendError
+			var proxyErr *ProxyError
+			switch tc.errorType {
+			case "backend":
+				assert.ErrorAs(err, &backendErr)
+				assert.Equal(tc.status, backendErr.StatusCode)
+			case "proxy":
+				assert.ErrorAs(err, &proxyErr)
+				assert.Equal(tc.status, proxyErr.StatusCode)
+			}
+			assert.Equal(tc.expectedHits, hits.Load())
+		})
+	}
+}
+
+func TestGetIntoWithEndpointsDoesNotRetryATruncatedBody(t *testing.T) {
+	assert := assert.New(t)
+
+	var hits atomic.Int32
+	proxyPort := setupMockSeedPeerProxy(t, func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Length", "15")
+		fmt.Fprint(w, "hello")
+	})
+
+	proxy, err := NewWithEndpoints([]string{fmt.Sprintf("http://127.0.0.1:%d", proxyPort)}, WithProxyWithEndpointsMaxRetries(3))
+	assert.NoError(err)
+
+	var buf bytes.Buffer
+	_, err = proxy.GetInto(context.Background(), NewGetRequest("http://example.com/file.txt"), &buf)
+	assert.ErrorIs(err, ErrInternal)
+	assert.Equal(int32(1), hits.Load())
 }
 
 func TestGetIntoWithEndpointsTimeout(t *testing.T) {

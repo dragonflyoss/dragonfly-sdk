@@ -2062,19 +2062,23 @@ mod tests {
         Ok(server)
     }
 
-    async fn setup_flaky_seed_peer_proxy(first: FlakyFirstConnection, body: &'static str) -> u16 {
+    async fn setup_flaky_seed_peer_proxy(
+        first: FlakyFirstConnection,
+        body: &'static str,
+    ) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counter = connections.clone();
         tokio::spawn(async move {
-            let mut connections = 0usize;
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     return;
                 };
-                connections += 1;
-                let flaky = connections == 1;
+                let flaky = counter.fetch_add(1, Ordering::SeqCst) == 0;
                 tokio::spawn(async move {
                     let mut request = Vec::new();
                     let mut byte = [0u8; 1];
@@ -2102,13 +2106,42 @@ mod tests {
             }
         });
 
-        port
+        (port, connections)
     }
 
     #[derive(Debug, Clone, Copy, PartialEq)]
     enum FlakyFirstConnection {
         Hang,
         TruncateBody,
+    }
+
+    fn flaky_test_cases() -> Vec<(FlakyFirstConnection, Duration, Option<Duration>)> {
+        let timeout = Duration::from_millis(300);
+        vec![
+            (
+                FlakyFirstConnection::TruncateBody,
+                DEFAULT_REQUEST_TIMEOUT,
+                None,
+            ),
+            (FlakyFirstConnection::Hang, timeout, Some(timeout)),
+        ]
+    }
+
+    fn assert_flaky_retry(
+        first: FlakyFirstConnection,
+        buf: &BytesMut,
+        connections: usize,
+        elapsed: Duration,
+        expected_wait: Option<Duration>,
+    ) {
+        assert_eq!(&buf[..], b"prefix:hello dragonfly", "first: {first:?}");
+        assert_eq!(connections, 2, "first: {first:?}");
+        if let Some(expected_wait) = expected_wait {
+            assert!(
+                (expected_wait..expected_wait * 3).contains(&elapsed),
+                "first: {first:?}, elapsed: {elapsed:?}"
+            );
+        }
     }
 
     #[cfg(feature = "preheat")]
@@ -2504,20 +2537,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_into_retries_a_flaky_first_attempt() {
+        for (first, timeout, expected_wait) in flaky_test_cases() {
+            let (port, connections) = setup_flaky_seed_peer_proxy(first, "hello dragonfly").await;
+            let mock_seed_peer = setup_mock_seed_peer(MockSet::new()).await.unwrap();
+            let mock_scheduler = setup_mock_scheduler(vec![create_seed_peer_host(
+                "seed-peer-1",
+                mock_seed_peer.port().unwrap(),
+                port,
+            )])
+            .await
+            .unwrap();
+
+            let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+            let proxy = Proxy::builder()
+                .scheduler_endpoint(scheduler_endpoint)
+                .build()
+                .await
+                .unwrap();
+
+            let request = GetRequest {
+                url: "http://example.com/file.txt".to_string(),
+                replicas: 1,
+                timeout,
+                ..Default::default()
+            };
+
+            let start = std::time::Instant::now();
+            let mut buf = BytesMut::from(&b"prefix:"[..]);
+            let response = proxy.get_into(&request, &mut buf).await.unwrap();
+            assert!(response.success, "first: {first:?}");
+            assert_flaky_retry(
+                first,
+                &buf,
+                connections.load(std::sync::atomic::Ordering::SeqCst),
+                start.elapsed(),
+                expected_wait,
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn get_into_with_endpoints_retries_a_flaky_first_attempt() {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let timeout = Duration::from_millis(300);
-        let test_cases = vec![
-            (
-                FlakyFirstConnection::TruncateBody,
-                DEFAULT_REQUEST_TIMEOUT,
-                None,
-            ),
-            (FlakyFirstConnection::Hang, timeout, Some(timeout)),
-        ];
-
-        for (first, timeout, expected_wait) in test_cases {
-            let port = setup_flaky_seed_peer_proxy(first, "hello dragonfly").await;
+        for (first, timeout, expected_wait) in flaky_test_cases() {
+            let (port, connections) = setup_flaky_seed_peer_proxy(first, "hello dragonfly").await;
             let proxy = ProxyWithEndpoints::builder()
                 .endpoints(vec![format!("http://127.0.0.1:{port}")])
                 .build()
@@ -2533,20 +2597,112 @@ mod tests {
             let start = std::time::Instant::now();
             let mut buf = BytesMut::from(&b"prefix:"[..]);
             let response = proxy.get_into(&request, &mut buf).await.unwrap();
-            let elapsed = start.elapsed();
-
             assert!(response.success, "first: {first:?}");
-            assert_eq!(&buf[..], b"prefix:hello dragonfly", "first: {first:?}");
-            if let Some(expected_wait) = expected_wait {
-                assert!(
-                    elapsed >= expected_wait,
-                    "first: {first:?}, elapsed: {elapsed:?}"
-                );
-                assert!(
-                    elapsed < expected_wait * 3,
-                    "first: {first:?}, elapsed: {elapsed:?}"
-                );
+            assert_flaky_retry(
+                first,
+                &buf,
+                connections.load(std::sync::atomic::Ordering::SeqCst),
+                start.elapsed(),
+                expected_wait,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_with_endpoints_streams_a_truncated_body_without_retrying() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (port, connections) =
+            setup_flaky_seed_peer_proxy(FlakyFirstConnection::TruncateBody, "hello dragonfly")
+                .await;
+        let proxy = ProxyWithEndpoints::builder()
+            .endpoints(vec![format!("http://127.0.0.1:{port}")])
+            .max_retries(3)
+            .build()
+            .await
+            .unwrap();
+
+        let request = GetRequest {
+            url: "http://example.com/file.txt".to_string(),
+            ..Default::default()
+        };
+
+        let response = proxy.get(&request).await.unwrap();
+        assert!(response.success);
+
+        let mut body = response.body.unwrap();
+        let mut content = Vec::new();
+        let err = loop {
+            match body.try_next().await {
+                Ok(Some(chunk)) => content.extend_from_slice(&chunk),
+                Ok(None) => panic!("truncated body must not end cleanly"),
+                Err(err) => break err,
             }
+        };
+        assert!(matches!(err, Error::Internal(_)), "unexpected: {err:?}");
+        assert!(content.len() < b"hello dragonfly".len());
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn get_with_endpoints_retries_only_transient_answers() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let test_cases = vec![
+            (reqwest::StatusCode::SERVICE_UNAVAILABLE, "backend", 2, 3),
+            (reqwest::StatusCode::SERVICE_UNAVAILABLE, "proxy", 2, 3),
+            (reqwest::StatusCode::REQUEST_TIMEOUT, "proxy", 1, 2),
+            (reqwest::StatusCode::TOO_MANY_REQUESTS, "backend", 3, 4),
+            (reqwest::StatusCode::TOO_MANY_REQUESTS, "proxy", 3, 4),
+            (reqwest::StatusCode::TOO_MANY_REQUESTS, "proxy", 0, 1),
+            (reqwest::StatusCode::UNAUTHORIZED, "proxy", 3, 1),
+            (reqwest::StatusCode::FORBIDDEN, "proxy", 3, 1),
+            (reqwest::StatusCode::NOT_FOUND, "backend", 3, 1),
+        ];
+
+        for (status, error_type, max_retries, expected_calls) in test_cases {
+            let mut mocks = MockSet::new();
+            mocks.mock(|when, then| {
+                when.get().path("/file.txt");
+                then.status(status)
+                    .headers([("X-Dragonfly-Error-Type", error_type)])
+                    .text("no");
+            });
+            let mock_proxy = setup_mock_seed_peer_proxy(mocks).await.unwrap();
+
+            let proxy = ProxyWithEndpoints::builder()
+                .endpoints(vec![format!(
+                    "http://127.0.0.1:{}",
+                    mock_proxy.port().unwrap()
+                )])
+                .max_retries(max_retries)
+                .build()
+                .await
+                .unwrap();
+
+            let request = GetRequest {
+                url: "http://example.com/file.txt".to_string(),
+                ..Default::default()
+            };
+
+            let err = proxy.get(&request).await.err().unwrap();
+            let got = match &err {
+                Error::BackendError(BackendError { status_code, .. })
+                | Error::ProxyError(ProxyError { status_code, .. }) => *status_code,
+                other => panic!("status: {status}, unexpected error: {other:?}"),
+            };
+            assert_eq!(
+                got,
+                Some(status),
+                "status: {status}, error_type: {error_type}"
+            );
+            assert_eq!(
+                mock_proxy
+                    .mocks()
+                    .iter()
+                    .map(|mock| mock.match_count())
+                    .sum::<usize>(),
+                expected_calls,
+                "status: {status}, error_type: {error_type}"
+            );
         }
     }
 
@@ -3030,6 +3186,57 @@ mod tests {
         assert!(
             matches!(result, Err(Error::Internal(message)) if message.contains("failed to select seed peers"))
         );
+    }
+
+    #[tokio::test]
+    async fn preheat_retries_on_the_same_seed_peer() {
+        let mut failing_mocks = MockSet::new();
+        failing_mocks.mock(|when, then| {
+            when.path("/dfdaemon.v2.DfdaemonUpload/DownloadTask");
+            then.error(StatusCode::SERVICE_UNAVAILABLE, "seed peer is busy");
+        });
+        let failing_seed_peer = setup_mock_seed_peer(failing_mocks).await.unwrap();
+
+        let mut healthy_mocks = MockSet::new();
+        healthy_mocks.mock(|when, then| {
+            when.path("/dfdaemon.v2.DfdaemonUpload/DownloadTask");
+            then.pb_stream(vec![DownloadTaskResponse {
+                host_id: "seed-peer-2".to_string(),
+                task_id: "task-1".to_string(),
+                peer_id: "peer-1".to_string(),
+                ..Default::default()
+            }]);
+        });
+        let healthy_seed_peer = setup_mock_seed_peer(healthy_mocks).await.unwrap();
+
+        let mock_scheduler = setup_mock_scheduler(vec![
+            create_seed_peer_host("seed-peer-1", failing_seed_peer.port().unwrap(), 0),
+            create_seed_peer_host("seed-peer-2", healthy_seed_peer.port().unwrap(), 0),
+        ])
+        .await
+        .unwrap();
+
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .max_retries(2)
+            .build()
+            .await
+            .unwrap();
+
+        let request = PreheatRequest {
+            url: "http://example.com/payload.txt".to_string(),
+            replicas: 2,
+            ..Default::default()
+        };
+
+        let result = proxy.preheat(&request).await;
+        assert!(
+            matches!(&result, Err(Error::TonicStatus(status)) if status.code() == tonic::Code::Unavailable),
+            "unexpected: {result:?}"
+        );
+        assert_eq!(download_task_calls(&failing_seed_peer), 3);
+        assert_eq!(download_task_calls(&healthy_seed_peer), 1);
     }
 
     #[tokio::test]
