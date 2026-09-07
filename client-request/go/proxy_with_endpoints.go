@@ -30,16 +30,16 @@ import (
 // ProxyWithEndpointsOption configures the ProxyWithEndpoints.
 type ProxyWithEndpointsOption func(p *ProxyWithEndpoints)
 
-// WithProxyWithEndpointsMaxRetries sets the maximum number of retries of a
-// request on a transient failure: a timeout, a connection or transport error,
-// a dfdaemon error, or a 5xx or 408 answer. Each retry goes to the next
-// endpoint, any other answer returns at once.
+// WithProxyWithEndpointsMaxRetries sets how many times a request is retried
+// after a transient failure, each retry on the next endpoint. Default 1, at
+// most 3. A transient failure is a timeout, a connection error, or a 5xx, 408
+// or 429 answer. Any other answer returns at once.
 func WithProxyWithEndpointsMaxRetries(retries uint8) ProxyWithEndpointsOption {
 	return func(p *ProxyWithEndpoints) { p.retry.maxRetries = retries }
 }
 
-// WithProxyWithEndpointsBackoff sets the exponential backoff between the retries. Without
-// it retries go at once.
+// WithProxyWithEndpointsBackoff sets the exponential backoff between retries,
+// none retrying at once. Every request starts from a fresh copy of b.
 func WithProxyWithEndpointsBackoff(b *backoff.ExponentialBackOff) ProxyWithEndpointsOption {
 	return func(p *ProxyWithEndpoints) { p.retry.backoff = b }
 }
@@ -138,8 +138,8 @@ func (p *ProxyWithEndpoints) GetInto(ctx context.Context, req *GetRequest, w io.
 	return copyResponse(resp, w)
 }
 
-// trySend scatters the request across the endpoints, retrying a transient
-// failure on the next endpoint up to the max retries.
+// trySend sends the request to the endpoints, retrying a transient failure on
+// the next one, see retryWithEndpoints.
 func (p *ProxyWithEndpoints) trySend(ctx context.Context, req *GetRequest) (*http.Response, context.CancelFunc, error) {
 	return retryWithEndpoints(ctx, p.retry, p.endpoints, req.timeout, func(ctx context.Context, endpoint string) (*http.Response, error) {
 		return p.send(ctx, p.clients[endpoint], req)
@@ -182,7 +182,7 @@ func (p *ProxyWithEndpoints) send(ctx context.Context, client *http.Client, req 
 	case "proxy":
 		return nil, &ProxyError{Message: string(message), Header: header, StatusCode: resp.StatusCode}
 	case "dfdaemon":
-		return nil, &DfdaemonError{Message: string(message)}
+		return nil, &DfdaemonError{Message: string(message), Header: header, StatusCode: resp.StatusCode}
 	case "":
 		return nil, &ProxyError{
 			Message:    fmt.Sprintf("unexpected status code from proxy: %d", resp.StatusCode),

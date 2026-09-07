@@ -36,11 +36,20 @@ var (
 	ErrInternal = errors.New("request internal error")
 )
 
-// isRetryable reports whether a failed attempt is worth another: the seed peer
-// could not be reached or answered too slowly, the dfdaemon failed, or the
-// proxy or backend answered 5xx, 408 or 429, since another seed peer may not
-// be rate limited. Every other answer is definitive for the request, so
-// retrying would only repeat it.
+// isRetryable reports whether a failed attempt is worth another one against a
+// different seed peer.
+//
+//	| Failure                                                        | Retry |
+//	|----------------------------------------------------------------|-------|
+//	| ErrRequestTimeout, ErrInternal (connect, transport)            | yes   |
+//	| proxy / backend / dfdaemon answer 5xx, 408 or 429              | yes   |
+//	| gRPC Internal, Unavailable, Unknown, Aborted, DeadlineExceeded | yes   |
+//	| any other answer, such as 403, 404, 422                        | no    |
+//	| any other gRPC code, ErrInvalidArgument                        | no    |
+//
+// 429 and 507 are retried because another seed peer may not be rate limited
+// or out of space. Any other 4xx is definitive: every seed peer would answer
+// the same.
 func isRetryable(err error) bool {
 	var answer interface{ retryable() bool }
 	if errors.As(err, &answer) {
@@ -59,8 +68,8 @@ func isRetryable(err error) bool {
 	return errors.Is(err, ErrRequestTimeout) || errors.Is(err, ErrInternal)
 }
 
-// isRetryableStatus reports whether the status code of a proxy or backend
-// answer marks a transient failure: 5xx, 408 or 429.
+// isRetryableStatus reports whether the status of a proxy, backend or
+// dfdaemon answer marks a transient failure: 5xx, 408 or 429.
 func isRetryableStatus(status int) bool {
 	return status >= http.StatusInternalServerError ||
 		status == http.StatusRequestTimeout ||
@@ -111,18 +120,32 @@ func (e *ProxyError) retryable() bool {
 	return isRetryableStatus(e.StatusCode)
 }
 
-// DfdaemonError is the error detail returned by the dfdaemon.
+// DfdaemonError is the error detail returned by the dfdaemon: the seed peer's
+// dfdaemon could not run the download task. The status code says why.
+//
+//	| Status | Meaning                                                           |
+//	|--------|-------------------------------------------------------------------|
+//	| 400    | invalid request or URL                                            |
+//	| 422    | the origin sent no Content-Length, or the piece length is invalid |
+//	| 507    | the seed peer has no room for the task                            |
+//	| 500    | any other failure: scheduling, peers, streaming                   |
 type DfdaemonError struct {
 	// Message is the dfdaemon error message.
 	Message string
+
+	// Header is the dfdaemon HTTP response header.
+	Header http.Header
+
+	// StatusCode is the dfdaemon HTTP status code.
+	StatusCode int
 }
 
 // Error implements the error interface.
 func (e *DfdaemonError) Error() string {
-	return fmt.Sprintf("dfdaemon error, message: %q", e.Message)
+	return fmt.Sprintf("dfdaemon error, message: %q, header: %v, status_code: %d", e.Message, e.Header, e.StatusCode)
 }
 
-// retryable reports that a dfdaemon failure is transient.
+// retryable reports whether the answer marks a transient failure.
 func (e *DfdaemonError) retryable() bool {
-	return true
+	return isRetryableStatus(e.StatusCode)
 }

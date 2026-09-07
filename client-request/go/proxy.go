@@ -85,16 +85,16 @@ const (
 // ProxyOption configures the Proxy.
 type ProxyOption func(p *Proxy)
 
-// WithProxyMaxRetries sets the maximum number of retries of a request on a
-// transient failure: a timeout, a connection or transport error, a dfdaemon
-// error, or a 5xx or 408 answer. Each retry goes to the next seed peer, any
-// other answer returns at once.
+// WithProxyMaxRetries sets how many times a request is retried after a
+// transient failure, each retry on the next seed peer. Default 1, at most 10.
+// A transient failure is a timeout, a connection error, or a 5xx, 408 or 429
+// answer. Any other answer returns at once.
 func WithProxyMaxRetries(retries uint8) ProxyOption {
 	return func(p *Proxy) { p.retry.maxRetries = retries }
 }
 
-// WithProxyBackoff sets the exponential backoff between the retries. Without
-// it retries go at once.
+// WithProxyBackoff sets the exponential backoff between retries, none retrying
+// at once. Every request starts from a fresh copy of b.
 func WithProxyBackoff(b *backoff.ExponentialBackOff) ProxyOption {
 	return func(p *Proxy) { p.retry.backoff = b }
 }
@@ -345,8 +345,8 @@ func (p *Proxy) lookupProxyEndpoints(req *GetRequest) ([]string, error) {
 	return endpoints, nil
 }
 
-// trySend scatters the request across the seed peers serving it, retrying a
-// transient failure on the next seed peer up to the max retries.
+// trySend sends the request to the seed peers serving it, retrying a transient
+// failure on the next one, see retryWithEndpoints.
 func (p *Proxy) trySend(ctx context.Context, req *GetRequest) (*http.Response, context.CancelFunc, error) {
 	endpoints, err := p.lookupProxyEndpoints(req)
 	if err != nil {
@@ -401,7 +401,7 @@ func (p *Proxy) send(ctx context.Context, client *http.Client, req *GetRequest) 
 	case "proxy":
 		return nil, &ProxyError{Message: string(message), Header: header, StatusCode: resp.StatusCode}
 	case "dfdaemon":
-		return nil, &DfdaemonError{Message: string(message)}
+		return nil, &DfdaemonError{Message: string(message), Header: header, StatusCode: resp.StatusCode}
 	case "":
 		return nil, &ProxyError{
 			Message:    fmt.Sprintf("unexpected status code from proxy: %d", resp.StatusCode),

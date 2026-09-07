@@ -141,44 +141,66 @@ func TestGetErrorTypes(t *testing.T) {
 	assert.NoError(t, err)
 	defer proxy.Close()
 
-	get := func(tag string) error {
-		opts := []GetRequestOption{WithGetRequestReplicas(1)}
-		if tag != "" {
-			opts = append(opts, WithGetRequestTag(tag))
-		}
-
-		_, err := proxy.Get(context.Background(), NewGetRequest("http://example.com/file.txt", opts...))
-		return err
+	tests := []struct {
+		name   string
+		tag    string
+		expect func(t *testing.T, err error)
+	}{
+		{
+			name: "backend",
+			tag:  "backend",
+			expect: func(t *testing.T, err error) {
+				assert := assert.New(t)
+				var backendErr *BackendError
+				assert.ErrorAs(err, &backendErr)
+				assert.Equal("boom", backendErr.Message)
+				assert.Equal(http.StatusInternalServerError, backendErr.StatusCode)
+			},
+		},
+		{
+			name: "proxy",
+			tag:  "proxy",
+			expect: func(t *testing.T, err error) {
+				assert := assert.New(t)
+				var proxyErr *ProxyError
+				assert.ErrorAs(err, &proxyErr)
+				assert.Equal("boom", proxyErr.Message)
+				assert.Equal(http.StatusInternalServerError, proxyErr.StatusCode)
+			},
+		},
+		{
+			name: "dfdaemon",
+			tag:  "dfdaemon",
+			expect: func(t *testing.T, err error) {
+				assert := assert.New(t)
+				var dfdaemonErr *DfdaemonError
+				assert.ErrorAs(err, &dfdaemonErr)
+				assert.Equal("boom", dfdaemonErr.Message)
+				assert.Equal(http.StatusInternalServerError, dfdaemonErr.StatusCode)
+			},
+		},
+		{
+			name: "unknown status code",
+			expect: func(t *testing.T, err error) {
+				assert := assert.New(t)
+				var proxyErr *ProxyError
+				assert.ErrorAs(err, &proxyErr)
+				assert.Contains(proxyErr.Message, "unexpected status code")
+			},
+		},
 	}
 
-	t.Run("backend", func(t *testing.T) {
-		var backendErr *BackendError
-		err := get("backend")
-		assert.ErrorAs(t, err, &backendErr)
-		assert.Equal(t, "boom", backendErr.Message)
-		assert.Equal(t, http.StatusInternalServerError, backendErr.StatusCode)
-	})
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := []GetRequestOption{WithGetRequestReplicas(1)}
+			if tc.tag != "" {
+				opts = append(opts, WithGetRequestTag(tc.tag))
+			}
 
-	t.Run("proxy", func(t *testing.T) {
-		var proxyErr *ProxyError
-		err := get("proxy")
-		assert.ErrorAs(t, err, &proxyErr)
-		assert.Equal(t, "boom", proxyErr.Message)
-	})
-
-	t.Run("dfdaemon", func(t *testing.T) {
-		var dfdaemonErr *DfdaemonError
-		err := get("dfdaemon")
-		assert.ErrorAs(t, err, &dfdaemonErr)
-		assert.Equal(t, "boom", dfdaemonErr.Message)
-	})
-
-	t.Run("unknown status code", func(t *testing.T) {
-		var proxyErr *ProxyError
-		err := get("")
-		assert.ErrorAs(t, err, &proxyErr)
-		assert.Contains(t, proxyErr.Message, "unexpected status code")
-	})
+			_, err := proxy.Get(context.Background(), NewGetRequest("http://example.com/file.txt", opts...))
+			tc.expect(t, err)
+		})
+	}
 }
 
 func TestGetScattersAcrossReplicas(t *testing.T) {
@@ -209,24 +231,6 @@ func TestGetScattersAcrossReplicas(t *testing.T) {
 }
 
 func TestGetRetriesOnlyTransientAnswers(t *testing.T) {
-	expectBackend := func(status int, hits int32) func(t *testing.T, hits int32, err error) {
-		return func(t *testing.T, got int32, err error) {
-			assert := assert.New(t)
-			var backendErr *BackendError
-			assert.ErrorAs(err, &backendErr)
-			assert.Equal(status, backendErr.StatusCode)
-			assert.Equal(hits, got)
-		}
-	}
-	expectProxy := func(status int, hits int32) func(t *testing.T, hits int32, err error) {
-		return func(t *testing.T, got int32, err error) {
-			assert := assert.New(t)
-			var proxyErr *ProxyError
-			assert.ErrorAs(err, &proxyErr)
-			assert.Equal(status, proxyErr.StatusCode)
-			assert.Equal(hits, got)
-		}
-	}
 	tests := []struct {
 		name       string
 		status     int
@@ -234,21 +238,240 @@ func TestGetRetriesOnlyTransientAnswers(t *testing.T) {
 		maxRetries uint8
 		expect     func(t *testing.T, hits int32, err error)
 	}{
-		{"503 backend", http.StatusServiceUnavailable, "backend", 2, expectBackend(http.StatusServiceUnavailable, 3)},
-		{"503 proxy", http.StatusServiceUnavailable, "proxy", 2, expectProxy(http.StatusServiceUnavailable, 3)},
-		{"500 backend", http.StatusInternalServerError, "backend", 1, expectBackend(http.StatusInternalServerError, 2)},
-		{"500 proxy", http.StatusInternalServerError, "proxy", 1, expectProxy(http.StatusInternalServerError, 2)},
-		{"408 backend", http.StatusRequestTimeout, "backend", 1, expectBackend(http.StatusRequestTimeout, 2)},
-		{"408 proxy", http.StatusRequestTimeout, "proxy", 1, expectProxy(http.StatusRequestTimeout, 2)},
-		{"429 backend", http.StatusTooManyRequests, "backend", 3, expectBackend(http.StatusTooManyRequests, 4)},
-		{"429 proxy", http.StatusTooManyRequests, "proxy", 3, expectProxy(http.StatusTooManyRequests, 4)},
-		{"429 proxy without retries", http.StatusTooManyRequests, "proxy", 0, expectProxy(http.StatusTooManyRequests, 1)},
-		{"401 backend", http.StatusUnauthorized, "backend", 3, expectBackend(http.StatusUnauthorized, 1)},
-		{"401 proxy", http.StatusUnauthorized, "proxy", 3, expectProxy(http.StatusUnauthorized, 1)},
-		{"403 backend", http.StatusForbidden, "backend", 3, expectBackend(http.StatusForbidden, 1)},
-		{"403 proxy", http.StatusForbidden, "proxy", 3, expectProxy(http.StatusForbidden, 1)},
-		{"404 backend", http.StatusNotFound, "backend", 3, expectBackend(http.StatusNotFound, 1)},
-		{"404 proxy", http.StatusNotFound, "proxy", 3, expectProxy(http.StatusNotFound, 1)},
+		{
+			name:       "503 backend",
+			status:     http.StatusServiceUnavailable,
+			errorType:  "backend",
+			maxRetries: 2,
+			expect: func(t *testing.T, hits int32, err error) {
+				assert := assert.New(t)
+				var backendErr *BackendError
+				assert.ErrorAs(err, &backendErr)
+				assert.Equal(http.StatusServiceUnavailable, backendErr.StatusCode)
+				assert.Equal(int32(3), hits)
+			},
+		},
+		{
+			name:       "503 proxy",
+			status:     http.StatusServiceUnavailable,
+			errorType:  "proxy",
+			maxRetries: 2,
+			expect: func(t *testing.T, hits int32, err error) {
+				assert := assert.New(t)
+				var proxyErr *ProxyError
+				assert.ErrorAs(err, &proxyErr)
+				assert.Equal(http.StatusServiceUnavailable, proxyErr.StatusCode)
+				assert.Equal(int32(3), hits)
+			},
+		},
+		{
+			name:       "500 backend",
+			status:     http.StatusInternalServerError,
+			errorType:  "backend",
+			maxRetries: 1,
+			expect: func(t *testing.T, hits int32, err error) {
+				assert := assert.New(t)
+				var backendErr *BackendError
+				assert.ErrorAs(err, &backendErr)
+				assert.Equal(http.StatusInternalServerError, backendErr.StatusCode)
+				assert.Equal(int32(2), hits)
+			},
+		},
+		{
+			name:       "500 proxy",
+			status:     http.StatusInternalServerError,
+			errorType:  "proxy",
+			maxRetries: 1,
+			expect: func(t *testing.T, hits int32, err error) {
+				assert := assert.New(t)
+				var proxyErr *ProxyError
+				assert.ErrorAs(err, &proxyErr)
+				assert.Equal(http.StatusInternalServerError, proxyErr.StatusCode)
+				assert.Equal(int32(2), hits)
+			},
+		},
+		{
+			name:       "500 dfdaemon",
+			status:     http.StatusInternalServerError,
+			errorType:  "dfdaemon",
+			maxRetries: 1,
+			expect: func(t *testing.T, hits int32, err error) {
+				assert := assert.New(t)
+				var dfdaemonErr *DfdaemonError
+				assert.ErrorAs(err, &dfdaemonErr)
+				assert.Equal(http.StatusInternalServerError, dfdaemonErr.StatusCode)
+				assert.Equal(int32(2), hits)
+			},
+		},
+		{
+			name:       "507 dfdaemon",
+			status:     http.StatusInsufficientStorage,
+			errorType:  "dfdaemon",
+			maxRetries: 2,
+			expect: func(t *testing.T, hits int32, err error) {
+				assert := assert.New(t)
+				var dfdaemonErr *DfdaemonError
+				assert.ErrorAs(err, &dfdaemonErr)
+				assert.Equal(http.StatusInsufficientStorage, dfdaemonErr.StatusCode)
+				assert.Equal(int32(3), hits)
+			},
+		},
+		{
+			name:       "422 dfdaemon",
+			status:     http.StatusUnprocessableEntity,
+			errorType:  "dfdaemon",
+			maxRetries: 3,
+			expect: func(t *testing.T, hits int32, err error) {
+				assert := assert.New(t)
+				var dfdaemonErr *DfdaemonError
+				assert.ErrorAs(err, &dfdaemonErr)
+				assert.Equal(http.StatusUnprocessableEntity, dfdaemonErr.StatusCode)
+				assert.Equal(int32(1), hits)
+			},
+		},
+		{
+			name:       "408 backend",
+			status:     http.StatusRequestTimeout,
+			errorType:  "backend",
+			maxRetries: 1,
+			expect: func(t *testing.T, hits int32, err error) {
+				assert := assert.New(t)
+				var backendErr *BackendError
+				assert.ErrorAs(err, &backendErr)
+				assert.Equal(http.StatusRequestTimeout, backendErr.StatusCode)
+				assert.Equal(int32(2), hits)
+			},
+		},
+		{
+			name:       "408 proxy",
+			status:     http.StatusRequestTimeout,
+			errorType:  "proxy",
+			maxRetries: 1,
+			expect: func(t *testing.T, hits int32, err error) {
+				assert := assert.New(t)
+				var proxyErr *ProxyError
+				assert.ErrorAs(err, &proxyErr)
+				assert.Equal(http.StatusRequestTimeout, proxyErr.StatusCode)
+				assert.Equal(int32(2), hits)
+			},
+		},
+		{
+			name:       "429 backend",
+			status:     http.StatusTooManyRequests,
+			errorType:  "backend",
+			maxRetries: 3,
+			expect: func(t *testing.T, hits int32, err error) {
+				assert := assert.New(t)
+				var backendErr *BackendError
+				assert.ErrorAs(err, &backendErr)
+				assert.Equal(http.StatusTooManyRequests, backendErr.StatusCode)
+				assert.Equal(int32(4), hits)
+			},
+		},
+		{
+			name:       "429 proxy",
+			status:     http.StatusTooManyRequests,
+			errorType:  "proxy",
+			maxRetries: 3,
+			expect: func(t *testing.T, hits int32, err error) {
+				assert := assert.New(t)
+				var proxyErr *ProxyError
+				assert.ErrorAs(err, &proxyErr)
+				assert.Equal(http.StatusTooManyRequests, proxyErr.StatusCode)
+				assert.Equal(int32(4), hits)
+			},
+		},
+		{
+			name:       "429 proxy without retries",
+			status:     http.StatusTooManyRequests,
+			errorType:  "proxy",
+			maxRetries: 0,
+			expect: func(t *testing.T, hits int32, err error) {
+				assert := assert.New(t)
+				var proxyErr *ProxyError
+				assert.ErrorAs(err, &proxyErr)
+				assert.Equal(http.StatusTooManyRequests, proxyErr.StatusCode)
+				assert.Equal(int32(1), hits)
+			},
+		},
+		{
+			name:       "401 backend",
+			status:     http.StatusUnauthorized,
+			errorType:  "backend",
+			maxRetries: 3,
+			expect: func(t *testing.T, hits int32, err error) {
+				assert := assert.New(t)
+				var backendErr *BackendError
+				assert.ErrorAs(err, &backendErr)
+				assert.Equal(http.StatusUnauthorized, backendErr.StatusCode)
+				assert.Equal(int32(1), hits)
+			},
+		},
+		{
+			name:       "401 proxy",
+			status:     http.StatusUnauthorized,
+			errorType:  "proxy",
+			maxRetries: 3,
+			expect: func(t *testing.T, hits int32, err error) {
+				assert := assert.New(t)
+				var proxyErr *ProxyError
+				assert.ErrorAs(err, &proxyErr)
+				assert.Equal(http.StatusUnauthorized, proxyErr.StatusCode)
+				assert.Equal(int32(1), hits)
+			},
+		},
+		{
+			name:       "403 backend",
+			status:     http.StatusForbidden,
+			errorType:  "backend",
+			maxRetries: 3,
+			expect: func(t *testing.T, hits int32, err error) {
+				assert := assert.New(t)
+				var backendErr *BackendError
+				assert.ErrorAs(err, &backendErr)
+				assert.Equal(http.StatusForbidden, backendErr.StatusCode)
+				assert.Equal(int32(1), hits)
+			},
+		},
+		{
+			name:       "403 proxy",
+			status:     http.StatusForbidden,
+			errorType:  "proxy",
+			maxRetries: 3,
+			expect: func(t *testing.T, hits int32, err error) {
+				assert := assert.New(t)
+				var proxyErr *ProxyError
+				assert.ErrorAs(err, &proxyErr)
+				assert.Equal(http.StatusForbidden, proxyErr.StatusCode)
+				assert.Equal(int32(1), hits)
+			},
+		},
+		{
+			name:       "404 backend",
+			status:     http.StatusNotFound,
+			errorType:  "backend",
+			maxRetries: 3,
+			expect: func(t *testing.T, hits int32, err error) {
+				assert := assert.New(t)
+				var backendErr *BackendError
+				assert.ErrorAs(err, &backendErr)
+				assert.Equal(http.StatusNotFound, backendErr.StatusCode)
+				assert.Equal(int32(1), hits)
+			},
+		},
+		{
+			name:       "404 proxy",
+			status:     http.StatusNotFound,
+			errorType:  "proxy",
+			maxRetries: 3,
+			expect: func(t *testing.T, hits int32, err error) {
+				assert := assert.New(t)
+				var proxyErr *ProxyError
+				assert.ErrorAs(err, &proxyErr)
+				assert.Equal(http.StatusNotFound, proxyErr.StatusCode)
+				assert.Equal(int32(1), hits)
+			},
+		},
 	}
 
 	for _, tc := range tests {

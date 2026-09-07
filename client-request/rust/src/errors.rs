@@ -59,15 +59,26 @@ pub enum Error {
 
 /// Implements the error.
 impl Error {
-    /// Whether a failed attempt is worth another: the seed peer could not be reached
-    /// or answered too slowly, the dfdaemon failed, or the proxy or backend answered
-    /// `5xx`, `408` or `429`, since another seed peer may not be rate limited. Every
-    /// other answer is definitive for the request, so retrying would only repeat it.
+    /// Whether a failed attempt is worth another one against a different seed peer.
+    ///
+    /// | Failure                                                      | Retry |
+    /// |--------------------------------------------------------------|-------|
+    /// | `RequestTimeout`, `Internal` (connect, transport, body read) | yes   |
+    /// | proxy / backend / dfdaemon answer `5xx`, `408` or `429`      | yes   |
+    /// | proxy / backend / dfdaemon answer without a status code      | yes   |
+    /// | gRPC `Internal`, `Unavailable`, `Unknown`, `Aborted`         | yes   |
+    /// | any other answer, such as `403`, `404`, `422`                | no    |
+    /// | any other gRPC code, `InvalidArgument`, `HostNotFound`       | no    |
+    ///
+    /// `429` and `507` are retried because another seed peer may not be rate
+    /// limited or out of space. Any other `4xx` is definitive: every seed peer
+    /// would answer the same.
     pub(crate) fn is_retryable(&self) -> bool {
         match self {
-            Error::RequestTimeout(_) | Error::Internal(_) | Error::DfdaemonError(_) => true,
+            Error::RequestTimeout(_) | Error::Internal(_) => true,
             Error::ProxyError(ProxyError { status_code, .. })
-            | Error::BackendError(BackendError { status_code, .. }) => {
+            | Error::BackendError(BackendError { status_code, .. })
+            | Error::DfdaemonError(DfdaemonError { status_code, .. }) => {
                 status_code.is_none_or(|status| {
                     status.is_server_error()
                         || status == reqwest::StatusCode::REQUEST_TIMEOUT
@@ -85,10 +96,18 @@ impl Error {
         }
     }
 
-    /// Converts the status of a failed dfdaemon download task into the error. The
-    /// dfdaemon encodes a backend failure into the status details with the backend's
-    /// status code, which is kept so a definitive answer such as `404` is not retried.
-    /// A deadline is a request timeout, anything else stays the status itself.
+    /// Converts the gRPC status of a failed dfdaemon download task into an [`Error`].
+    ///
+    /// ```text
+    /// Status ──details decode as Backend──▶ BackendError { status_code, header, message }
+    ///    │
+    ///    ├──DeadlineExceeded─────────────▶ RequestTimeout
+    ///    └──anything else────────────────▶ TonicStatus
+    /// ```
+    ///
+    /// The dfdaemon reports an origin failure as `Internal` with the origin's
+    /// status code in the details. Decoding it keeps a `404` definitive instead of
+    /// retrying it as an internal error.
     pub(crate) fn from_status(status: tonic::Status) -> Error {
         if let Ok(backend) = serde_json::from_slice::<Backend>(status.details()) {
             return Error::BackendError(BackendError {
@@ -140,12 +159,26 @@ pub struct ProxyError {
     pub status_code: Option<reqwest::StatusCode>,
 }
 
-/// The error detail for Dfdaemon.
+/// The error detail for Dfdaemon: the seed peer's dfdaemon could not run the
+/// download task. The status code says why.
+///
+/// | Status | Meaning                                                            |
+/// |--------|--------------------------------------------------------------------|
+/// | `400`  | invalid request or URL                                             |
+/// | `422`  | the origin sent no `Content-Length`, or the piece length is invalid |
+/// | `507`  | the seed peer has no room for the task                             |
+/// | `500`  | any other failure: scheduling, peers, streaming                    |
 #[derive(Debug, thiserror::Error)]
-#[error("dfdaemon error, message: {message:?}")]
+#[error("dfdaemon error, message: {message:?}, header: {header:?}, status_code: {status_code:?}")]
 pub struct DfdaemonError {
     /// Dfdaemon error message.
     pub message: Option<String>,
+
+    /// Dfdaemon HTTP response header.
+    pub header: HashMap<String, String>,
+
+    /// Dfdaemon HTTP status code.
+    pub status_code: Option<reqwest::StatusCode>,
 }
 
 #[cfg(test)]
@@ -169,6 +202,14 @@ mod tests {
         })
     }
 
+    fn dfdaemon(status_code: Option<StatusCode>) -> Error {
+        Error::DfdaemonError(DfdaemonError {
+            message: None,
+            header: HashMap::new(),
+            status_code,
+        })
+    }
+
     fn status(code: Code) -> Error {
         Error::TonicStatus(tonic::Status::new(code, "status"))
     }
@@ -178,7 +219,11 @@ mod tests {
         let test_cases = vec![
             (Error::RequestTimeout("timeout".to_string()), true),
             (Error::Internal("boom".to_string()), true),
-            (Error::DfdaemonError(DfdaemonError { message: None }), true),
+            (dfdaemon(None), true),
+            (dfdaemon(Some(StatusCode::INTERNAL_SERVER_ERROR)), true),
+            (dfdaemon(Some(StatusCode::INSUFFICIENT_STORAGE)), true),
+            (dfdaemon(Some(StatusCode::UNPROCESSABLE_ENTITY)), false),
+            (dfdaemon(Some(StatusCode::BAD_REQUEST)), false),
             (proxy(None), true),
             (backend(None), true),
             (proxy(Some(StatusCode::INTERNAL_SERVER_ERROR)), true),

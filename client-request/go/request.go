@@ -42,62 +42,69 @@ const defaultReplicas = 2
 
 // Request is the interface for sending requests via the Dragonfly.
 //
-// It enables interaction with remote servers through the Dragonfly, shielding
-// the complex request logic between the client and the Dragonfly seed client's
-// proxy.
+// A request is served by the seed peers the scheduler picks for its task, and a
+// seed peer's dfdaemon fetches from the origin only what the P2P network does
+// not hold yet:
+//
+//	client ──lookup──▶ scheduler ──▶ seed peers [B, A]
+//	  │
+//	  └──GET──▶ B (seed peer proxy) ──miss──▶ origin
+//	                │
+//	                └──5xx / timeout──▶ retry on A
+//
+// Proxy implements it.
 type Request interface {
-	// Get sends a GET request to a remote server via the Dragonfly and returns
-	// a response with a streaming body. The caller must close the body.
+	// Get sends a GET request via the Dragonfly and returns a response with a
+	// streaming body the caller must close. A transient failure before the
+	// body starts is retried on the next seed peer, a failure while streaming
+	// it is not.
 	Get(ctx context.Context, req *GetRequest) (*GetResponse, error)
 
-	// GetInto sends a GET request to a remote server via the Dragonfly and
-	// writes the response body directly into the provided writer.
+	// GetInto sends a GET request via the Dragonfly and writes the response
+	// body into w. A transient failure before the body starts is retried on
+	// the next seed peer, a failed body write is not since w cannot be rewound.
 	GetInto(ctx context.Context, req *GetRequest, w io.Writer) (*GetResponse, error)
 
-	// Preheat preheats a file by downloading it to the replicas of seed peers
-	// via the Dragonfly, without streaming the file content back to the
-	// client. It fails when the available seed peers are fewer than the
-	// replicas of the request.
+	// Preheat preheats a file: has every replica seed peer download it through
+	// the dfdaemon download task API without streaming it back. A transient
+	// failure is retried on the same seed peer, so the file lands on every
+	// replica. It fails when fewer seed peers than replicas are available.
 	Preheat(ctx context.Context, req *PreheatRequest) error
 
-	// PreheatImage preheats an OCI image by downloading all its blobs via the
-	// Dragonfly. It resolves the image manifest (including multi-platform
-	// image indexes) and triggers the seed client to download each blob.
+	// PreheatImage preheats an OCI image: resolves its manifest, multi-platform
+	// indexes included, and has the seed peers download every config and layer
+	// blob without streaming them back.
 	PreheatImage(ctx context.Context, req *PreheatImageRequest) error
 
-	// StatImage provides detailed status for an OCI image's distribution in
-	// the Dragonfly. It requests the scheduler to resolve the image manifest
-	// and collect the cached layers on each peer. It only queries the seed
-	// peers.
+	// StatImage reports which seed peers hold which layers of an OCI image, as
+	// resolved by the scheduler. Useful to verify a preheat.
 	StatImage(ctx context.Context, req *StatImageRequest) (*StatImageResponse, error)
 
-	// LookupEndpoints looks up the endpoints of the seed peers serving the
-	// request, in the consistent hash ring selection order for the request's
-	// task id. It returns up to the replicas of the request distinct
-	// endpoints, clamped to the number of available seed peers.
+	// LookupEndpoints returns the endpoints of the seed peers that would serve
+	// the request, in consistent hash ring order for its task id, up to the
+	// replicas of the request and clamped to the available seed peers.
 	LookupEndpoints(ctx context.Context, req *GetRequest) ([]string, error)
 }
 
 // RequestWithEndpoints is the interface for sending requests via fixed seed
-// peer endpoints of the Dragonfly.
+// peer endpoints.
 //
-// Unlike Request, it sends requests to the seed peer endpoints given at
-// construction (e.g., the ones returned by Request.LookupEndpoints), without
-// selecting seed peers by the consistent hash ring or syncing them from the
-// scheduler.
+// The endpoints are given at construction, typically from
+// Request.LookupEndpoints, so no scheduler is consulted:
+//
+//	client ──GET──▶ endpoint B ──5xx / timeout──▶ retry on endpoint A
+//
+// ProxyWithEndpoints implements it.
 type RequestWithEndpoints interface {
-	// Get sends a GET request to a remote server via the seed peer endpoints
-	// of the Dragonfly and returns a response with a streaming body. The
-	// request is sent to a randomly picked endpoint and a transient failure is
-	// retried on the others up to the max retries. The caller must close the
-	// body.
+	// Get sends a GET request to the endpoints and returns a response with a
+	// streaming body the caller must close. A transient failure before the
+	// body starts is retried on the next endpoint, a failure while streaming
+	// it is not.
 	Get(ctx context.Context, req *GetRequest) (*GetResponse, error)
 
-	// GetInto sends a GET request to a remote server via the seed peer
-	// endpoints of the Dragonfly and writes the response body directly into
-	// the provided writer. The request is sent to a randomly picked endpoint
-	// and a transient failure is retried on the others up to the max retries,
-	// while a failed body read is not, since the writer cannot be rewound.
+	// GetInto sends a GET request to the endpoints and writes the response
+	// body into w. A transient failure before the body starts is retried on
+	// the next endpoint, a failed body write is not since w cannot be rewound.
 	GetInto(ctx context.Context, req *GetRequest, w io.Writer) (*GetResponse, error)
 }
 
