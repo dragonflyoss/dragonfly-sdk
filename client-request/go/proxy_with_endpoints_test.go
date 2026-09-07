@@ -37,7 +37,7 @@ func TestNewWithEndpoints(t *testing.T) {
 
 	// Each distinct endpoint gets its own client with a reusable connection
 	// pool, deduplicated across the given endpoints.
-	assert.Equal(uint8(defaultMaxRetries), p.maxRetries)
+	assert.Equal(uint8(defaultMaxRetries), p.retry.maxRetries)
 	assert.Equal(endpoints, p.endpoints)
 	assert.Len(p.clients, 2)
 	assert.NotNil(p.clients["http://127.0.0.1:4001"])

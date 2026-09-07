@@ -32,7 +32,7 @@ import (
 )
 
 // defaultRequestTimeout is the default timeout for requests.
-const defaultRequestTimeout = 30 * 60 * time.Second
+const defaultRequestTimeout = 10 * 60 * time.Second
 
 // defaultConcurrentTaskCount is the default number of blobs to preheat concurrently.
 const defaultConcurrentTaskCount = 4
@@ -88,14 +88,16 @@ type Request interface {
 type RequestWithEndpoints interface {
 	// Get sends a GET request to a remote server via the seed peer endpoints
 	// of the Dragonfly and returns a response with a streaming body. The
-	// request is sent to a randomly picked endpoint and retried on the others
-	// up to the max retries. The caller must close the body.
+	// request is sent to a randomly picked endpoint and a transient failure is
+	// retried on the others up to the max retries. The caller must close the
+	// body.
 	Get(ctx context.Context, req *GetRequest) (*GetResponse, error)
 
 	// GetInto sends a GET request to a remote server via the seed peer
 	// endpoints of the Dragonfly and writes the response body directly into
 	// the provided writer. The request is sent to a randomly picked endpoint
-	// and retried on the others up to the max retries.
+	// and a transient failure is retried on the others up to the max retries,
+	// while a failed body read is not, since the writer cannot be rewound.
 	GetInto(ctx context.Context, req *GetRequest, w io.Writer) (*GetResponse, error)
 }
 
@@ -133,7 +135,7 @@ type GetRequest struct {
 	// replicas is the number of seed peers serving the task.
 	replicas int
 
-	// timeout is the timeout of the request.
+	// timeout is the timeout of each attempt of the request.
 	timeout time.Duration
 
 	// certificates is the client certificates for the request.
@@ -203,7 +205,7 @@ func WithGetRequestReplicas(replicas int) GetRequestOption {
 	return func(r *GetRequest) { r.replicas = replicas }
 }
 
-// WithGetRequestTimeout sets the timeout of the request.
+// WithGetRequestTimeout sets the timeout of each attempt of the request.
 func WithGetRequestTimeout(timeout time.Duration) GetRequestOption {
 	return func(r *GetRequest) { r.timeout = timeout }
 }
@@ -215,7 +217,7 @@ func WithGetRequestCertificates(certs []*x509.Certificate) GetRequestOption {
 }
 
 // NewGetRequest returns a GetRequest for the url with default values: the
-// default filtered query params, blob digest based task id enabled and a 30
+// default filtered query params, blob digest based task id enabled and a 10
 // minutes timeout.
 func NewGetRequest(url string, opts ...GetRequestOption) *GetRequest {
 	r := &GetRequest{
@@ -295,7 +297,7 @@ type PreheatRequest struct {
 	// replicas is the number of seed peers serving the task.
 	replicas int
 
-	// timeout is the timeout of the request.
+	// timeout is the timeout of each attempt of the request.
 	timeout time.Duration
 
 	// certificates is the client certificates for the request.
@@ -357,7 +359,7 @@ func WithPreheatRequestReplicas(replicas int) PreheatRequestOption {
 	return func(r *PreheatRequest) { r.replicas = replicas }
 }
 
-// WithPreheatRequestTimeout sets the timeout of the request.
+// WithPreheatRequestTimeout sets the timeout of each attempt of the request.
 func WithPreheatRequestTimeout(timeout time.Duration) PreheatRequestOption {
 	return func(r *PreheatRequest) { r.timeout = timeout }
 }

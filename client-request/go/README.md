@@ -54,6 +54,24 @@ req := request.NewGetRequest(
 )
 ```
 
+Retry transient failures. A request is retried on another seed peer when the
+peer cannot be reached or answers too slowly, the dfdaemon fails, or the proxy
+or backend answers `5xx`, `408` or `429`, since another seed peer may not be
+rate limited. Any other answer, such as `404`, is definitive and returns at
+once. Preheating retries the same way on each replica seed peer. The default is
+one retry at once, `WithProxyMaxRetries(0)` disables retries, and a
+`cenkalti/backoff` exponential backoff spreads the retries out. The request
+timeout applies to each attempt:
+
+```go
+import "github.com/cenkalti/backoff/v5"
+
+proxy, err := request.New(ctx, "http://127.0.0.1:8002",
+    request.WithProxyMaxRetries(3),
+    request.WithProxyBackoff(backoff.NewExponentialBackOff()),
+)
+```
+
 Preheat a file or an OCI image to the seed peers:
 
 ```go

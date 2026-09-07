@@ -40,7 +40,7 @@ fn key_hash(key: &str) -> u64 {
 }
 
 #[test]
-fn test_siphash() {
+fn siphash_matches_go() {
     let test_cases = vec![
         (0, "seed-peer-1", 0x1e5a582b8d945969),
         (1, "seed-peer-1", 0xb5db98265419376c),
@@ -67,7 +67,7 @@ fn test_siphash() {
 }
 
 #[test]
-fn test_hashring() {
+fn hashring_matches_go() {
     let mut ring = VNodeHashRing::new(3);
     for name in ["seed-peer-1", "seed-peer-2", "seed-peer-3"] {
         ring.add(name.to_string());
@@ -124,7 +124,7 @@ fn test_hashring() {
 }
 
 #[test]
-fn test_task_id() {
+fn task_id_matches_go() {
     let generator = IDGenerator::new("127.0.0.1".to_string(), "localhost".to_string(), false);
 
     let test_cases = vec![

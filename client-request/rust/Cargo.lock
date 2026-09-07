@@ -138,6 +138,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "backon"
+version = "1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cffb0e931875b666fc4fcb20fee52e9bbd1ef836fd9e9e04ec21555f9f85f7ef"
+dependencies = [
+ "fastrand",
+ "tokio",
+]
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -619,9 +629,10 @@ dependencies = [
 
 [[package]]
 name = "dragonfly-client-request"
-version = "1.6.2"
+version = "1.7.1"
 dependencies = [
  "async-trait",
+ "backon",
  "bytes",
  "criterion",
  "dashmap",
@@ -643,6 +654,7 @@ dependencies = [
  "reqwest-tracing",
  "rustls",
  "rustls-pki-types",
+ "serde_json",
  "sha2 0.10.9",
  "siphasher 1.0.3",
  "thiserror 2.0.20",
@@ -2753,7 +2765,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

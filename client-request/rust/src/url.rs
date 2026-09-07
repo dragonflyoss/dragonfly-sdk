@@ -48,7 +48,7 @@ fn query_escape(s: &str) -> String {
 /// applies WHATWG normalizations that Go's net/url does not (e.g. lowercasing
 /// the host, stripping default ports, resolving dot segments), so such urls
 /// may still canonicalize differently from the scheduler.
-pub fn filter_query_params(url: &str, filtered_query_params: &[String]) -> Result<String> {
+pub(crate) fn filter_query_params(url: &str, filtered_query_params: &[String]) -> Result<String> {
     if filtered_query_params.is_empty() {
         return Ok(url.to_string());
     }

@@ -24,7 +24,10 @@ import (
 	"testing"
 	"time"
 
+	"sync/atomic"
+
 	commonv2 "d7y.io/api/v2/pkg/apis/common/v2"
+	"github.com/cenkalti/backoff/v5"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -87,6 +90,43 @@ func TestPreheatFailsWhenSeedPeerDownloadFails(t *testing.T) {
 
 	err = proxy.Preheat(context.Background(), req)
 	assert.ErrorContains(err, "failed to download task")
+}
+
+func TestPreheatRetriesOnlyTransientDownloadFailures(t *testing.T) {
+	tests := []struct {
+		code         codes.Code
+		maxRetries   uint8
+		expectedHits int32
+	}{
+		{codes.Internal, 1, 2},
+		{codes.Unavailable, 2, 3},
+		{codes.DeadlineExceeded, 1, 2},
+		{codes.NotFound, 3, 1},
+		{codes.PermissionDenied, 3, 1},
+		{codes.InvalidArgument, 3, 1},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.code.String(), func(t *testing.T) {
+			assert := assert.New(t)
+
+			var hits atomic.Int32
+			port := setupMockSeedPeerServer(t, &mockSeedPeer{
+				downloadErr: status.Error(tc.code, "download failed"),
+				onDownload:  func() { hits.Add(1) },
+			})
+			endpoint := setupMockScheduler(t, []*commonv2.Host{createSeedPeerHost("seed-peer-1", port, 0)})
+
+			exponential := &backoff.ExponentialBackOff{InitialInterval: time.Millisecond, Multiplier: 2, MaxInterval: 2 * time.Millisecond}
+			proxy, err := New(context.Background(), endpoint, WithProxyMaxRetries(tc.maxRetries), WithProxyBackoff(exponential))
+			assert.NoError(err)
+			defer proxy.Close()
+
+			err = proxy.Preheat(context.Background(), NewPreheatRequest("http://example.com/payload.txt", WithPreheatRequestReplicas(1)))
+			assert.Equal(tc.code, status.Code(err))
+			assert.Equal(tc.expectedHits, hits.Load())
+		})
+	}
 }
 
 func TestPreheatImageInvalidReference(t *testing.T) {

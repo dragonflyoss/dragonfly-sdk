@@ -22,8 +22,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/cenkalti/backoff/v5"
 
 	commonv2 "d7y.io/api/v2/pkg/apis/common/v2"
 	"d7y.io/dragonfly/v2/pkg/idgen"
@@ -36,7 +39,7 @@ func TestNewSuccess(t *testing.T) {
 
 	p, err := New(context.Background(), endpoint)
 	assert.NoError(err)
-	assert.Equal(uint8(1), p.maxRetries)
+	assert.Equal(uint8(1), p.retry.maxRetries)
 	p.Close()
 }
 
@@ -204,6 +207,95 @@ func TestGetScattersAcrossReplicas(t *testing.T) {
 	body, err := io.ReadAll(resp.Body)
 	assert.NoError(err)
 	assert.Equal("ok", string(body))
+}
+
+func TestGetRetriesOnlyTransientAnswers(t *testing.T) {
+	tests := []struct {
+		name         string
+		status       int
+		errorType    string
+		maxRetries   uint8
+		expectedHits int32
+	}{
+		{"503 backend", http.StatusServiceUnavailable, "backend", 2, 3},
+		{"503 proxy", http.StatusServiceUnavailable, "proxy", 2, 3},
+		{"500 backend", http.StatusInternalServerError, "backend", 1, 2},
+		{"500 proxy", http.StatusInternalServerError, "proxy", 1, 2},
+		{"408 backend", http.StatusRequestTimeout, "backend", 1, 2},
+		{"408 proxy", http.StatusRequestTimeout, "proxy", 1, 2},
+		{"429 backend", http.StatusTooManyRequests, "backend", 3, 4},
+		{"429 proxy", http.StatusTooManyRequests, "proxy", 3, 4},
+		{"429 proxy without retries", http.StatusTooManyRequests, "proxy", 0, 1},
+		{"401 backend", http.StatusUnauthorized, "backend", 3, 1},
+		{"401 proxy", http.StatusUnauthorized, "proxy", 3, 1},
+		{"403 backend", http.StatusForbidden, "backend", 3, 1},
+		{"403 proxy", http.StatusForbidden, "proxy", 3, 1},
+		{"404 backend", http.StatusNotFound, "backend", 3, 1},
+		{"404 proxy", http.StatusNotFound, "proxy", 3, 1},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
+
+			var hits atomic.Int32
+			proxyPort := setupMockSeedPeerProxy(t, func(w http.ResponseWriter, r *http.Request) {
+				hits.Add(1)
+				w.Header().Set("X-Dragonfly-Error-Type", tc.errorType)
+				w.WriteHeader(tc.status)
+			})
+			port := setupMockSeedPeer(t, nil)
+			endpoint := setupMockScheduler(t, []*commonv2.Host{createSeedPeerHost("seed-peer-1", port, proxyPort)})
+
+			exponential := &backoff.ExponentialBackOff{InitialInterval: time.Millisecond, RandomizationFactor: 0.5, Multiplier: 2, MaxInterval: 2 * time.Millisecond}
+			proxy, err := New(context.Background(), endpoint, WithProxyMaxRetries(tc.maxRetries), WithProxyBackoff(exponential))
+			assert.NoError(err)
+			defer proxy.Close()
+
+			_, err = proxy.Get(context.Background(), NewGetRequest("http://example.com/file.txt", WithGetRequestReplicas(1)))
+			var backendErr *BackendError
+			var proxyErr *ProxyError
+			switch tc.errorType {
+			case "backend":
+				assert.ErrorAs(err, &backendErr)
+				assert.Equal(tc.status, backendErr.StatusCode)
+			case "proxy":
+				assert.ErrorAs(err, &proxyErr)
+				assert.Equal(tc.status, proxyErr.StatusCode)
+			}
+			assert.Equal(tc.expectedHits, hits.Load())
+		})
+	}
+}
+
+func TestTimeoutAppliesToEachAttempt(t *testing.T) {
+	assert := assert.New(t)
+
+	var hits atomic.Int32
+	proxyPort := setupMockSeedPeerProxy(t, func(w http.ResponseWriter, r *http.Request) {
+		if hits.Add(1) == 1 {
+			<-r.Context().Done()
+			return
+		}
+
+		fmt.Fprint(w, "ok")
+	})
+	port := setupMockSeedPeer(t, nil)
+	endpoint := setupMockScheduler(t, []*commonv2.Host{createSeedPeerHost("seed-peer-1", port, proxyPort)})
+
+	proxy, err := New(context.Background(), endpoint)
+	assert.NoError(err)
+	defer proxy.Close()
+
+	timeout := 300 * time.Millisecond
+	start := time.Now()
+	var buf bytes.Buffer
+	req := NewGetRequest("http://example.com/file.txt", WithGetRequestReplicas(1), WithGetRequestTimeout(timeout))
+	_, err = proxy.GetInto(context.Background(), req, &buf)
+	assert.NoError(err)
+	assert.Equal("ok", buf.String())
+	assert.GreaterOrEqual(time.Since(start), timeout)
+	assert.Less(time.Since(start), 3*timeout)
 }
 
 func TestGetInvalidReplicas(t *testing.T) {

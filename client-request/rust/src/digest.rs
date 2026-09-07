@@ -192,7 +192,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_extract_from_blob_url() {
+    fn extracts_digest_from_blob_url() {
         let test_cases = vec![
             (
                 "http://registry.example.com/v2/library/ubuntu/blobs/sha256:b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e",
@@ -233,7 +233,7 @@ mod tests {
     }
 
     #[test]
-    fn test_is_manifest_digest_url() {
+    fn recognizes_manifest_digest_url() {
         let test_cases = vec![
             (
                 "http://registry.example.com/v2/library/ubuntu/manifests/sha256:b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e",
@@ -268,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_from_manifest_url() {
+    fn extracts_digest_from_manifest_url() {
         let test_cases = vec![
             (
                 "http://registry.example.com/v2/library/ubuntu/manifests/sha256:b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e",
@@ -310,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn test_algorithm_display() {
+    fn algorithm_display() {
         let test_cases = vec![
             (Algorithm::Crc32, "crc32"),
             (Algorithm::Sha256, "sha256"),
@@ -323,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn test_algorithm_from_str() {
+    fn algorithm_from_str() {
         let test_cases = vec![
             ("crc32", Some(Algorithm::Crc32)),
             ("sha256", Some(Algorithm::Sha256)),
@@ -337,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn test_digest_display() {
+    fn digest_display() {
         let test_cases = vec![
             (Algorithm::Crc32, "1475635037", "crc32:1475635037"),
             (Algorithm::Sha256, "encoded_hash", "sha256:encoded_hash"),

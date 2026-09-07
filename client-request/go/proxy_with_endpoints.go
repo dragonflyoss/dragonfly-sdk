@@ -21,18 +21,27 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
-	"math/rand/v2"
 	"net/http"
 	"slices"
+
+	"github.com/cenkalti/backoff/v5"
 )
 
 // ProxyWithEndpointsOption configures the ProxyWithEndpoints.
 type ProxyWithEndpointsOption func(p *ProxyWithEndpoints)
 
-// WithProxyWithEndpointsMaxRetries sets the maximum number of retries.
+// WithProxyWithEndpointsMaxRetries sets the maximum number of retries of a
+// request on a transient failure: a timeout, a connection or transport error,
+// a dfdaemon error, or a 5xx or 408 answer. Each retry goes to the next
+// endpoint, any other answer returns at once.
 func WithProxyWithEndpointsMaxRetries(retries uint8) ProxyWithEndpointsOption {
-	return func(p *ProxyWithEndpoints) { p.maxRetries = retries }
+	return func(p *ProxyWithEndpoints) { p.retry.maxRetries = retries }
+}
+
+// WithProxyWithEndpointsBackoff sets the exponential backoff between the retries. Without
+// it retries go at once.
+func WithProxyWithEndpointsBackoff(b *backoff.ExponentialBackOff) ProxyWithEndpointsOption {
+	return func(p *ProxyWithEndpoints) { p.retry.backoff = b }
 }
 
 // Ensure ProxyWithEndpoints implements the RequestWithEndpoints interface at
@@ -44,8 +53,8 @@ var _ RequestWithEndpoints = (*ProxyWithEndpoints)(nil)
 // selecting seed peers by the consistent hash ring or syncing them from the
 // scheduler.
 type ProxyWithEndpoints struct {
-	// maxRetries is the number of times to retry a request.
-	maxRetries uint8
+	// retry is the retry policy of the requests.
+	retry retryPolicy
 
 	// endpoints is the seed peer endpoints serving the requests.
 	endpoints []string
@@ -61,8 +70,8 @@ type ProxyWithEndpoints struct {
 // its own client with a reusable connection pool.
 func NewWithEndpoints(endpoints []string, opts ...ProxyWithEndpointsOption) (*ProxyWithEndpoints, error) {
 	p := &ProxyWithEndpoints{
-		maxRetries: defaultMaxRetries,
-		endpoints:  slices.Clone(endpoints),
+		retry:     defaultRetryPolicy,
+		endpoints: slices.Clone(endpoints),
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -72,8 +81,8 @@ func NewWithEndpoints(endpoints []string, opts ...ProxyWithEndpointsOption) (*Pr
 		return nil, fmt.Errorf("%w: endpoints must not be empty", ErrInvalidArgument)
 	}
 
-	if p.maxRetries > 10 {
-		return nil, fmt.Errorf("%w: max retries must be between 0 and 10", ErrInvalidArgument)
+	if p.retry.maxRetries > 3 {
+		return nil, fmt.Errorf("%w: max retries must be between 0 and 3", ErrInvalidArgument)
 	}
 
 	p.clients = make(map[string]*http.Client, len(p.endpoints))
@@ -95,19 +104,15 @@ func NewWithEndpoints(endpoints []string, opts ...ProxyWithEndpointsOption) (*Pr
 
 // Get sends a GET request to a remote server via the seed peer endpoints of
 // the Dragonfly and returns a response with a streaming body. The request is
-// sent to a randomly picked endpoint and retried on the others up to the max
-// retries. The caller must close the body.
+// sent to a randomly picked endpoint and a transient failure is retried on
+// the others up to the max retries. The caller must close the body.
 func (p *ProxyWithEndpoints) Get(ctx context.Context, req *GetRequest) (*GetResponse, error) {
 	if err := req.validate(); err != nil {
 		return nil, err
 	}
 
-	// The timeout covers the whole request including the body read, so the
-	// cancel function is called when the body is closed.
-	ctx, cancel := context.WithTimeout(ctx, req.timeout)
-	resp, err := p.trySend(ctx, req)
+	resp, cancel, err := p.trySend(ctx, req)
 	if err != nil {
-		cancel()
 		return nil, err
 	}
 
@@ -116,51 +121,29 @@ func (p *ProxyWithEndpoints) Get(ctx context.Context, req *GetRequest) (*GetResp
 
 // GetInto sends a GET request to a remote server via the seed peer endpoints
 // of the Dragonfly and writes the response body directly into the provided
-// writer. The request is sent to a randomly picked endpoint and retried on
-// the others up to the max retries.
+// writer. The request is sent to a randomly picked endpoint and a transient
+// failure is retried on the others up to the max retries, while a failed body
+// read is not, since the writer cannot be rewound.
 func (p *ProxyWithEndpoints) GetInto(ctx context.Context, req *GetRequest, w io.Writer) (*GetResponse, error) {
 	if err := req.validate(); err != nil {
 		return nil, err
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, req.timeout)
-	defer cancel()
-
-	resp, err := p.trySend(ctx, req)
+	resp, cancel, err := p.trySend(ctx, req)
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			return nil, fmt.Errorf("%w: %v", ErrRequestTimeout, err)
-		}
-
 		return nil, err
 	}
+	defer cancel()
 
 	return copyResponse(resp, w)
 }
 
-// trySend scatters the request across the endpoints: it tries randomly picked
-// endpoints one by one, limited by the max retries.
-func (p *ProxyWithEndpoints) trySend(ctx context.Context, req *GetRequest) (*http.Response, error) {
-	// Scatter the request across the endpoints: shuffle them and make
-	// 1 + max retries attempts, wrapping around when the endpoints are fewer
-	// than the attempts.
-	shuffled := slices.Clone(p.endpoints)
-	rand.Shuffle(len(shuffled), func(i, j int) { shuffled[i], shuffled[j] = shuffled[j], shuffled[i] })
-
-	var lastErr error
-	for attempt := range int(p.maxRetries) + 1 {
-		endpoint := shuffled[attempt%len(shuffled)]
-		resp, err := p.send(ctx, p.clients[endpoint], req)
-		if err != nil {
-			slog.Warn("failed to send request to endpoint", "endpoint", endpoint, "error", err)
-			lastErr = err
-			continue
-		}
-
-		return resp, nil
-	}
-
-	return nil, lastErr
+// trySend scatters the request across the endpoints, retrying a transient
+// failure on the next endpoint up to the max retries.
+func (p *ProxyWithEndpoints) trySend(ctx context.Context, req *GetRequest) (*http.Response, context.CancelFunc, error) {
+	return retryWithEndpoints(ctx, p.retry, p.endpoints, req.timeout, func(ctx context.Context, endpoint string) (*http.Response, error) {
+		return p.send(ctx, p.clients[endpoint], req)
+	})
 }
 
 // send sends a request to the specified URL via the client with the given

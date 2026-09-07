@@ -22,12 +22,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
-	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -39,6 +36,7 @@ import (
 
 	"d7y.io/dragonfly-sdk/client-request/go/internal/pool"
 	"d7y.io/dragonfly-sdk/client-request/go/internal/selector"
+	"github.com/cenkalti/backoff/v5"
 )
 
 const (
@@ -87,9 +85,18 @@ const (
 // ProxyOption configures the Proxy.
 type ProxyOption func(p *Proxy)
 
-// WithProxyMaxRetries sets the maximum number of retries.
+// WithProxyMaxRetries sets the maximum number of retries of a request on a
+// transient failure: a timeout, a connection or transport error, a dfdaemon
+// error, or a 5xx or 408 answer. Each retry goes to the next seed peer, any
+// other answer returns at once.
 func WithProxyMaxRetries(retries uint8) ProxyOption {
-	return func(p *Proxy) { p.maxRetries = retries }
+	return func(p *Proxy) { p.retry.maxRetries = retries }
+}
+
+// WithProxyBackoff sets the exponential backoff between the retries. Without
+// it retries go at once.
+func WithProxyBackoff(b *backoff.ExponentialBackOff) ProxyOption {
+	return func(p *Proxy) { p.retry.backoff = b }
 }
 
 // WithProxySchedulerRequestTimeout sets the timeout of requests to the
@@ -109,8 +116,8 @@ var _ Request = (*Proxy)(nil)
 
 // Proxy is the HTTP proxy client that sends requests via Dragonfly.
 type Proxy struct {
-	// maxRetries is the number of times to retry a request.
-	maxRetries uint8
+	// retry is the retry policy of the requests.
+	retry retryPolicy
 
 	// schedulerRequestTimeout is the timeout of requests to the scheduler
 	// service.
@@ -133,7 +140,7 @@ type Proxy struct {
 // e.g. "http://scheduler-service:8002".
 func New(ctx context.Context, schedulerEndpoint string, opts ...ProxyOption) (*Proxy, error) {
 	p := &Proxy{
-		maxRetries:              defaultMaxRetries,
+		retry:                   defaultRetryPolicy,
 		schedulerRequestTimeout: defaultSchedulerRequestTimeout,
 		healthCheckInterval:     defaultHealthCheckInterval,
 		clientPool:              pool.New(httpClientFactory, defaultClientPoolCapacity, defaultClientPoolIdleTimeout),
@@ -189,7 +196,7 @@ func (p *Proxy) validate(schedulerEndpoint string) (string, error) {
 		return "", fmt.Errorf("%w: health check interval must be between 1 and 600 seconds", ErrInvalidArgument)
 	}
 
-	if p.maxRetries > 10 {
+	if p.retry.maxRetries > 10 {
 		return "", fmt.Errorf("%w: max retries must be between 0 and 10", ErrInvalidArgument)
 	}
 
@@ -234,12 +241,8 @@ func (p *Proxy) Get(ctx context.Context, req *GetRequest) (*GetResponse, error) 
 		return nil, err
 	}
 
-	// The timeout covers the whole request including the body read, so the
-	// cancel function is called when the body is closed.
-	ctx, cancel := context.WithTimeout(ctx, req.timeout)
-	resp, err := p.trySend(ctx, req)
+	resp, cancel, err := p.trySend(ctx, req)
 	if err != nil {
-		cancel()
 		return nil, err
 	}
 
@@ -253,60 +256,17 @@ func (p *Proxy) GetInto(ctx context.Context, req *GetRequest, w io.Writer) (*Get
 		return nil, err
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, req.timeout)
-	defer cancel()
-
-	resp, err := p.trySend(ctx, req)
+	resp, cancel, err := p.trySend(ctx, req)
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			return nil, fmt.Errorf("%w: %v", ErrRequestTimeout, err)
-		}
-
 		return nil, err
 	}
+	defer cancel()
 
 	return copyResponse(resp, w)
 }
 
-// sendWithEndpoints scatters the request across the given seed peer endpoints:
-// it tries randomly picked endpoints one by one, limited by the max retries of
-// the Proxy.
-func (p *Proxy) sendWithEndpoints(ctx context.Context, endpoints []string, req *GetRequest) (*http.Response, error) {
-	if len(endpoints) == 0 {
-		return nil, fmt.Errorf("%w: no endpoints to send request", ErrInvalidArgument)
-	}
-
-	// Scatter the request across the endpoints: shuffle them and make
-	// 1 + max retries attempts, wrapping around when the endpoints are fewer
-	// than the attempts.
-	shuffled := slices.Clone(endpoints)
-	rand.Shuffle(len(shuffled), func(i, j int) { shuffled[i], shuffled[j] = shuffled[j], shuffled[i] })
-
-	var lastErr error
-	for attempt := range int(p.maxRetries) + 1 {
-		endpoint := shuffled[attempt%len(shuffled)]
-		entry, err := p.clientPool.Entry(endpoint, endpoint)
-		if err != nil {
-			return nil, err
-		}
-
-		guard := entry.RequestGuard()
-		resp, err := p.send(ctx, entry.Client, req)
-		guard.Done()
-		if err != nil {
-			slog.Warn("failed to send request to endpoint", "endpoint", endpoint, "error", err)
-			lastErr = err
-			continue
-		}
-
-		return resp, nil
-	}
-
-	return nil, lastErr
-}
-
 // streamResponse builds the response with a streaming body that releases the
-// request timeout when the body is closed.
+// attempt timeout when the body is closed.
 func streamResponse(resp *http.Response, cancel context.CancelFunc) *GetResponse {
 	return &GetResponse{
 		Success:    true,
@@ -385,15 +345,24 @@ func (p *Proxy) lookupProxyEndpoints(req *GetRequest) ([]string, error) {
 	return endpoints, nil
 }
 
-// trySend scatters the request across the seed peers serving it and returns
-// the first successful response.
-func (p *Proxy) trySend(ctx context.Context, req *GetRequest) (*http.Response, error) {
+// trySend scatters the request across the seed peers serving it, retrying a
+// transient failure on the next seed peer up to the max retries.
+func (p *Proxy) trySend(ctx context.Context, req *GetRequest) (*http.Response, context.CancelFunc, error) {
 	endpoints, err := p.lookupProxyEndpoints(req)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	return p.sendWithEndpoints(ctx, endpoints, req)
+	return retryWithEndpoints(ctx, p.retry, endpoints, req.timeout, func(ctx context.Context, endpoint string) (*http.Response, error) {
+		entry, err := p.clientPool.Entry(endpoint, endpoint)
+		if err != nil {
+			return nil, err
+		}
+
+		guard := entry.RequestGuard()
+		defer guard.Done()
+		return p.send(ctx, entry.Client, req)
+	})
 }
 
 // send sends a request to the specified URL via the client with the given

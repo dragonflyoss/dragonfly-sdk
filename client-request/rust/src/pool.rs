@@ -31,9 +31,9 @@ const DEFAULT_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Entry wrapper for clients in the pool.
 #[derive(Clone)]
-pub struct Entry<T> {
+pub(crate) struct Entry<T> {
     /// The generic client instance.
-    pub client: T,
+    pub(crate) client: T,
 
     /// The time when the client is the last active time.
     actived_at: Arc<std::sync::Mutex<Instant>>,
@@ -63,7 +63,7 @@ impl<T> Entry<T> {
 
 /// Factory trait for creating new clients.
 #[async_trait]
-pub trait Factory<A, T> {
+pub(crate) trait Factory<A, T> {
     type Error;
 
     /// Create a new client for the given key.
@@ -71,7 +71,7 @@ pub trait Factory<A, T> {
 }
 
 /// Generic client pool for managing reusable clients with automatic cleanup.
-pub struct Pool<K, A, T, F> {
+pub(crate) struct Pool<K, A, T, F> {
     /// The factory for creating new clients.
     factory: F,
 
@@ -94,7 +94,7 @@ pub struct Pool<K, A, T, F> {
 }
 
 /// Builder for creating a client pool.
-pub struct Builder<K, A, T, F> {
+pub(crate) struct Builder<K, A, T, F> {
     factory: F,
     capacity: usize,
     idle_timeout: Duration,
@@ -109,7 +109,7 @@ where
     F: Factory<A, T>,
 {
     /// Create a new client pool builder.
-    pub fn new(factory: F) -> Self {
+    pub(crate) fn new(factory: F) -> Self {
         Self {
             factory,
             capacity: DEFAULT_POOL_CAPACITY,
@@ -119,19 +119,19 @@ where
     }
 
     /// Set the capacity of the pool.
-    pub fn capacity(mut self, capacity: usize) -> Self {
+    pub(crate) fn capacity(mut self, capacity: usize) -> Self {
         self.capacity = capacity;
         self
     }
 
     /// Set the idle timeout of the pool.
-    pub fn idle_timeout(mut self, idle_timeout: Duration) -> Self {
+    pub(crate) fn idle_timeout(mut self, idle_timeout: Duration) -> Self {
         self.idle_timeout = idle_timeout;
         self
     }
 
     /// Build the client pool.
-    pub fn build(self) -> Pool<K, A, T, F> {
+    pub(crate) fn build(self) -> Pool<K, A, T, F> {
         Pool {
             factory: self.factory,
             clients: Arc::new(DashMap::new()),
@@ -159,7 +159,7 @@ where
     F: Factory<A, T>,
 {
     /// Get or create a client entry for the given key.
-    pub async fn entry(&self, key: &K, addr: &A) -> Result<Entry<T>, F::Error> {
+    pub(crate) async fn entry(&self, key: &K, addr: &A) -> Result<Entry<T>, F::Error> {
         // Cleanup idle clients first.
         self.cleanup_idle_entries().await;
 

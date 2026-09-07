@@ -36,7 +36,7 @@ use tracing::{debug, error, info, Instrument};
 
 /// The interface for selecting item from a list of items by a specific criteria.
 #[async_trait]
-pub trait Selector: Send + Sync {
+pub(crate) trait Selector: Send + Sync {
     /// select selects items based on the given task_id and number of replicas.
     async fn select(&self, task_id: String, replicas: u32) -> Result<Vec<Host>>;
 }
@@ -57,7 +57,7 @@ struct SeedPeers {
 }
 
 /// The implementation of Selector for seed peers.
-pub struct SeedPeerSelector {
+pub(crate) struct SeedPeerSelector {
     /// The interval of health check for seed peers.
     health_check_interval: Duration,
 
@@ -74,7 +74,7 @@ pub struct SeedPeerSelector {
 /// Implements a selector that selects seed peers from the scheduler service.
 impl SeedPeerSelector {
     /// Creates a new seed peer selector.
-    pub async fn new(
+    pub(crate) async fn new(
         scheduler_client: SchedulerClient<Channel>,
         health_check_interval: Duration,
     ) -> Result<Self> {
@@ -93,7 +93,7 @@ impl SeedPeerSelector {
     }
 
     /// Starts the seed peer selector service.
-    pub async fn run(&self) {
+    pub(crate) async fn run(&self) {
         let mut interval = tokio::time::interval(self.health_check_interval);
         loop {
             tokio::select! {
@@ -321,7 +321,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_select_with_no_hosts() {
+    async fn select_with_no_hosts() {
         let selector = create_test_selector().await;
 
         let result = selector.select("test-task".to_string(), 2).await;
@@ -330,7 +330,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_select_with_single_host() {
+    async fn select_with_single_host() {
         let selector = create_test_selector().await;
 
         let host = create_test_host("1", "192.168.1.1", 8080, 1);
@@ -346,7 +346,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_select_replicas() {
+    async fn select_replicas() {
         let test_cases = vec![(5, 3, 3), (2, 5, 2), (20, 10, 10)];
 
         for (host_count, replicas, expected_len) in test_cases {
@@ -376,7 +376,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_select_consistency() {
+    async fn select_consistency() {
         let selector = create_test_selector().await;
 
         for i in 1..=5 {
@@ -402,7 +402,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_concurrent_select() {
+    async fn concurrent_select() {
         let selector = Arc::new(create_test_selector().await);
 
         for i in 1..=5 {
