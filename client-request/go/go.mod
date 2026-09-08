@@ -1,6 +1,6 @@
 module d7y.io/dragonfly-sdk/client-request/go
 
-go 1.25
+go 1.26.0
 
 require (
 	d7y.io/api/v2 v2.3.7
@@ -9,7 +9,7 @@ require (
 	github.com/dchest/siphash v1.2.3
 	github.com/docker/distribution v2.8.3+incompatible
 	github.com/stretchr/testify v1.12.1
-	golang.org/x/sync v0.19.0
+	golang.org/x/sync v0.23.0
 	google.golang.org/grpc v1.80.0
 	google.golang.org/protobuf v1.36.12
 )
