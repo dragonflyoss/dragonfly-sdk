@@ -1,0 +1,46 @@
+scheduler:
+  image:
+    repository: dragonflyoss/scheduler
+    tag: v2.5.2-rc.2
+  replicas: 1
+  resources:
+    requests:
+      cpu: '0'
+      memory: '0'
+    limits:
+      cpu: '2'
+      memory: '4Gi'
+  config:
+    server:
+      logLevel: debug
+    dynconfig:
+      refreshInterval: 5s
+
+seedClient:
+  enable: true
+  replicas: 4
+  image:
+    repository: dragonflyoss/client
+    tag: v1.5.4
+  resources:
+    requests:
+      cpu: '0'
+      memory: '0'
+    limits:
+      cpu: '2'
+      memory: '4Gi'
+  persistence:
+    enable: false
+  config:
+    log:
+      level: debug
+    scheduler:
+      announceInterval: 15s
+    dynconfig:
+      refreshInterval: 5s
+    proxy:
+      server:
+        requestRateLimit: 4000
+
+client:
+  enable: false

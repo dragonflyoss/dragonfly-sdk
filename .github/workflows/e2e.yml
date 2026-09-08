@@ -1,0 +1,97 @@
+name: E2E Test
+
+on:
+  push:
+    branches: [main, release-*]
+    paths: ['client-request/**', 'test/**', '.github/workflows/e2e.yml']
+  pull_request:
+    branches: [main, release-*]
+    paths: ['client-request/**', 'test/**', '.github/workflows/e2e.yml']
+
+permissions:
+  contents: read
+
+env:
+  KIND_VERSION: v0.32.0
+  KIND_CONFIG_PATH: test/testdata/kind/config.yaml
+  DRAGONFLY_CHARTS_VERSION: 1.7.9
+  DRAGONFLY_CHARTS_CONFIG_PATH: test/testdata/charts/config.yaml
+  DRAGONFLY_FILE_SERVER_PATH: test/testdata/k8s/dufs.yaml
+  DRAGONFLY_E2E_RUNNER_PATH: test/testdata/k8s/e2e-runner.yaml
+  ARTIFACT_DIR: /tmp/artifact
+
+jobs:
+  e2e_tests:
+    name: E2E
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: test/e2e/go.mod
+          cache-dependency-path: test/e2e/go.sum
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: test/e2e/driver/rust
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get dependencies
+        run: |
+          go install github.com/onsi/ginkgo/v2/ginkgo@v2.32.1
+          mkdir -p ${{ env.ARTIFACT_DIR }}/bin ${{ env.ARTIFACT_DIR }}/dufs
+          chmod -R 777 ${{ env.ARTIFACT_DIR }}
+
+      - name: Build SDK drivers
+        run: |
+          make build-e2e-drivers ARTIFACT_DIR=${{ env.ARTIFACT_DIR }}
+
+      - name: Setup Kind
+        uses: helm/kind-action@v1
+        with:
+          version: ${{ env.KIND_VERSION }}
+          config: ${{ env.KIND_CONFIG_PATH }}
+          cluster_name: kind
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v5
+
+      - name: Setup dragonfly
+        run: |
+          helm repo add dragonfly https://dragonflyoss.github.io/helm-charts/
+          helm install --wait --timeout 15m --create-namespace --namespace dragonfly-system -f ${{ env.DRAGONFLY_CHARTS_CONFIG_PATH }} dragonfly dragonfly/dragonfly --version ${{ env.DRAGONFLY_CHARTS_VERSION }}
+
+          kubectl apply -f ${{ env.DRAGONFLY_FILE_SERVER_PATH }}
+          kubectl apply -f ${{ env.DRAGONFLY_E2E_RUNNER_PATH }}
+          kubectl wait po dufs-0 --namespace dragonfly-e2e --for=condition=ready --timeout=10m
+          kubectl wait po e2e-runner --namespace dragonfly-e2e --for=condition=ready --timeout=10m
+
+      - name: Run E2E test
+        run: |
+          make e2e-test
+
+      - name: Export logs
+        if: always()
+        run: |
+          sudo chown -R $USER:$USER ${{ env.ARTIFACT_DIR }}
+          rm -rf ${{ env.ARTIFACT_DIR }}/bin ${{ env.ARTIFACT_DIR }}/dufs
+
+      - name: Upload Logs
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: e2e-tests-logs
+          path: |
+            ${{ env.ARTIFACT_DIR }}/**
