@@ -50,7 +50,7 @@ jobs:
 
       - name: Get dependencies
         run: |
-          go install github.com/onsi/ginkgo/v2/ginkgo@v2.32.1
+          go install github.com/onsi/ginkgo/v2/ginkgo@v2.28.2
           mkdir -p ${{ env.ARTIFACT_DIR }}/bin ${{ env.ARTIFACT_DIR }}/dufs
           chmod -R 777 ${{ env.ARTIFACT_DIR }}
 
