@@ -561,10 +561,10 @@ func TestLookupEndpoints(t *testing.T) {
 	assert := assert.New(t)
 	endpoints := make(map[string]string, 3)
 	var hosts []*commonv2.Host
-	for _, name := range []string{"seed-peer-1", "seed-peer-2", "seed-peer-3"} {
-		port := setupMockSeedPeer(t, nil)
-		endpoints[name] = fmt.Sprintf("http://127.0.0.1:%d", port)
-		hosts = append(hosts, createSeedPeerHost(name, port, 0))
+	for i, name := range []string{"seed-peer-1", "seed-peer-2", "seed-peer-3"} {
+		proxyPort := int32(4001 + i)
+		endpoints[name] = fmt.Sprintf("http://127.0.0.1:%d", proxyPort)
+		hosts = append(hosts, createSeedPeerHost(name, setupMockSeedPeer(t, nil), proxyPort))
 	}
 	endpoint := setupMockScheduler(t, hosts)
 

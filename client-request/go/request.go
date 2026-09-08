@@ -80,9 +80,9 @@ type Request interface {
 	// resolved by the scheduler. Useful to verify a preheat.
 	StatImage(ctx context.Context, req *StatImageRequest) (*StatImageResponse, error)
 
-	// LookupEndpoints returns the endpoints of the seed peers that would serve
-	// the request, in consistent hash ring order for its task id, up to the
-	// replicas of the request and clamped to the available seed peers.
+	// LookupEndpoints returns the proxy endpoints of the seed peers that would
+	// serve the request, in consistent hash ring order for its task id, up to
+	// the replicas of the request and clamped to the available seed peers.
 	LookupEndpoints(ctx context.Context, req *GetRequest) ([]string, error)
 }
 

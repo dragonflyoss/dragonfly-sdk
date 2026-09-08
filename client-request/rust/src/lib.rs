@@ -185,8 +185,8 @@ pub trait Request {
     /// Fails when fewer seed peers than replicas are available.
     async fn preheat(&self, request: &PreheatRequest) -> Result<()>;
 
-    /// Returns the endpoints of the seed peers that would serve the request, in
-    /// consistent hash ring order for its task id, up to `replicas` of them and
+    /// Returns the proxy endpoints of the seed peers that would serve the request,
+    /// in consistent hash ring order for its task id, up to `replicas` of them and
     /// clamped to the available seed peers.
     async fn lookup_endpoints(&self, request: &GetRequest) -> Result<Vec<String>>;
 }
@@ -1281,58 +1281,13 @@ impl Request for Proxy {
         Ok(())
     }
 
-    /// Looks up the endpoints of the seed peers serving the request, in the consistent
-    /// hash ring selection order for the request's task id. It returns up to the
-    /// replicas of the request distinct endpoints, clamped to the number of available
-    /// seed peers.
+    /// Looks up the proxy endpoints of the seed peers serving the request, in the
+    /// consistent hash ring selection order for the request's task id. It returns up
+    /// to the replicas of the request distinct endpoints, clamped to the number of
+    /// available seed peers.
     async fn lookup_endpoints(&self, request: &GetRequest) -> Result<Vec<String>> {
         request.validate()?;
-
-        // Generate task id for selecting seed peer.
-        let task_id = self
-            .id_generator
-            .task_id(
-                if let Some(content) = request.content_for_calculating_task_id.clone() {
-                    TaskIDParameter::Content(content)
-                } else if request.enable_task_id_based_blob_digest && is_blob_url(&request.url) {
-                    TaskIDParameter::BlobDigestBased(request.url.clone())
-                } else if request.enable_task_id_based_blob_digest
-                    && is_manifest_digest_url(&request.url)
-                {
-                    TaskIDParameter::ManifestDigestBased(request.url.clone())
-                } else {
-                    TaskIDParameter::URLBased {
-                        url: request.url.clone(),
-                        piece_length: request.piece_length,
-                        tag: request.tag.clone(),
-                        application: request.application.clone(),
-                        filtered_query_params: request.filtered_query_params.clone(),
-                        revision: None,
-                    }
-                },
-            )
-            .map_err(|err| Error::Internal(format!("failed to generate task id: {err}")))?;
-
-        // Select seed peers for downloading.
-        let seed_peers = self
-            .seed_peer_selector
-            .select(task_id.clone(), request.replicas as u32)
-            .await
-            .map_err(|err| {
-                Error::Internal(format!("failed to select seed peers from scheduler: {err}"))
-            })?;
-        debug!("task {} selected seed peers: {:?}", task_id, seed_peers);
-
-        let mut addrs = Vec::with_capacity(seed_peers.len());
-        for peer in seed_peers.iter() {
-            addrs.push(format_url(
-                "http",
-                IpAddr::from_str(&peer.ip).map_err(|err| Error::Internal(err.to_string()))?,
-                peer.port as u16,
-            ));
-        }
-
-        Ok(addrs)
+        self.lookup_proxy_endpoints(request).await
     }
 }
 
@@ -3043,11 +2998,18 @@ mod tests {
         let mut servers = Vec::new();
         let mut endpoints = std::collections::HashMap::new();
         let mut hosts = Vec::new();
-        for name in ["seed-peer-1", "seed-peer-2", "seed-peer-3"] {
+        for (i, name) in ["seed-peer-1", "seed-peer-2", "seed-peer-3"]
+            .into_iter()
+            .enumerate()
+        {
             let server = setup_mock_seed_peer(MockSet::new()).await.unwrap();
-            let port = server.port().unwrap();
-            endpoints.insert(name, format!("http://127.0.0.1:{port}"));
-            hosts.push(create_seed_peer_host(name, port, 0));
+            let proxy_port = 4001 + i as u16;
+            endpoints.insert(name, format!("http://127.0.0.1:{proxy_port}"));
+            hosts.push(create_seed_peer_host(
+                name,
+                server.port().unwrap(),
+                proxy_port,
+            ));
             servers.push(server);
         }
 
