@@ -4,7 +4,7 @@ go 1.25.6
 
 require (
 	d7y.io/api/v2 v2.3.6
-	d7y.io/dragonfly/v2 v2.5.2-rc.1
+	d7y.io/dragonfly/v2 v2.5.2-rc.2
 	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/dchest/siphash v1.2.3
 	github.com/docker/distribution v2.8.3+incompatible
@@ -83,7 +83,7 @@ require (
 	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20260807164820-c8921c73eeea // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260819154853-08b0e4226688 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	gorm.io/driver/mysql v1.4.7 // indirect
