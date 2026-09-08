@@ -296,8 +296,8 @@ func copyResponse(resp *http.Response, w io.Writer) (*GetResponse, error) {
 	}, nil
 }
 
-// LookupEndpoints looks up the endpoints (e.g., "http://127.0.0.1:4000") of
-// the seed peers serving the request, in the consistent hash ring selection
+// LookupEndpoints looks up the proxy endpoints (e.g., "http://127.0.0.1:4001")
+// of the seed peers serving the request, in the consistent hash ring selection
 // order for the request's task id. It returns up to the replicas of the
 // request distinct endpoints, clamped to the number of available seed peers.
 func (p *Proxy) LookupEndpoints(ctx context.Context, req *GetRequest) ([]string, error) {
@@ -305,22 +305,7 @@ func (p *Proxy) LookupEndpoints(ctx context.Context, req *GetRequest) ([]string,
 		return nil, err
 	}
 
-	taskID, err := idgen.TaskIDV2(req.url, req.pieceLength, req.tag, req.application, req.filteredQueryParams, req.contentForCalculatingTaskID, req.enableTaskIDBasedBlobDigest)
-	if err != nil {
-		return nil, fmt.Errorf("%w: failed to generate task id: %v", ErrInternal, err)
-	}
-
-	seedPeers, err := p.seedPeerSelector.Select(taskID, uint32(req.replicas))
-	if err != nil {
-		return nil, fmt.Errorf("%w: failed to select seed peers from scheduler: %v", ErrInternal, err)
-	}
-
-	addrs := make([]string, 0, len(seedPeers))
-	for _, peer := range seedPeers {
-		addrs = append(addrs, fmt.Sprintf("http://%s", net.JoinHostPort(peer.Ip, strconv.Itoa(int(peer.Port)))))
-	}
-
-	return addrs, nil
+	return p.lookupProxyEndpoints(req)
 }
 
 // lookupProxyEndpoints looks up the proxy endpoints of the seed peers serving the
