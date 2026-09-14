@@ -1,16 +1,16 @@
 module d7y.io/dragonfly-sdk/test/e2e
 
-go 1.25
+go 1.25.0
 
 require (
 	d7y.io/dragonfly-sdk/client-request/go v0.0.0
-	d7y.io/dragonfly/v2 v2.5.2-rc.3
+	d7y.io/dragonfly/v2 v2.5.2
 	github.com/onsi/ginkgo/v2 v2.28.2
 	github.com/onsi/gomega v1.42.0
 )
 
 require (
-	d7y.io/api/v2 v2.3.7 // indirect
+	d7y.io/api/v2 v2.3.8 // indirect
 	filippo.io/edwards25519 v1.1.1 // indirect
 	github.com/Masterminds/semver/v3 v3.4.0 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
