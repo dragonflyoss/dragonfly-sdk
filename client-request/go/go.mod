@@ -1,10 +1,10 @@
 module d7y.io/dragonfly-sdk/client-request/go
 
-go 1.25
+go 1.25.0
 
 require (
-	d7y.io/api/v2 v2.3.7
-	d7y.io/dragonfly/v2 v2.5.2-rc.3
+	d7y.io/api/v2 v2.3.8
+	d7y.io/dragonfly/v2 v2.5.2
 	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/dchest/siphash v1.2.3
 	github.com/docker/distribution v2.8.3+incompatible
