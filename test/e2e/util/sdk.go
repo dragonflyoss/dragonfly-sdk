@@ -109,6 +109,16 @@ func (s *SDK) PreheatImage(image string) error {
 	return s.run(nil, "preheat-image", "--scheduler", SchedulerEndpoint, image)
 }
 
+// Delete deletes the preheated url from the seed peers through the SDK.
+func (s *SDK) Delete(url string) error {
+	return s.run(nil, "delete", "--scheduler", SchedulerEndpoint, url)
+}
+
+// DeleteImage deletes the preheated image from the seed peers through the SDK.
+func (s *SDK) DeleteImage(image string) error {
+	return s.run(nil, "delete-image", "--scheduler", SchedulerEndpoint, image)
+}
+
 // run runs the driver in the runner pod and decodes its JSON output into out
 // when out is not nil.
 func (s *SDK) run(out any, args ...string) error {

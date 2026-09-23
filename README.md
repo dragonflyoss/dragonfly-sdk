@@ -10,8 +10,8 @@ Multi-language SDKs for Dragonfly.
 
 | Package                                        | Description                                                                                                                        |
 | :--------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------- |
-| [client-request (Rust)](./client-request/rust) | Request library for the Dragonfly client: streaming and buffered GET requests, preheating files and OCI images through seed peers. |
-| [client-request (Go)](./client-request/go)     | Go implementation of the request library, generating identical task ids and seed peer selections as the Rust crate.                |
+| [client-request (Rust)](./client-request/rust) | Request library for the Dragonfly client: streaming and buffered GET requests, preheating files and OCI images through seed peers, deleting preheated files and OCI images from them. |
+| [client-request (Go)](./client-request/go)     | Go implementation of the request library, generating identical task ids and seed peer selections as the Rust crate.                                                                  |
 
 ## Documentation
 

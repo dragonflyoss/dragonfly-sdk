@@ -34,7 +34,8 @@ import (
 // defaultRequestTimeout is the default timeout for requests.
 const defaultRequestTimeout = 10 * 60 * time.Second
 
-// defaultConcurrentTaskCount is the default number of blobs to preheat concurrently.
+// defaultConcurrentTaskCount is the default number of blobs to preheat or
+// delete concurrently.
 const defaultConcurrentTaskCount = 4
 
 // defaultReplicas is the default number of seed peers serving a task.
@@ -79,6 +80,18 @@ type Request interface {
 	// StatImage reports which seed peers hold which layers of an OCI image, as
 	// resolved by the scheduler. Useful to verify a preheat.
 	StatImage(ctx context.Context, req *StatImageRequest) (*StatImageResponse, error)
+
+	// Delete deletes a preheated file: has every replica seed peer delete its
+	// task through the dfdaemon delete task API. A transient failure is retried
+	// on the same seed peer, so the task leaves every replica. A seed peer
+	// answering NotFound counts as deleted.
+	Delete(ctx context.Context, req *DeleteRequest) error
+
+	// DeleteImage deletes a preheated OCI image: resolves its manifest,
+	// multi-platform indexes included, and has the replica seed peers delete
+	// every manifest, config and layer blob task. A seed peer answering NotFound
+	// counts as deleted.
+	DeleteImage(ctx context.Context, req *DeleteImageRequest) error
 
 	// LookupEndpoints returns the proxy endpoints of the seed peers that would
 	// serve the request, in consistent hash ring order for its task id, up to
@@ -709,4 +722,265 @@ type Layer struct {
 
 	// IsFinished indicates whether the peer has finished downloading the layer.
 	IsFinished bool
+}
+
+// DeleteRequest represents a request to delete a preheated file from the
+// Dragonfly seed peers. The delete removes the task of the specified url from
+// the seed peers serving it. Construct it with NewDeleteRequest and set the
+// optional parameters with DeleteRequestOption.
+type DeleteRequest struct {
+	// url is the url of the request.
+	url string
+
+	// pieceLength is the task piece length.
+	pieceLength *uint64
+
+	// tag identifies different tasks for the same url.
+	tag string
+
+	// application identifies different tasks for the same url.
+	application string
+
+	// filteredQueryParams is the filtered query params to generate the task id.
+	filteredQueryParams []string
+
+	// contentForCalculatingTaskID is the content for calculating the task id.
+	contentForCalculatingTaskID string
+
+	// enableTaskIDBasedBlobDigest indicates whether to use the blob digest for
+	// task id calculation when the url is an OCI blob url.
+	enableTaskIDBasedBlobDigest bool
+
+	// replicas is the number of seed peers serving the task.
+	replicas int
+
+	// timeout is the timeout of each attempt of the request.
+	timeout time.Duration
+}
+
+// DeleteRequestOption configures the DeleteRequest.
+type DeleteRequestOption func(r *DeleteRequest)
+
+// WithDeleteRequestPieceLength sets the task piece length.
+func WithDeleteRequestPieceLength(pieceLength uint64) DeleteRequestOption {
+	return func(r *DeleteRequest) { r.pieceLength = &pieceLength }
+}
+
+// WithDeleteRequestTag sets the tag that identifies different tasks for the same
+// url.
+func WithDeleteRequestTag(tag string) DeleteRequestOption {
+	return func(r *DeleteRequest) { r.tag = tag }
+}
+
+// WithDeleteRequestApplication sets the application that identifies different tasks
+// for the same url.
+func WithDeleteRequestApplication(application string) DeleteRequestOption {
+	return func(r *DeleteRequest) { r.application = application }
+}
+
+// WithDeleteRequestFilteredQueryParams sets the filtered query params to generate
+// the task id.
+func WithDeleteRequestFilteredQueryParams(params []string) DeleteRequestOption {
+	return func(r *DeleteRequest) { r.filteredQueryParams = params }
+}
+
+// WithDeleteRequestContentForCalculatingTaskID sets the content for calculating the
+// task id.
+func WithDeleteRequestContentForCalculatingTaskID(content string) DeleteRequestOption {
+	return func(r *DeleteRequest) { r.contentForCalculatingTaskID = content }
+}
+
+// WithDeleteRequestEnableTaskIDBasedBlobDigest sets whether to use the blob digest
+// for task id calculation when the url is an OCI blob url. It should be consistent
+// with the value used when the file was preheated, default is true.
+func WithDeleteRequestEnableTaskIDBasedBlobDigest(enable bool) DeleteRequestOption {
+	return func(r *DeleteRequest) { r.enableTaskIDBasedBlobDigest = enable }
+}
+
+// WithDeleteRequestReplicas sets the number of seed peers serving the task,
+// consistent with the replicas used when the file was preheated, default is 2.
+func WithDeleteRequestReplicas(replicas int) DeleteRequestOption {
+	return func(r *DeleteRequest) { r.replicas = replicas }
+}
+
+// WithDeleteRequestTimeout sets the timeout of each attempt of the request.
+func WithDeleteRequestTimeout(timeout time.Duration) DeleteRequestOption {
+	return func(r *DeleteRequest) { r.timeout = timeout }
+}
+
+// NewDeleteRequest returns a DeleteRequest for the url with default values.
+func NewDeleteRequest(url string, opts ...DeleteRequestOption) *DeleteRequest {
+	r := &DeleteRequest{
+		url:                         url,
+		filteredQueryParams:         idgen.DefaultFilteredQueryParams,
+		enableTaskIDBasedBlobDigest: true,
+		replicas:                    defaultReplicas,
+		timeout:                     defaultRequestTimeout,
+	}
+	for _, opt := range opts {
+		opt(r)
+	}
+
+	return r
+}
+
+// validate validates the request parameters.
+func (r *DeleteRequest) validate() error {
+	if r.replicas <= 0 {
+		return fmt.Errorf("%w: replicas must be positive", ErrInvalidArgument)
+	}
+
+	return nil
+}
+
+// DeleteImageRequest represents a request to delete a preheated OCI image from
+// the Dragonfly seed peers. The delete removes the manifests and blobs (config
+// and layers) of the specified image from the seed peers serving them.
+// Construct it with NewDeleteImageRequest and set the optional parameters with
+// DeleteImageRequestOption.
+type DeleteImageRequest struct {
+	// image is the OCI image reference (e.g., "docker.io/library/nginx:latest").
+	image string
+
+	// username is the username for registry authentication.
+	username string
+
+	// password is the password for registry authentication.
+	password string
+
+	// platform specifies the target platform in the format "os/arch".
+	platform string
+
+	// pieceLength is the task piece length.
+	pieceLength *uint64
+
+	// tag identifies different tasks for the same url.
+	tag string
+
+	// application identifies different tasks for the same url.
+	application string
+
+	// filteredQueryParams is the filtered query params to generate the task id.
+	filteredQueryParams []string
+
+	// contentForCalculatingTaskID is the content for calculating the task id.
+	contentForCalculatingTaskID string
+
+	// enableTaskIDBasedBlobDigest indicates whether to use the blob digest for
+	// task id calculation when the url is an OCI blob url.
+	enableTaskIDBasedBlobDigest bool
+
+	// replicas is the number of seed peers serving each task.
+	replicas int
+
+	// timeout is the timeout of each attempt of a task delete.
+	timeout time.Duration
+
+	// concurrentTaskCount is the number of blobs to delete concurrently.
+	concurrentTaskCount int
+}
+
+// DeleteImageRequestOption configures the DeleteImageRequest.
+type DeleteImageRequestOption func(r *DeleteImageRequest)
+
+// WithDeleteImageRequestAuth sets the username and password for registry
+// authentication. If not provided, anonymous access is used.
+func WithDeleteImageRequestAuth(username, password string) DeleteImageRequestOption {
+	return func(r *DeleteImageRequest) {
+		r.username = username
+		r.password = password
+	}
+}
+
+// WithDeleteImageRequestPlatform sets the target platform in the format "os/arch"
+// (e.g., "linux/amd64", "linux/arm64"). It should be consistent with the platform
+// used when the image was preheated, default is current platform.
+func WithDeleteImageRequestPlatform(platform string) DeleteImageRequestOption {
+	return func(r *DeleteImageRequest) { r.platform = platform }
+}
+
+// WithDeleteImageRequestPieceLength sets the task piece length.
+func WithDeleteImageRequestPieceLength(pieceLength uint64) DeleteImageRequestOption {
+	return func(r *DeleteImageRequest) { r.pieceLength = &pieceLength }
+}
+
+// WithDeleteImageRequestTag sets the tag that identifies different tasks for the
+// same url.
+func WithDeleteImageRequestTag(tag string) DeleteImageRequestOption {
+	return func(r *DeleteImageRequest) { r.tag = tag }
+}
+
+// WithDeleteImageRequestApplication sets the application that identifies different
+// tasks for the same url.
+func WithDeleteImageRequestApplication(application string) DeleteImageRequestOption {
+	return func(r *DeleteImageRequest) { r.application = application }
+}
+
+// WithDeleteImageRequestFilteredQueryParams sets the filtered query params to
+// generate the task id.
+func WithDeleteImageRequestFilteredQueryParams(params []string) DeleteImageRequestOption {
+	return func(r *DeleteImageRequest) { r.filteredQueryParams = params }
+}
+
+// WithDeleteImageRequestContentForCalculatingTaskID sets the content for calculating
+// the task id.
+func WithDeleteImageRequestContentForCalculatingTaskID(content string) DeleteImageRequestOption {
+	return func(r *DeleteImageRequest) { r.contentForCalculatingTaskID = content }
+}
+
+// WithDeleteImageRequestEnableTaskIDBasedBlobDigest sets whether to use the blob
+// digest for task id calculation when the url is an OCI blob url. It should be
+// consistent with the value used when the image was preheated, default is true.
+func WithDeleteImageRequestEnableTaskIDBasedBlobDigest(enable bool) DeleteImageRequestOption {
+	return func(r *DeleteImageRequest) { r.enableTaskIDBasedBlobDigest = enable }
+}
+
+// WithDeleteImageRequestReplicas sets the number of seed peers serving each
+// task, consistent with the replicas used when the image was preheated, default
+// is 2.
+func WithDeleteImageRequestReplicas(replicas int) DeleteImageRequestOption {
+	return func(r *DeleteImageRequest) { r.replicas = replicas }
+}
+
+// WithDeleteImageRequestTimeout sets the timeout of each attempt of a task
+// delete.
+func WithDeleteImageRequestTimeout(timeout time.Duration) DeleteImageRequestOption {
+	return func(r *DeleteImageRequest) { r.timeout = timeout }
+}
+
+// WithDeleteImageRequestConcurrentTaskCount sets the number of blobs to delete
+// concurrently, default is 4.
+func WithDeleteImageRequestConcurrentTaskCount(count int) DeleteImageRequestOption {
+	return func(r *DeleteImageRequest) { r.concurrentTaskCount = count }
+}
+
+// NewDeleteImageRequest returns a DeleteImageRequest for the image with default
+// values.
+func NewDeleteImageRequest(image string, opts ...DeleteImageRequestOption) *DeleteImageRequest {
+	r := &DeleteImageRequest{
+		image:                       image,
+		filteredQueryParams:         idgen.DefaultFilteredQueryParams,
+		enableTaskIDBasedBlobDigest: true,
+		replicas:                    defaultReplicas,
+		timeout:                     defaultRequestTimeout,
+		concurrentTaskCount:         defaultConcurrentTaskCount,
+	}
+	for _, opt := range opts {
+		opt(r)
+	}
+
+	return r
+}
+
+// validate validates the request parameters.
+func (r *DeleteImageRequest) validate() error {
+	if r.replicas <= 0 {
+		return fmt.Errorf("%w: replicas must be positive", ErrInvalidArgument)
+	}
+
+	if r.concurrentTaskCount <= 0 {
+		return fmt.Errorf("%w: concurrent task count must be positive", ErrInvalidArgument)
+	}
+
+	return nil
 }

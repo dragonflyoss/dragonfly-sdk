@@ -24,6 +24,8 @@
 //	driver get --scheduler <endpoint> [--endpoint <endpoint>]... [--header <key: value>]... --output <path> <url>
 //	driver preheat --scheduler <endpoint> <url>
 //	driver preheat-image --scheduler <endpoint> <image>
+//	driver delete --scheduler <endpoint> <url>
+//	driver delete-image --scheduler <endpoint> <image>
 package main
 
 import (
@@ -89,6 +91,10 @@ func main() {
 		err = preheat(ctx, os.Args[2:])
 	case "preheat-image":
 		err = preheatImage(ctx, os.Args[2:])
+	case "delete":
+		err = delete(ctx, os.Args[2:])
+	case "delete-image":
+		err = deleteImage(ctx, os.Args[2:])
 	default:
 		usage()
 	}
@@ -101,7 +107,7 @@ func main() {
 
 // usage prints the usage and exits.
 func usage() {
-	fmt.Fprintf(os.Stderr, "usage: %s lookup-endpoints|get|preheat|preheat-image [flags] <url-or-image>\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "usage: %s lookup-endpoints|get|preheat|preheat-image|delete|delete-image [flags] <url-or-image>\n", os.Args[0])
 	os.Exit(1)
 }
 
@@ -238,6 +244,48 @@ func preheatImage(ctx context.Context, args []string) error {
 	defer proxy.Close()
 
 	return proxy.PreheatImage(ctx, request.NewPreheatImageRequest(flags.Arg(0)))
+}
+
+// delete deletes the preheated url from the seed peers.
+func delete(ctx context.Context, args []string) error {
+	flags := flag.NewFlagSet("delete", flag.ExitOnError)
+	schedulerEndpoint := flags.String("scheduler", "", "scheduler endpoint")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+
+	if flags.NArg() != 1 {
+		return errors.New("delete takes exactly one url")
+	}
+
+	proxy, err := request.New(ctx, *schedulerEndpoint)
+	if err != nil {
+		return err
+	}
+	defer proxy.Close()
+
+	return proxy.Delete(ctx, request.NewDeleteRequest(flags.Arg(0)))
+}
+
+// deleteImage deletes the preheated image from the seed peers.
+func deleteImage(ctx context.Context, args []string) error {
+	flags := flag.NewFlagSet("delete-image", flag.ExitOnError)
+	schedulerEndpoint := flags.String("scheduler", "", "scheduler endpoint")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+
+	if flags.NArg() != 1 {
+		return errors.New("delete-image takes exactly one image")
+	}
+
+	proxy, err := request.New(ctx, *schedulerEndpoint)
+	if err != nil {
+		return err
+	}
+	defer proxy.Close()
+
+	return proxy.DeleteImage(ctx, request.NewDeleteImageRequest(flags.Arg(0)))
 }
 
 // parseHeader parses the repeatable "Key: Value" header flags.

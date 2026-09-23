@@ -4,8 +4,9 @@
 [![LICENSE](https://img.shields.io/github/license/dragonflyoss/dragonfly-sdk.svg?style=flat-square)](https://github.com/dragonflyoss/dragonfly-sdk/blob/main/LICENSE)
 
 Request library for the Dragonfly client. It sends requests to remote servers
-via the Dragonfly P2P network, supporting streaming and buffered GET requests
-and preheating files or OCI images through seed peers.
+via the Dragonfly P2P network, supporting streaming and buffered GET requests,
+preheating files or OCI images through seed peers and deleting preheated files
+or OCI images from them.
 
 ## Usage
 
@@ -111,12 +112,13 @@ let response = proxy_with_endpoints.get(&request).await?;
 ```
 
 The `preheat` feature enables preheating OCI images by resolving manifests from
-the registry and triggering seed peers to download each blob, and querying the
-distribution of an OCI image with the layers cached by each seed peer:
+the registry and triggering seed peers to download each blob, querying the
+distribution of an OCI image with the layers cached by each seed peer, and
+deleting a preheated OCI image from the seed peers:
 
 ```toml
 [dependencies]
-dragonfly-client-request = { version = "1.6.1", features = ["preheat"] }
+dragonfly-client-request = { version = "1.8.0", features = ["preheat"] }
 ```
 
 ```rust
@@ -129,6 +131,28 @@ proxy
 
 let response = proxy
     .stat_image(&StatImageRequest {
+        image: "docker.io/library/nginx:latest".to_string(),
+        ..Default::default()
+    })
+    .await?;
+```
+
+Delete a preheated file or an OCI image from the seed peers, `delete_image`
+needing the `preheat` feature. The request should carry the parameters the
+preheat used, such as the replicas and the platform, so the delete addresses
+the same tasks and seed peers. A seed peer answering `NotFound` for a task
+counts as deleted:
+
+```rust
+proxy
+    .delete(&DeleteRequest {
+        url: "https://example.com/file.txt".to_string(),
+        ..Default::default()
+    })
+    .await?;
+
+proxy
+    .delete_image(&DeleteImageRequest {
         image: "docker.io/library/nginx:latest".to_string(),
         ..Default::default()
     })

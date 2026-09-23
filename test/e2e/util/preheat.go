@@ -76,7 +76,7 @@ func GetPreheatedSeedClients(sdk *SDK, url, sha256 string) ([]*SeedClient, error
 		}
 	}
 
-	if CheckFilesExist(podExecs(unselected), taskID) {
+	if CheckFilesExist(PodExecs(unselected), taskID) {
 		return nil, fmt.Errorf("task %s should only be held by the seed clients %v", taskID, endpoints)
 	}
 
@@ -111,8 +111,8 @@ func CheckCacheHit(resp *GetResponse, taskID string, seedClients []*SeedClient) 
 	return true
 }
 
-// podExecs returns the pods of the seed clients.
-func podExecs(seedClients []*SeedClient) []*PodExec {
+// PodExecs returns the pods of the seed clients.
+func PodExecs(seedClients []*SeedClient) []*PodExec {
 	pods := make([]*PodExec, 0, len(seedClients))
 	for _, seedClient := range seedClients {
 		pods = append(pods, seedClient.Pod)

@@ -34,6 +34,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 type mockScheduler struct {
@@ -78,6 +79,8 @@ type mockSeedPeer struct {
 	dfdaemonv2.UnimplementedDfdaemonUploadServer
 	downloadErr error
 	onDownload  func()
+	deleteErr   error
+	onDelete    func()
 }
 
 func (s *mockSeedPeer) DownloadTask(req *dfdaemonv2.DownloadTaskRequest, stream dfdaemonv2.DfdaemonUpload_DownloadTaskServer) error {
@@ -100,6 +103,18 @@ func (s *mockSeedPeer) DownloadTask(req *dfdaemonv2.DownloadTaskRequest, stream 
 	}
 
 	return nil
+}
+
+func (s *mockSeedPeer) DeleteTask(ctx context.Context, req *dfdaemonv2.DeleteTaskRequest) (*emptypb.Empty, error) {
+	if s.onDelete != nil {
+		s.onDelete()
+	}
+
+	if s.deleteErr != nil {
+		return nil, s.deleteErr
+	}
+
+	return &emptypb.Empty{}, nil
 }
 
 func setupMockSeedPeer(t testing.TB, downloadErr error) int32 {
@@ -177,6 +192,19 @@ func TestNewRequestDefaults(t *testing.T) {
 	assert.NotEmpty(stat.filteredQueryParams)
 	assert.True(stat.enableTaskIDBasedBlobDigest)
 	assert.Equal(defaultRequestTimeout, stat.timeout)
+
+	del := NewDeleteRequest("https://example.com/file.txt")
+	assert.NotEmpty(del.filteredQueryParams)
+	assert.True(del.enableTaskIDBasedBlobDigest)
+	assert.Equal(2, del.replicas)
+	assert.Equal(defaultRequestTimeout, del.timeout)
+
+	deleteImage := NewDeleteImageRequest("docker.io/library/nginx:latest")
+	assert.NotEmpty(deleteImage.filteredQueryParams)
+	assert.True(deleteImage.enableTaskIDBasedBlobDigest)
+	assert.Equal(2, deleteImage.replicas)
+	assert.Equal(4, deleteImage.concurrentTaskCount)
+	assert.Equal(defaultRequestTimeout, deleteImage.timeout)
 }
 
 func setupBenchProxy(b *testing.B, body []byte) (*Proxy, string) {
