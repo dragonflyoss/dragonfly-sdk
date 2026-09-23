@@ -35,7 +35,7 @@ var fileSizes = []struct {
 	{name: "1GiB", size: util.FileSize1GiB},
 }
 
-var _ = Describe("Preheat File", func() {
+var _ = Describe("Preheat", func() {
 	for _, sdk := range util.SDKs {
 		for _, fileSize := range fileSizes {
 			Context(fmt.Sprintf("%s file using %s sdk", fileSize.name, sdk.Name), func() {

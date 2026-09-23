@@ -23,7 +23,8 @@ use bytes::{Bytes, BytesMut};
 use digest::{is_blob_url, is_manifest_digest_url};
 use dragonfly_api::common::v2::{Download, Priority, SchedulingPolicy, TaskType};
 use dragonfly_api::dfdaemon::v2::{
-    dfdaemon_upload_client::DfdaemonUploadClient as DfdaemonUploadGRPCClient, DownloadTaskRequest,
+    dfdaemon_upload_client::DfdaemonUploadClient as DfdaemonUploadGRPCClient, DeleteTaskRequest,
+    DownloadTaskRequest,
 };
 use dragonfly_api::scheduler::v2::scheduler_client::SchedulerClient;
 use errors::{BackendError, DfdaemonError, Error, ProxyError};
@@ -52,17 +53,16 @@ use tracing::debug;
 #[cfg(feature = "preheat")]
 use dragonfly_api::scheduler::v2::StatImageRequest as SchedulerStatImageRequest;
 #[cfg(feature = "preheat")]
+use oci::{blob_digests, build_blob_url, build_manifest_url, oci_client, resolve_registry};
+#[cfg(feature = "preheat")]
 use oci_client::{
-    client::{current_platform_resolver, ClientConfig},
     manifest::{
-        ImageIndexEntry, IMAGE_MANIFEST_LIST_MEDIA_TYPE, IMAGE_MANIFEST_MEDIA_TYPE,
-        OCI_IMAGE_INDEX_MEDIA_TYPE, OCI_IMAGE_MEDIA_TYPE,
+        IMAGE_MANIFEST_LIST_MEDIA_TYPE, IMAGE_MANIFEST_MEDIA_TYPE, OCI_IMAGE_INDEX_MEDIA_TYPE,
+        OCI_IMAGE_MEDIA_TYPE,
     },
     secrets::RegistryAuth,
-    Client as OciClient, Reference, RegistryOperation,
+    Reference, RegistryOperation,
 };
-#[cfg(feature = "preheat")]
-use oci_spec::image::{Arch, Os};
 #[cfg(feature = "preheat")]
 use reqwest::header::{ACCEPT, AUTHORIZATION};
 #[cfg(feature = "preheat")]
@@ -79,6 +79,8 @@ pub use backon::ExponentialBuilder;
 
 mod http;
 mod net;
+#[cfg(feature = "preheat")]
+mod oci;
 mod pool;
 mod retry;
 mod selector;
@@ -136,11 +138,6 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// The type alias for the response body stream of zero-copy `Bytes` chunks.
 pub type Body = Box<dyn Stream<Item = Result<Bytes>> + Send + Unpin>;
 
-/// The type alias for the resolver that selects the digest of the matching manifest
-/// from a multi-platform image index.
-#[cfg(feature = "preheat")]
-type PlatformResolver = Box<dyn Fn(&[ImageIndexEntry]) -> Option<String> + Send + Sync>;
-
 /// The interface for sending requests via the Dragonfly.
 ///
 /// A request is served by the seed peers the scheduler picks for its task, and a
@@ -179,11 +176,24 @@ pub trait Request {
     #[cfg(feature = "preheat")]
     async fn stat_image(&self, request: &StatImageRequest) -> Result<StatImageResponse>;
 
+    /// Deletes a preheated OCI image: resolves its manifest, multi-platform
+    /// indexes included, and has the replica seed peers delete every manifest,
+    /// config and layer blob task. A seed peer answering `NotFound` counts as
+    /// deleted.
+    #[cfg(feature = "preheat")]
+    async fn delete_image(&self, request: &DeleteImageRequest) -> Result<()>;
+
     /// Preheats a file: has every replica seed peer download it through the
     /// dfdaemon download task API without streaming it back. A transient failure
     /// is retried on the same seed peer, so the file lands on every replica.
     /// Fails when fewer seed peers than replicas are available.
     async fn preheat(&self, request: &PreheatRequest) -> Result<()>;
+
+    /// Deletes a preheated file: has every replica seed peer delete its task
+    /// through the dfdaemon delete task API. A transient failure is retried on
+    /// the same seed peer, so the task leaves every replica. A seed peer
+    /// answering `NotFound` counts as deleted.
+    async fn delete(&self, request: &DeleteRequest) -> Result<()>;
 
     /// Returns the proxy endpoints of the seed peers that would serve the request,
     /// in consistent hash ring order for its task id, up to `replicas` of them and
@@ -611,6 +621,181 @@ pub struct Layer {
     pub is_finished: bool,
 }
 
+/// Represents a request to delete a preheated file from the Dragonfly seed peers.
+/// The delete removes the task of the specified url from the seed peers serving
+/// it.
+pub struct DeleteRequest {
+    /// The url of the request.
+    pub url: String,
+
+    /// Task piece length.
+    pub piece_length: Option<u64>,
+
+    /// URL tag identifies different task for same url.
+    pub tag: Option<String>,
+
+    /// Application of task identifies different task for same url.
+    pub application: Option<String>,
+
+    /// Filtered query params to generate the task id.
+    /// When filter is ["Signature", "Expires", "ns"], for example:
+    /// `http://example.com/xyz?Expires=e1&Signature=s1&ns=docker.io` and
+    /// `http://example.com/xyz?Expires=e2&Signature=s2&ns=docker.io` will generate the same task id.
+    /// Default value includes the filtered query params of s3, gcs, oss, obs, cos.
+    pub filtered_query_params: Vec<String>,
+
+    /// Content for calculating task id. This is used when the task ID cannot be calculated based
+    /// on URL and other parameters, such as when the URL contains dynamic query parameters that
+    /// cannot be filtered out.
+    pub content_for_calculating_task_id: Option<String>,
+
+    /// Enable task id based blob digest. It indicates whether to use the blob digest for
+    /// task id calculation when the url is an OCI blob url. It should be consistent with
+    /// the value used when the file was preheated, default is true.
+    pub enable_task_id_based_blob_digest: bool,
+
+    /// The number of seed peers serving the task, consistent with the replicas used
+    /// when the file was preheated, default is 2.
+    pub replicas: usize,
+
+    /// The timeout of each attempt of the request, default is 10 minutes.
+    pub timeout: Duration,
+}
+
+/// Default implementation for DeleteRequest.
+impl Default for DeleteRequest {
+    /// Returns a default DeleteRequest with empty url and default values for other fields.
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            piece_length: None,
+            tag: None,
+            application: None,
+            filtered_query_params: default_proxy_rule_filtered_query_params(),
+            content_for_calculating_task_id: None,
+            enable_task_id_based_blob_digest: true,
+            replicas: DEFAULT_REPLICAS,
+            timeout: DEFAULT_REQUEST_TIMEOUT,
+        }
+    }
+}
+
+/// Implements methods for validating the request.
+impl DeleteRequest {
+    /// Validates the request parameters.
+    fn validate(&self) -> Result<()> {
+        if self.replicas == 0 {
+            return Err(Error::InvalidArgument(
+                "replicas must be positive".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+/// Represents a request to delete a preheated OCI image from the Dragonfly seed
+/// peers. The delete removes the manifests and blobs (config and layers) of the
+/// specified image from the seed peers serving them.
+#[cfg(feature = "preheat")]
+pub struct DeleteImageRequest {
+    /// The OCI image reference (e.g., "docker.io/library/nginx:latest").
+    pub image: String,
+
+    /// Username for registry authentication. If not provided, anonymous access is used.
+    pub username: Option<String>,
+
+    /// Password for registry authentication. If not provided, anonymous access is used.
+    pub password: Option<String>,
+
+    /// Platform specifies the target platform in the format "os/arch"
+    /// (e.g., "linux/amd64", "linux/arm64"). It should be consistent with the
+    /// platform used when the image was preheated, default is current platform.
+    pub platform: Option<String>,
+
+    /// The optional piece length for the Dragonfly task.
+    pub piece_length: Option<u64>,
+
+    /// Tag identifies different tasks for the same URL.
+    pub tag: Option<String>,
+
+    /// Application identifies different tasks for the same URL.
+    pub application: Option<String>,
+
+    /// Filtered query params to generate the task id.
+    /// When filter is ["Signature", "Expires", "ns"], for example:
+    /// `http://example.com/xyz?Expires=e1&Signature=s1&ns=docker.io` and
+    /// `http://example.com/xyz?Expires=e2&Signature=s2&ns=docker.io` will generate the same task id.
+    /// Default value includes the filtered query params of s3, gcs, oss, obs, cos.
+    pub filtered_query_params: Vec<String>,
+
+    /// Content for calculating task id. This is used when the task ID cannot be calculated based
+    /// on URL and other parameters, such as when the URL contains dynamic query parameters that
+    /// cannot be filtered out.
+    pub content_for_calculating_task_id: Option<String>,
+
+    /// Enable task id based blob digest. It indicates whether to use the blob digest for
+    /// task id calculation when the url is an OCI blob url. It should be consistent with
+    /// the value used when the image was preheated, otherwise the tasks can not be found
+    /// on the seed peers, default is true.
+    pub enable_task_id_based_blob_digest: bool,
+
+    /// The number of seed peers serving each task, consistent with the replicas used
+    /// when the image was preheated, default is 2.
+    pub replicas: usize,
+
+    /// The timeout of each attempt of a task delete, default is 10 minutes.
+    pub timeout: Duration,
+
+    /// The number of blobs to delete concurrently, default is 4.
+    pub concurrent_task_count: usize,
+}
+
+/// Default implementation for DeleteImageRequest.
+#[cfg(feature = "preheat")]
+impl Default for DeleteImageRequest {
+    /// Returns a default DeleteImageRequest with empty image and default values for other
+    /// fields.
+    fn default() -> Self {
+        Self {
+            image: String::new(),
+            username: None,
+            password: None,
+            platform: None,
+            piece_length: None,
+            tag: None,
+            application: None,
+            filtered_query_params: default_proxy_rule_filtered_query_params(),
+            content_for_calculating_task_id: None,
+            enable_task_id_based_blob_digest: true,
+            replicas: DEFAULT_REPLICAS,
+            timeout: DEFAULT_REQUEST_TIMEOUT,
+            concurrent_task_count: 4,
+        }
+    }
+}
+
+/// Implements methods for validating the request.
+#[cfg(feature = "preheat")]
+impl DeleteImageRequest {
+    /// Validates the request parameters.
+    fn validate(&self) -> Result<()> {
+        if self.replicas == 0 {
+            return Err(Error::InvalidArgument(
+                "replicas must be positive".to_string(),
+            ));
+        }
+
+        if self.concurrent_task_count == 0 {
+            return Err(Error::InvalidArgument(
+                "concurrent task count must be positive".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
 /// Factory for creating HTTPClient instances.
 #[derive(Debug, Clone, Default)]
 struct HTTPClientFactory {}
@@ -928,7 +1113,7 @@ impl Request for Proxy {
         request.validate()?;
 
         // Parse image reference.
-        let oci_client = Self::oci_client(request.platform.clone())?;
+        let client = oci_client(request.platform.clone())?;
         let reference: Reference = request
             .image
             .parse()
@@ -946,11 +1131,10 @@ impl Request for Proxy {
         // by selecting the platform-specific manifest using our resolver. The
         // digest of the platform manifest is used to preheat the manifest, so it
         // can be addressed independently of the tag.
-        let (manifest, manifest_digest) =
-            oci_client
-                .pull_image_manifest(&reference, &auth)
-                .await
-                .map_err(|err| Error::Internal(format!("failed to pull image manifest: {err}")))?;
+        let (manifest, manifest_digest) = client
+            .pull_image_manifest(&reference, &auth)
+            .await
+            .map_err(|err| Error::Internal(format!("failed to pull image manifest: {err}")))?;
         debug!(
             "pulled manifest for image {} with digest {}, layers: {}",
             request.image,
@@ -959,7 +1143,7 @@ impl Request for Proxy {
         );
 
         // Authenticate with the registry and get a bearer token if available.
-        let token = oci_client
+        let token = client
             .auth(&reference, &auth, RegistryOperation::Pull)
             .await
             .map_err(|err| Error::Internal(format!("failed to authenticate with registry: {err}")))?
@@ -983,25 +1167,21 @@ impl Request for Proxy {
             HeaderValue::from_str(&MIME_TYPES_DISTRIBUTION_MANIFEST.join(","))
                 .map_err(|err| Error::Internal(format!("invalid accept header: {err}")))?,
         );
-        let registry = Self::resolve_registry(&reference);
+        let registry = resolve_registry(&reference);
         let repository = reference.repository();
 
         // Collect the preheat targets. The manifest is the platform manifest referenced by its digest,
         // excluding the multi-platform image index. The blobs include the config and the layers of
         // the platform manifest.
-        let mut targets = Vec::with_capacity(manifest.layers.len() + 2);
+        let digests = blob_digests(&manifest);
+        let mut targets = Vec::with_capacity(digests.len() + 1);
         targets.push((
-            Self::build_manifest_url(registry, repository, &manifest_digest),
+            build_manifest_url(registry, repository, &manifest_digest),
             manifest_header.clone(),
         ));
 
-        for digest in std::iter::once(&manifest.config.digest)
-            .chain(manifest.layers.iter().map(|layer| &layer.digest))
-        {
-            targets.push((
-                Self::build_blob_url(registry, repository, digest),
-                header.clone(),
-            ));
+        for digest in digests {
+            targets.push((build_blob_url(registry, repository, digest), header.clone()));
         }
 
         // Preheat the manifests and blobs concurrently, limited by the concurrent
@@ -1063,10 +1243,9 @@ impl Request for Proxy {
             .parse()
             .map_err(|err| Error::InvalidArgument(format!("invalid image reference: {err}")))?;
 
-        let registry = Self::resolve_registry(&reference);
-
+        let registry = resolve_registry(&reference);
         let stat_image_request = SchedulerStatImageRequest {
-            url: Self::build_manifest_url(
+            url: build_manifest_url(
                 registry,
                 reference.repository(),
                 reference
@@ -1142,6 +1321,98 @@ impl Request for Proxy {
         })
     }
 
+    /// Deletes a preheated OCI image from the seed peers via the Dragonfly.
+    ///
+    /// This method is designed for scenarios where a preheated image is no longer
+    /// needed and its storage on the seed peers should be reclaimed. It resolves the
+    /// image like [`Request::preheat_image`] and has the replica seed peers serving
+    /// the platform manifest and each blob (config and layers) delete the task by the
+    /// dfdaemon delete task API. A seed peer answering `NotFound` counts as deleted.
+    #[cfg(feature = "preheat")]
+    async fn delete_image(&self, request: &DeleteImageRequest) -> Result<()> {
+        request.validate()?;
+
+        // Parse image reference.
+        let client = oci_client(request.platform.clone())?;
+        let reference: Reference = request
+            .image
+            .parse()
+            .map_err(|err| Error::InvalidArgument(format!("invalid image reference: {err}")))?;
+
+        // Create registry authentication.
+        let auth = match (&request.username, &request.password) {
+            (Some(username), Some(password)) => {
+                RegistryAuth::Basic(username.clone(), password.clone())
+            }
+            _ => RegistryAuth::Anonymous,
+        };
+
+        // Pull image manifest, selecting the platform manifest from a multi-platform
+        // image index like the preheat does, so the delete targets the same tasks.
+        let (manifest, manifest_digest) = client
+            .pull_image_manifest(&reference, &auth)
+            .await
+            .map_err(|err| Error::Internal(format!("failed to pull image manifest: {err}")))?;
+        debug!(
+            "pulled manifest for image {} with digest {}, layers: {}",
+            request.image,
+            manifest_digest,
+            manifest.layers.len()
+        );
+
+        // Collect the delete targets, identical to the preheat targets.
+        let registry = resolve_registry(&reference);
+        let repository = reference.repository();
+        let digests = blob_digests(&manifest);
+        let mut urls = Vec::with_capacity(digests.len() + 1);
+        urls.push(build_manifest_url(registry, repository, &manifest_digest));
+        for digest in digests {
+            urls.push(build_blob_url(registry, repository, digest));
+        }
+
+        // Delete the manifests and blobs concurrently, limited by the concurrent
+        // task count.
+        let semaphore = Arc::new(Semaphore::new(request.concurrent_task_count));
+        let mut join_set: JoinSet<Result<()>> = JoinSet::new();
+        for url in urls {
+            let semaphore = semaphore.clone();
+            let proxy = self.clone();
+            let delete_request = DeleteRequest {
+                url,
+                piece_length: request.piece_length,
+                tag: request.tag.clone(),
+                application: request.application.clone(),
+                filtered_query_params: request.filtered_query_params.clone(),
+                content_for_calculating_task_id: request.content_for_calculating_task_id.clone(),
+                enable_task_id_based_blob_digest: request.enable_task_id_based_blob_digest,
+                replicas: request.replicas,
+                timeout: request.timeout,
+            };
+
+            join_set.spawn(
+                async move {
+                    let _permit = semaphore
+                        .acquire()
+                        .await
+                        .map_err(|err| Error::Internal(err.to_string()))?;
+
+                    proxy.delete(&delete_request).await?;
+                    debug!("deleted: {}", delete_request.url);
+                    Ok(())
+                }
+                .in_current_span(),
+            );
+        }
+
+        // Wait for the deletes to finish.
+        while let Some(result) = join_set.join_next().await {
+            result.map_err(|err| Error::Internal(err.to_string()))??;
+        }
+
+        debug!("delete completed for image: {}", request.image);
+        Ok(())
+    }
+
     /// Preheats a file by downloading it to the replicas of seed peers via the Dragonfly.
     ///
     /// This method is designed for scenarios where file content needs to be pre-cached in
@@ -1152,29 +1423,15 @@ impl Request for Proxy {
         request.validate()?;
 
         // Generate task id for selecting seed peer.
-        let task_id = self
-            .id_generator
-            .task_id(
-                if let Some(content) = request.content_for_calculating_task_id.clone() {
-                    TaskIDParameter::Content(content)
-                } else if request.enable_task_id_based_blob_digest && is_blob_url(&request.url) {
-                    TaskIDParameter::BlobDigestBased(request.url.clone())
-                } else if request.enable_task_id_based_blob_digest
-                    && is_manifest_digest_url(&request.url)
-                {
-                    TaskIDParameter::ManifestDigestBased(request.url.clone())
-                } else {
-                    TaskIDParameter::URLBased {
-                        url: request.url.clone(),
-                        piece_length: request.piece_length,
-                        tag: request.tag.clone(),
-                        application: request.application.clone(),
-                        filtered_query_params: request.filtered_query_params.clone(),
-                        revision: None,
-                    }
-                },
-            )
-            .map_err(|err| Error::Internal(format!("failed to generate task id: {err}")))?;
+        let task_id = self.task_id(
+            &request.url,
+            request.piece_length,
+            request.tag.clone(),
+            request.application.clone(),
+            request.filtered_query_params.clone(),
+            request.content_for_calculating_task_id.clone(),
+            request.enable_task_id_based_blob_digest,
+        )?;
 
         // Select seed peers for downloading.
         let seed_peers = self
@@ -1281,6 +1538,97 @@ impl Request for Proxy {
         Ok(())
     }
 
+    /// Deletes a preheated file from the replicas of seed peers via the Dragonfly.
+    ///
+    /// This method is designed for scenarios where a preheated file is no longer
+    /// needed and its storage on the seed peers should be reclaimed. It has every
+    /// replica seed peer delete the task by the dfdaemon delete task API, clamping
+    /// the replicas to the available seed peers instead of failing when fewer are
+    /// available.
+    async fn delete(&self, request: &DeleteRequest) -> Result<()> {
+        request.validate()?;
+
+        // Generate task id for selecting seed peer.
+        let task_id = self.task_id(
+            &request.url,
+            request.piece_length,
+            request.tag.clone(),
+            request.application.clone(),
+            request.filtered_query_params.clone(),
+            request.content_for_calculating_task_id.clone(),
+            request.enable_task_id_based_blob_digest,
+        )?;
+
+        // Select the seed peers serving the task.
+        let seed_peers = self
+            .seed_peer_selector
+            .select(task_id.clone(), request.replicas as u32)
+            .await
+            .map_err(|err| {
+                Error::Internal(format!("failed to select seed peers from scheduler: {err}"))
+            })?;
+
+        debug!("task {} selected seed peers: {:?}", task_id, seed_peers);
+
+        // Construct the delete task request.
+        let delete_task_request = DeleteTaskRequest {
+            task_id: task_id.clone(),
+            remote_ip: preferred_local_ip().map(|ip| ip.to_string()),
+        };
+
+        // Delete the task from every replica seed peer concurrently and wait for the
+        // deletes to finish. A transient failure is retried on the same seed peer, so
+        // the task leaves every replica.
+        let mut join_set: JoinSet<Result<()>> = JoinSet::new();
+        for peer in seed_peers.iter() {
+            let addr = format_url(
+                "http",
+                IpAddr::from_str(&peer.ip).map_err(|err| Error::Internal(err.to_string()))?,
+                peer.port as u16,
+            );
+
+            let delete_task_request = delete_task_request.clone();
+            let timeout = request.timeout;
+            let retry_policy = self.retry;
+            join_set.spawn(
+                async move {
+                    retry(retry_policy, || async {
+                        let channel = Channel::from_shared(addr.clone())
+                            .map_err(|err| Error::InvalidArgument(err.to_string()))?
+                            .connect_timeout(timeout)
+                            .timeout(timeout)
+                            .connect()
+                            .await
+                            .map_err(|err| {
+                                Error::Internal(format!(
+                                    "failed to connect to seed peer {addr}: {err}"
+                                ))
+                            })?;
+
+                        let mut client = DfdaemonUploadGRPCClient::new(channel)
+                            .max_decoding_message_size(usize::MAX)
+                            .max_encoding_message_size(usize::MAX);
+
+                        match client.delete_task(delete_task_request.clone()).await {
+                            Ok(_) => Ok(()),
+                            Err(status) if status.code() == tonic::Code::NotFound => Ok(()),
+                            Err(status) => Err(Error::from_status(status)),
+                        }
+                    })
+                    .await
+                }
+                .in_current_span(),
+            );
+        }
+
+        // Wait for the deletes on every replica seed peer to finish.
+        while let Some(result) = join_set.join_next().await {
+            result.map_err(|err| Error::Internal(err.to_string()))??;
+        }
+
+        Ok(())
+    }
+
     /// Looks up the proxy endpoints of the seed peers serving the request, in the
     /// consistent hash ring selection order for the request's task id. It returns up
     /// to the replicas of the request distinct endpoints, clamped to the number of
@@ -1293,33 +1641,53 @@ impl Request for Proxy {
 
 /// Implements proxy request logic.
 impl Proxy {
+    /// Generates the task id of the url with the request parameters. It uses the
+    /// content when given, else the blob or manifest digest of an OCI url when the
+    /// digest based task id is enabled, else the url and its metadata.
+    #[allow(clippy::too_many_arguments)]
+    fn task_id(
+        &self,
+        url: &str,
+        piece_length: Option<u64>,
+        tag: Option<String>,
+        application: Option<String>,
+        filtered_query_params: Vec<String>,
+        content_for_calculating_task_id: Option<String>,
+        enable_task_id_based_blob_digest: bool,
+    ) -> Result<String> {
+        self.id_generator
+            .task_id(if let Some(content) = content_for_calculating_task_id {
+                TaskIDParameter::Content(content)
+            } else if enable_task_id_based_blob_digest && is_blob_url(url) {
+                TaskIDParameter::BlobDigestBased(url.to_string())
+            } else if enable_task_id_based_blob_digest && is_manifest_digest_url(url) {
+                TaskIDParameter::ManifestDigestBased(url.to_string())
+            } else {
+                TaskIDParameter::URLBased {
+                    url: url.to_string(),
+                    piece_length,
+                    tag,
+                    application,
+                    filtered_query_params,
+                    revision: None,
+                }
+            })
+            .map_err(|err| Error::Internal(format!("failed to generate task id: {err}")))
+    }
+
     /// Looks up the proxy endpoints of the seed peers serving the request, in the
     /// consistent hash ring selection order.
     async fn lookup_proxy_endpoints(&self, request: &GetRequest) -> Result<Vec<String>> {
         // Generate task id for selecting seed peer.
-        let task_id = self
-            .id_generator
-            .task_id(
-                if let Some(content) = request.content_for_calculating_task_id.clone() {
-                    TaskIDParameter::Content(content)
-                } else if request.enable_task_id_based_blob_digest && is_blob_url(&request.url) {
-                    TaskIDParameter::BlobDigestBased(request.url.clone())
-                } else if request.enable_task_id_based_blob_digest
-                    && is_manifest_digest_url(&request.url)
-                {
-                    TaskIDParameter::ManifestDigestBased(request.url.clone())
-                } else {
-                    TaskIDParameter::URLBased {
-                        url: request.url.clone(),
-                        piece_length: request.piece_length,
-                        tag: request.tag.clone(),
-                        application: request.application.clone(),
-                        filtered_query_params: request.filtered_query_params.clone(),
-                        revision: None,
-                    }
-                },
-            )
-            .map_err(|err| Error::Internal(format!("failed to generate task id: {err}")))?;
+        let task_id = self.task_id(
+            &request.url,
+            request.piece_length,
+            request.tag.clone(),
+            request.application.clone(),
+            request.filtered_query_params.clone(),
+            request.content_for_calculating_task_id.clone(),
+            request.enable_task_id_based_blob_digest,
+        )?;
 
         // Select seed peers for downloading.
         let seed_peers = self
@@ -1506,75 +1874,6 @@ impl Proxy {
 
         headers.insert("X-Dragonfly-Use-P2P", HeaderValue::from_static("true"));
         Ok(headers)
-    }
-}
-
-/// Implements helpers for the preheat feature.
-impl Proxy {
-    /// Helper function to check if a URL is an OCI blob URL (e.g., /v2/<name>/blobs/sha256:
-    /// <digest>).
-    #[cfg(feature = "preheat")]
-    fn build_blob_url(registry: &str, repository: &str, digest: &str) -> String {
-        format!("https://{registry}/v2/{repository}/blobs/{digest}")
-    }
-
-    /// Builds the manifest URL for the given registry, repository and reference (tag or
-    /// digest).
-    #[cfg(feature = "preheat")]
-    fn build_manifest_url(registry: &str, repository: &str, reference: &str) -> String {
-        format!("https://{registry}/v2/{repository}/manifests/{reference}")
-    }
-
-    /// Resolves the registry host of the image reference. The docker.io registry is
-    /// resolved to registry-1.docker.io, aligned with the OCI resolver in the
-    /// dragonfly, so that the urls are identical to the ones generated by the Go
-    /// implementation.
-    #[cfg(feature = "preheat")]
-    fn resolve_registry(reference: &Reference) -> &str {
-        match reference.registry() {
-            "docker.io" => "registry-1.docker.io",
-            registry => registry,
-        }
-    }
-
-    /// Builds a platform resolver that selects the digest of the manifest matching
-    /// the requested platform in the format "os/arch" (e.g., 'linux/amd64') from a
-    /// multi-platform image index.
-    #[cfg(feature = "preheat")]
-    fn platform_resolver(platform: &str) -> Result<PlatformResolver> {
-        let (os, arch) = platform
-            .split_once('/')
-            .map(|(os, arch)| (Os::from(os), Arch::from(arch)))
-            .ok_or_else(|| {
-                Error::InvalidArgument(format!("invalid platform format '{platform}', expected 'os/arch' (e.g., 'linux/amd64')"))
-            })?;
-
-        Ok(Box::new(move |manifests: &[ImageIndexEntry]| {
-            manifests
-                .iter()
-                .find(|entry| {
-                    entry
-                        .platform
-                        .as_ref()
-                        .is_some_and(|platform| platform.os == os && platform.architecture == arch)
-                })
-                .map(|entry| entry.digest.clone())
-        }))
-    }
-
-    /// Builds an OCI client with a platform resolver that matches the requested os/arch,
-    /// defaulting to the current platform when the platform is not specified.
-    #[cfg(feature = "preheat")]
-    fn oci_client(platform: Option<String>) -> Result<OciClient> {
-        let oci_config = ClientConfig {
-            platform_resolver: match platform {
-                Some(platform) => Some(Self::platform_resolver(&platform)?),
-                None => Some(Box::new(current_platform_resolver)),
-            },
-            ..ClientConfig::default()
-        };
-
-        Ok(OciClient::new(oci_config))
     }
 }
 
@@ -2060,25 +2359,6 @@ mod tests {
     }
 
     type ExpectElapsed = fn(Duration);
-
-    #[cfg(feature = "preheat")]
-    fn image_index_entry(digest: &str, platform: Option<(Os, Arch)>) -> ImageIndexEntry {
-        ImageIndexEntry {
-            media_type: IMAGE_MANIFEST_MEDIA_TYPE.to_string(),
-            digest: digest.to_string(),
-            size: 0,
-            platform: platform.map(|(os, architecture)| oci_client::manifest::Platform {
-                architecture,
-                os,
-                os_version: None,
-                os_features: None,
-                variant: None,
-                features: None,
-            }),
-            annotations: None,
-            artifact_type: None,
-        }
-    }
 
     #[tokio::test]
     async fn new_success() {
@@ -3190,8 +3470,8 @@ mod tests {
             matches!(&result, Err(Error::TonicStatus(status)) if status.code() == tonic::Code::Unavailable),
             "unexpected: {result:?}"
         );
-        assert_eq!(download_task_calls(&failing_seed_peer), 3);
-        assert_eq!(download_task_calls(&healthy_seed_peer), 1);
+        assert_eq!(seed_peer_calls(&failing_seed_peer), 3);
+        assert_eq!(seed_peer_calls(&healthy_seed_peer), 1);
     }
 
     #[tokio::test]
@@ -3259,20 +3539,191 @@ mod tests {
                 "status: {status:?}, unexpected: {result:?}"
             );
             assert_eq!(
-                download_task_calls(&mock_seed_peer),
+                seed_peer_calls(&mock_seed_peer),
                 expected_calls,
                 "status: {status:?}"
             );
         }
     }
 
-    fn download_task_calls(seed_peer: &mocktail::server::MockServer) -> usize {
+    fn seed_peer_calls(seed_peer: &mocktail::server::MockServer) -> usize {
         seed_peer
             .mocks()
             .iter()
             .next()
             .map(|mock| mock.match_count() / 2)
             .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn delete_no_available_seed_peers() {
+        let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let request = DeleteRequest {
+            url: "http://example.com/payload.txt".to_string(),
+            ..Default::default()
+        };
+
+        let result = proxy.delete(&request).await;
+        assert!(
+            matches!(result, Err(Error::Internal(message)) if message.contains("failed to select seed peers"))
+        );
+    }
+
+    #[tokio::test]
+    async fn preheat_and_delete_hit_same_seed_peers() {
+        let cases = [
+            ("http://example.com/replicas-1.txt", 1, vec!["seed-peer-1"]),
+            (
+                "http://example.com/replicas-2.txt",
+                2,
+                vec!["seed-peer-1", "seed-peer-2"],
+            ),
+            (
+                "http://example.com/replicas-3.txt",
+                3,
+                vec!["seed-peer-1", "seed-peer-2", "seed-peer-3"],
+            ),
+        ];
+
+        for (url, replicas, expected) in cases {
+            let mut hosts = Vec::new();
+            let mut servers = Vec::new();
+            for name in ["seed-peer-1", "seed-peer-2", "seed-peer-3"] {
+                let mut mocks = MockSet::new();
+                mocks.mock(|when, then| {
+                    when.path("/dfdaemon.v2.DfdaemonUpload/DeleteTask");
+                    then.pb(());
+                });
+                if expected.contains(&name) {
+                    mocks.mock(|when, then| {
+                        when.path("/dfdaemon.v2.DfdaemonUpload/DownloadTask");
+                        then.pb_stream(vec![DownloadTaskResponse {
+                            host_id: name.to_string(),
+                            task_id: "task-1".to_string(),
+                            peer_id: "peer-1".to_string(),
+                            ..Default::default()
+                        }]);
+                    });
+                }
+                let seed_peer = setup_mock_seed_peer(mocks).await.unwrap();
+
+                hosts.push(create_seed_peer_host(name, seed_peer.port().unwrap(), 0));
+                servers.push((name, seed_peer));
+            }
+
+            let mock_scheduler = setup_mock_scheduler(hosts).await.unwrap();
+            let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+            let proxy = Proxy::builder()
+                .scheduler_endpoint(scheduler_endpoint)
+                .build()
+                .await
+                .unwrap();
+
+            let preheat_request = PreheatRequest {
+                url: url.to_string(),
+                replicas,
+                ..Default::default()
+            };
+            proxy.preheat(&preheat_request).await.unwrap();
+
+            let delete_request = DeleteRequest {
+                url: url.to_string(),
+                replicas,
+                ..Default::default()
+            };
+            proxy.delete(&delete_request).await.unwrap();
+
+            for (name, server) in servers.iter() {
+                let expected_calls = usize::from(expected.contains(name));
+                assert_eq!(
+                    seed_peer_calls(server),
+                    expected_calls,
+                    "{url}: seed peer {name}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_retries_only_transient_delete_failures() {
+        let test_cases = vec![
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                None,
+                2,
+                Some(tonic::Code::Internal),
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some(2),
+                3,
+                Some(tonic::Code::Unavailable),
+            ),
+            (StatusCode::NOT_FOUND, Some(3), 1, None),
+            (
+                StatusCode::FORBIDDEN,
+                Some(3),
+                1,
+                Some(tonic::Code::PermissionDenied),
+            ),
+        ];
+
+        for (status, max_retries, expected_calls, expected_code) in test_cases {
+            let mut mocks = MockSet::new();
+            mocks.mock(|when, then| {
+                when.path("/dfdaemon.v2.DfdaemonUpload/DeleteTask");
+                then.error(status.clone(), "delete failed");
+            });
+
+            let mock_seed_peer = setup_mock_seed_peer(mocks).await.unwrap();
+            let mock_scheduler = setup_mock_scheduler(vec![create_seed_peer_host(
+                "seed-peer-1",
+                mock_seed_peer.port().unwrap(),
+                0,
+            )])
+            .await
+            .unwrap();
+
+            let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+            let mut builder = Proxy::builder()
+                .scheduler_endpoint(scheduler_endpoint)
+                .backoff(
+                    ExponentialBuilder::new()
+                        .with_min_delay(Duration::from_millis(1))
+                        .with_max_delay(Duration::from_millis(2)),
+                );
+            if let Some(max_retries) = max_retries {
+                builder = builder.max_retries(max_retries);
+            }
+            let proxy = builder.build().await.unwrap();
+
+            let request = DeleteRequest {
+                url: "http://example.com/payload.txt".to_string(),
+                replicas: 1,
+                ..Default::default()
+            };
+
+            let result = proxy.delete(&request).await;
+            match expected_code {
+                Some(expected_code) => assert!(
+                    matches!(&result, Err(Error::TonicStatus(got)) if got.code() == expected_code),
+                    "status: {status:?}, unexpected: {result:?}"
+                ),
+                None => assert!(result.is_ok(), "status: {status:?}, unexpected: {result:?}"),
+            }
+            assert_eq!(
+                seed_peer_calls(&mock_seed_peer),
+                expected_calls,
+                "status: {status:?}"
+            );
+        }
     }
 
     #[cfg(feature = "preheat")]
@@ -3630,77 +4081,100 @@ mod tests {
     }
 
     #[cfg(feature = "preheat")]
-    #[test]
-    fn build_blob_url_uses_https_by_default() {
-        let url = Proxy::build_blob_url("registry.example.com", "library/nginx", "sha256:abcdef");
+    #[tokio::test]
+    async fn delete_image_invalid_reference() {
+        let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
 
-        assert_eq!(
-            url,
-            "https://registry.example.com/v2/library/nginx/blobs/sha256:abcdef"
+        let result = proxy
+            .delete_image(&DeleteImageRequest {
+                image: "invalid image reference!!".to_string(),
+                ..Default::default()
+            })
+            .await;
+        assert!(
+            matches!(result, Err(Error::InvalidArgument(message)) if message.contains("invalid image reference"))
         );
     }
 
     #[cfg(feature = "preheat")]
-    #[test]
-    fn build_manifest_url_uses_https_by_default() {
-        let url = Proxy::build_manifest_url("registry.example.com", "library/nginx", "latest");
+    #[tokio::test]
+    async fn delete_image_invalid_arguments() {
+        let test_cases = vec![
+            DeleteImageRequest {
+                image: "docker.io/library/nginx:latest".to_string(),
+                replicas: 0,
+                ..Default::default()
+            },
+            DeleteImageRequest {
+                image: "docker.io/library/nginx:latest".to_string(),
+                concurrent_task_count: 0,
+                ..Default::default()
+            },
+        ];
 
-        assert_eq!(
-            url,
-            "https://registry.example.com/v2/library/nginx/manifests/latest"
+        let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        for request in test_cases {
+            let result = proxy.delete_image(&request).await;
+            assert!(matches!(result, Err(Error::InvalidArgument(_))));
+        }
+    }
+
+    #[cfg(feature = "preheat")]
+    #[tokio::test]
+    async fn delete_image_invalid_platform() {
+        let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let result = proxy
+            .delete_image(&DeleteImageRequest {
+                image: "docker.io/library/nginx:latest".to_string(),
+                platform: Some("linux-amd64".to_string()),
+                ..Default::default()
+            })
+            .await;
+        assert!(
+            matches!(result, Err(Error::InvalidArgument(message)) if message.contains("invalid platform format"))
         );
     }
 
     #[cfg(feature = "preheat")]
-    #[test]
-    fn resolve_registry_maps_docker_hub() {
-        let test_cases = vec![
-            ("nginx", "registry-1.docker.io"),
-            ("example.com/foo/bar:1.0", "example.com"),
-        ];
+    #[tokio::test]
+    async fn delete_image_unreachable_registry() {
+        let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
 
-        for (image, expected) in test_cases {
-            let reference: Reference = image.parse().unwrap();
-            assert_eq!(Proxy::resolve_registry(&reference), expected);
-        }
-    }
-
-    #[cfg(feature = "preheat")]
-    #[test]
-    fn platform_resolver_matches_manifests() {
-        let manifests = vec![
-            image_index_entry("sha256:amd64", Some((Os::Linux, Arch::Amd64))),
-            image_index_entry("sha256:arm64", Some((Os::Linux, Arch::ARM64))),
-            image_index_entry("sha256:no-platform", None),
-        ];
-
-        let test_cases = vec![
-            ("linux/amd64", Ok(Some("sha256:amd64"))),
-            ("linux/arm64", Ok(Some("sha256:arm64"))),
-            ("windows/amd64", Ok(None)),
-            ("linux/riscv64", Ok(None)),
-            ("linux-amd64", Err("invalid platform format")),
-            ("", Err("invalid platform format")),
-        ];
-
-        for (platform, expected) in test_cases {
-            match expected {
-                Ok(expected_digest) => {
-                    let resolver = Proxy::platform_resolver(platform).unwrap();
-                    assert_eq!(
-                        resolver(&manifests),
-                        expected_digest.map(|digest| digest.to_string()),
-                        "platform: {platform}"
-                    );
-                }
-                Err(expected_message) => {
-                    assert!(
-                        matches!(Proxy::platform_resolver(platform), Err(Error::InvalidArgument(message)) if message.contains(expected_message)),
-                        "platform: {platform}"
-                    );
-                }
-            }
-        }
+        let result = proxy
+            .delete_image(&DeleteImageRequest {
+                image: "127.0.0.1:1/library/nginx:latest".to_string(),
+                ..Default::default()
+            })
+            .await;
+        assert!(
+            matches!(result, Err(Error::Internal(message)) if message.contains("failed to pull image manifest"))
+        );
     }
 
     #[tokio::test]

@@ -4,8 +4,9 @@
 [![LICENSE](https://img.shields.io/github/license/dragonflyoss/dragonfly-sdk.svg?style=flat-square)](https://github.com/dragonflyoss/dragonfly-sdk/blob/main/LICENSE)
 
 Request library for the Dragonfly client. It sends requests to remote servers
-via the Dragonfly P2P network, supporting streaming and buffered GET requests
-and preheating files or OCI images through seed peers.
+via the Dragonfly P2P network, supporting streaming and buffered GET requests,
+preheating files or OCI images through seed peers and deleting preheated files
+or OCI images from them.
 
 It is the Go implementation of the Rust crate
 [dragonfly-client-request](../rust) and generates identical task ids and seed
@@ -100,6 +101,21 @@ if err != nil {
 fmt.Printf("image has %d layers\n", len(resp.Layers))
 for _, peer := range resp.Peers {
     fmt.Printf("peer %s (%s) cached %d layers\n", peer.Hostname, peer.IP, len(peer.CachedLayers))
+}
+```
+
+Delete a preheated file or an OCI image from the seed peers. The request
+should carry the parameters the preheat used, such as the replicas and the
+platform, so the delete addresses the same tasks and seed peers. A seed peer
+answering `NotFound` for a task counts as deleted:
+
+```go
+if err := proxy.Delete(ctx, request.NewDeleteRequest("https://example.com/file.txt")); err != nil {
+    panic(err)
+}
+
+if err := proxy.DeleteImage(ctx, request.NewDeleteImageRequest("docker.io/library/nginx:latest")); err != nil {
+    panic(err)
 }
 ```
 

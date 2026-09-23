@@ -98,23 +98,26 @@ func (p *Proxy) Preheat(ctx context.Context, req *PreheatRequest) error {
 		download.ContentForCalculatingTaskId = &req.contentForCalculatingTaskID
 	}
 
+	downloadTaskRequest := &dfdaemonv2.DownloadTaskRequest{Download: download}
+
 	// Trigger every replica seed peer to download the task concurrently and
 	// wait for the download tasks to finish. A transient failure is retried on
 	// the same seed peer, so the file lands on every replica.
 	g, ctx := errgroup.WithContext(ctx)
 	for _, peer := range seedPeers {
 		g.Go(func() error {
-			return p.downloadTask(ctx, peer, id, download, req.timeout)
+			return p.download(ctx, peer, id, downloadTaskRequest, req.timeout)
 		})
 	}
 
 	return g.Wait()
 }
 
-// downloadTask has the seed peer download the task, retrying a transient
-// failure on the same seed peer so the file lands on every replica. Each
-// attempt runs under the timeout.
-func (p *Proxy) downloadTask(ctx context.Context, peer *commonv2.Host, id string, download *commonv2.Download, timeout time.Duration) error {
+// download has the seed peer download the task and drains the response stream,
+// retrying a transient failure on the same seed peer so the file lands on every
+// replica. Each attempt runs under the timeout. The gRPC status of a failure
+// stays in the error, so isRetryable can tell a definitive one apart.
+func (p *Proxy) download(ctx context.Context, peer *commonv2.Host, id string, downloadTaskRequest *dfdaemonv2.DownloadTaskRequest, timeout time.Duration) error {
 	addr := net.JoinHostPort(peer.Ip, strconv.Itoa(int(peer.Port)))
 	conn, err := grpc.NewClient(
 		addr,
@@ -134,30 +137,23 @@ func (p *Proxy) downloadTask(ctx context.Context, peer *commonv2.Host, id string
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 
-		return struct{}{}, downloadTask(ctx, client, id, download)
+		stream, err := client.DownloadTask(ctx, downloadTaskRequest)
+		if err != nil {
+			return struct{}{}, fmt.Errorf("%w: failed to download task %s: %w", ErrInternal, id, err)
+		}
+
+		for {
+			if _, err := stream.Recv(); err != nil {
+				if errors.Is(err, io.EOF) {
+					return struct{}{}, nil
+				}
+
+				return struct{}{}, fmt.Errorf("%w: failed to download task %s: %w", ErrInternal, id, err)
+			}
+		}
 	})
 
 	return err
-}
-
-// downloadTask has the seed peer download the task once and drains the
-// response stream, returning once the download finished. The gRPC status of a
-// failure stays in the error, so isRetryable can tell a definitive one apart.
-func downloadTask(ctx context.Context, client dfdaemonv2.DfdaemonUploadClient, id string, download *commonv2.Download) error {
-	stream, err := client.DownloadTask(ctx, &dfdaemonv2.DownloadTaskRequest{Download: download})
-	if err != nil {
-		return fmt.Errorf("%w: failed to download task %s: %w", ErrInternal, id, err)
-	}
-
-	for {
-		if _, err := stream.Recv(); err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-
-			return fmt.Errorf("%w: failed to download task %s: %w", ErrInternal, id, err)
-		}
-	}
 }
 
 // PreheatImage preheats an OCI image by downloading its manifests and blobs via
@@ -208,11 +204,11 @@ func (p *Proxy) PreheatImage(ctx context.Context, req *PreheatImageRequest) erro
 	}
 
 	targets := make([]target, 0, len(manifestURLs)+len(blobURLs))
-	for _, manifestURL := range manifestURLs {
+	for _, manifestURL := range uniqueURLs(manifestURLs) {
 		targets = append(targets, target{url: manifestURL, header: manifestHeader})
 	}
 
-	for _, blobURL := range blobURLs {
+	for _, blobURL := range uniqueURLs(blobURLs) {
 		targets = append(targets, target{url: blobURL, header: header})
 	}
 
@@ -242,17 +238,4 @@ func (p *Proxy) PreheatImage(ctx context.Context, req *PreheatImageRequest) erro
 	}
 
 	return g.Wait()
-}
-
-// headerToMap converts an http.Header to a map, the last value wins for
-// duplicate keys.
-func headerToMap(header http.Header) map[string]string {
-	m := make(map[string]string, len(header))
-	for k, v := range header {
-		if len(v) > 0 {
-			m[k] = v[len(v)-1]
-		}
-	}
-
-	return m
 }

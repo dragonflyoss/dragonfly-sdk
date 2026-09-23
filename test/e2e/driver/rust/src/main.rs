@@ -28,6 +28,8 @@
 //! driver get --scheduler <endpoint> [--endpoint <endpoint>]... [--header <key: value>]... --output <path> <url>
 //! driver preheat --scheduler <endpoint> <url>
 //! driver preheat-image --scheduler <endpoint> <image>
+//! driver delete --scheduler <endpoint> <url>
+//! driver delete-image --scheduler <endpoint> <image>
 //! ```
 
 use std::collections::BTreeMap;
@@ -35,8 +37,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use dragonfly_client_request::{
-    GetRequest, PreheatImageRequest, PreheatRequest, Proxy, ProxyWithEndpoints, Request,
-    RequestWithEndpoints,
+    DeleteImageRequest, DeleteRequest, GetRequest, PreheatImageRequest, PreheatRequest, Proxy,
+    ProxyWithEndpoints, Request, RequestWithEndpoints,
 };
 use futures::TryStreamExt;
 use http::header::{HeaderMap, HeaderName, HeaderValue};
@@ -96,6 +98,7 @@ enum Command {
         #[arg(long)]
         scheduler: String,
 
+        /// Url to preheat.
         url: String,
     },
 
@@ -105,6 +108,27 @@ enum Command {
         #[arg(long)]
         scheduler: String,
 
+        /// Image reference, e.g., "docker.io/library/busybox:latest".
+        image: String,
+    },
+
+    /// Deletes the preheated url from the seed peers.
+    Delete {
+        /// Scheduler endpoint.
+        #[arg(long)]
+        scheduler: String,
+
+        /// Url to preheat.
+        url: String,
+    },
+
+    /// Deletes the preheated image from the seed peers.
+    DeleteImage {
+        /// Scheduler endpoint.
+        #[arg(long)]
+        scheduler: String,
+
+        /// Image reference, e.g., "docker.io/library/busybox:latest".
         image: String,
     },
 }
@@ -141,6 +165,8 @@ async fn main() -> Result<()> {
         } => get(scheduler, endpoint, header, output, url).await,
         Command::Preheat { scheduler, url } => preheat(scheduler, url).await,
         Command::PreheatImage { scheduler, image } => preheat_image(scheduler, image).await,
+        Command::Delete { scheduler, url } => delete(scheduler, url).await,
+        Command::DeleteImage { scheduler, image } => delete_image(scheduler, image).await,
     }
 }
 
@@ -228,6 +254,32 @@ async fn preheat_image(scheduler_endpoint: String, image: String) -> Result<()> 
     let proxy = new_proxy(scheduler_endpoint).await?;
     proxy
         .preheat_image(&PreheatImageRequest {
+            image,
+            ..Default::default()
+        })
+        .await?;
+
+    Ok(())
+}
+
+/// Deletes the preheated url from the seed peers.
+async fn delete(scheduler_endpoint: String, url: String) -> Result<()> {
+    let proxy = new_proxy(scheduler_endpoint).await?;
+    proxy
+        .delete(&DeleteRequest {
+            url,
+            ..Default::default()
+        })
+        .await?;
+
+    Ok(())
+}
+
+/// Deletes the preheated image from the seed peers.
+async fn delete_image(scheduler_endpoint: String, image: String) -> Result<()> {
+    let proxy = new_proxy(scheduler_endpoint).await?;
+    proxy
+        .delete_image(&DeleteImageRequest {
             image,
             ..Default::default()
         })
