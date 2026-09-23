@@ -1,6 +1,6 @@
 module d7y.io/dragonfly-sdk/client-request/go
 
-go 1.25
+go 1.25.0
 
 require (
 	d7y.io/api/v2 v2.3.7
