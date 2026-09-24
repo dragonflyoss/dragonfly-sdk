@@ -21,7 +21,7 @@
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use digest::{is_blob_url, is_manifest_digest_url};
-use dragonfly_api::common::v2::{Download, Priority, SchedulingPolicy, TaskType};
+use dragonfly_api::common::v2::{Download, Host, Priority, SchedulingPolicy, TaskType};
 use dragonfly_api::dfdaemon::v2::{
     dfdaemon_upload_client::DfdaemonUploadClient as DfdaemonUploadGRPCClient, DeleteTaskRequest,
     DownloadTaskRequest,
@@ -116,6 +116,19 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// The default number of seed peers serving a task.
 const DEFAULT_REPLICAS: usize = 2;
 
+/// The seed peers a preheat or delete addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Scope {
+    /// The replicas of the task: the seed peers picked in the consistent hash
+    /// ring order for its task id.
+    #[default]
+    Default,
+
+    /// All seed peers regardless of the replicas, aligned with the
+    /// AllSeedPeersScope in the dragonfly manager types.
+    AllSeedPeers,
+}
+
 /// The scope that queries only the seed peers for the image distribution, aligned
 /// with the AllSeedPeersScope in the dragonfly manager types.
 #[cfg(feature = "preheat")]
@@ -183,16 +196,18 @@ pub trait Request {
     #[cfg(feature = "preheat")]
     async fn delete_image(&self, request: &DeleteImageRequest) -> Result<()>;
 
-    /// Preheats a file: has every replica seed peer download it through the
-    /// dfdaemon download task API without streaming it back. A transient failure
-    /// is retried on the same seed peer, so the file lands on every replica.
-    /// Fails when fewer seed peers than replicas are available.
+    /// Preheats a file: has every replica seed peer, or every seed peer with
+    /// `Scope::AllSeedPeers`, download it through the dfdaemon download task API
+    /// without streaming it back. A transient failure is retried on the same seed
+    /// peer, so the file lands on every replica. Fails when fewer seed peers than
+    /// replicas are available.
     async fn preheat(&self, request: &PreheatRequest) -> Result<()>;
 
-    /// Deletes a preheated file: has every replica seed peer delete its task
-    /// through the dfdaemon delete task API. A transient failure is retried on
-    /// the same seed peer, so the task leaves every replica. A seed peer
-    /// answering `NotFound` counts as deleted.
+    /// Deletes a preheated file: has every replica seed peer, or every seed peer
+    /// with `Scope::AllSeedPeers`, delete its task through the dfdaemon delete
+    /// task API. A transient failure is retried on the same seed peer, so the
+    /// task leaves every replica. A seed peer answering `NotFound` counts as
+    /// deleted.
     async fn delete(&self, request: &DeleteRequest) -> Result<()>;
 
     /// Returns the proxy endpoints of the seed peers that would serve the request,
@@ -377,6 +392,11 @@ pub struct PreheatImageRequest {
     /// The number of seed peers serving the task, default is 2.
     pub replicas: usize,
 
+    /// The seed peers to preheat each blob task to, default is the replicas of the
+    /// task. `Scope::AllSeedPeers` preheats to all seed peers regardless of the
+    /// replicas.
+    pub scope: Scope,
+
     /// The timeout for each blob download request, default is 10 minutes.
     pub timeout: Duration,
 
@@ -406,6 +426,7 @@ impl Default for PreheatImageRequest {
             enable_task_id_based_blob_digest: true,
             priority: None,
             replicas: DEFAULT_REPLICAS,
+            scope: Scope::default(),
             timeout: DEFAULT_REQUEST_TIMEOUT,
             concurrent_task_count: 4,
             client_cert: None,
@@ -478,6 +499,10 @@ pub struct PreheatRequest {
     /// The number of seed peers serving the task, default is 2.
     pub replicas: usize,
 
+    /// The seed peers to preheat the task to, default is the replicas of the task.
+    /// `Scope::AllSeedPeers` preheats to all seed peers regardless of the replicas.
+    pub scope: Scope,
+
     /// The timeout of each attempt of the request, default is 10 minutes.
     pub timeout: Duration,
 
@@ -500,6 +525,7 @@ impl Default for PreheatRequest {
             enable_task_id_based_blob_digest: true,
             priority: None,
             replicas: DEFAULT_REPLICAS,
+            scope: Scope::default(),
             timeout: DEFAULT_REQUEST_TIMEOUT,
             client_cert: None,
         }
@@ -658,6 +684,10 @@ pub struct DeleteRequest {
     /// when the file was preheated, default is 2.
     pub replicas: usize,
 
+    /// The seed peers to delete the task from, consistent with the scope used when
+    /// the file was preheated, default is the replicas of the task.
+    pub scope: Scope,
+
     /// The timeout of each attempt of the request, default is 10 minutes.
     pub timeout: Duration,
 }
@@ -675,6 +705,7 @@ impl Default for DeleteRequest {
             content_for_calculating_task_id: None,
             enable_task_id_based_blob_digest: true,
             replicas: DEFAULT_REPLICAS,
+            scope: Scope::default(),
             timeout: DEFAULT_REQUEST_TIMEOUT,
         }
     }
@@ -744,6 +775,10 @@ pub struct DeleteImageRequest {
     /// when the image was preheated, default is 2.
     pub replicas: usize,
 
+    /// The seed peers to delete each task from, consistent with the scope used when
+    /// the image was preheated, default is the replicas of the task.
+    pub scope: Scope,
+
     /// The timeout of each attempt of a task delete, default is 10 minutes.
     pub timeout: Duration,
 
@@ -769,6 +804,7 @@ impl Default for DeleteImageRequest {
             content_for_calculating_task_id: None,
             enable_task_id_based_blob_digest: true,
             replicas: DEFAULT_REPLICAS,
+            scope: Scope::default(),
             timeout: DEFAULT_REQUEST_TIMEOUT,
             concurrent_task_count: 4,
         }
@@ -1202,6 +1238,7 @@ impl Request for Proxy {
                 enable_task_id_based_blob_digest: request.enable_task_id_based_blob_digest,
                 priority: request.priority,
                 replicas: request.replicas,
+                scope: request.scope,
                 timeout: request.timeout,
                 client_cert: request.client_cert.clone(),
             };
@@ -1386,6 +1423,7 @@ impl Request for Proxy {
                 content_for_calculating_task_id: request.content_for_calculating_task_id.clone(),
                 enable_task_id_based_blob_digest: request.enable_task_id_based_blob_digest,
                 replicas: request.replicas,
+                scope: request.scope,
                 timeout: request.timeout,
             };
 
@@ -1413,11 +1451,12 @@ impl Request for Proxy {
         Ok(())
     }
 
-    /// Preheats a file by downloading it to the replicas of seed peers via the Dragonfly.
+    /// Preheats a file by downloading it to the replicas of seed peers, or to all seed
+    /// peers with `Scope::AllSeedPeers`, via the Dragonfly.
     ///
     /// This method is designed for scenarios where file content needs to be pre-cached in
     /// the seed client before actual consumption, ensuring faster subsequent access across
-    /// the cluster. It triggers every replica seed peer to download the file by the
+    /// the cluster. It triggers every selected seed peer to download the file by the
     /// dfdaemon download task API.
     async fn preheat(&self, request: &PreheatRequest) -> Result<()> {
         request.validate()?;
@@ -1435,16 +1474,14 @@ impl Request for Proxy {
 
         // Select seed peers for downloading.
         let seed_peers = self
-            .seed_peer_selector
-            .select(task_id.clone(), request.replicas as u32)
+            .select_seed_peers(task_id.clone(), request.scope, request.replicas)
             .await
             .map_err(|err| {
                 Error::Internal(format!("failed to select seed peers from scheduler: {err}"))
             })?;
-
         debug!("task {} selected seed peers: {:?}", task_id, seed_peers);
 
-        if seed_peers.len() < request.replicas {
+        if request.scope == Scope::Default && seed_peers.len() < request.replicas {
             return Err(Error::Internal(format!(
                 "insufficient seed peers for {} replicas, {} available",
                 request.replicas,
@@ -1538,11 +1575,12 @@ impl Request for Proxy {
         Ok(())
     }
 
-    /// Deletes a preheated file from the replicas of seed peers via the Dragonfly.
+    /// Deletes a preheated file from the replicas of seed peers, or from all seed
+    /// peers with `Scope::AllSeedPeers`, via the Dragonfly.
     ///
     /// This method is designed for scenarios where a preheated file is no longer
     /// needed and its storage on the seed peers should be reclaimed. It has every
-    /// replica seed peer delete the task by the dfdaemon delete task API, clamping
+    /// selected seed peer delete the task by the dfdaemon delete task API, clamping
     /// the replicas to the available seed peers instead of failing when fewer are
     /// available.
     async fn delete(&self, request: &DeleteRequest) -> Result<()> {
@@ -1561,13 +1599,11 @@ impl Request for Proxy {
 
         // Select the seed peers serving the task.
         let seed_peers = self
-            .seed_peer_selector
-            .select(task_id.clone(), request.replicas as u32)
+            .select_seed_peers(task_id.clone(), request.scope, request.replicas)
             .await
             .map_err(|err| {
                 Error::Internal(format!("failed to select seed peers from scheduler: {err}"))
             })?;
-
         debug!("task {} selected seed peers: {:?}", task_id, seed_peers);
 
         // Construct the delete task request.
@@ -1641,6 +1677,24 @@ impl Request for Proxy {
 
 /// Implements proxy request logic.
 impl Proxy {
+    /// Selects the seed peers the scope addresses for the task: the replicas in
+    /// the consistent hash ring order, or all seed peers.
+    async fn select_seed_peers(
+        &self,
+        task_id: String,
+        scope: Scope,
+        replicas: usize,
+    ) -> Result<Vec<Host>> {
+        match scope {
+            Scope::Default => {
+                self.seed_peer_selector
+                    .select(task_id, replicas as u32)
+                    .await
+            }
+            Scope::AllSeedPeers => self.seed_peer_selector.select_all().await,
+        }
+    }
+
     /// Generates the task id of the url with the request parameters. It uses the
     /// content when given, else the blob or manifest digest of an OCI url when the
     /// digest based task id is enabled, else the url and its metadata.
@@ -2470,6 +2524,48 @@ mod tests {
 
         let result = proxy.preheat(&request).await;
         assert!(result.is_ok(), "preheat should succeed: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn preheat_all_seed_peers() {
+        let mut hosts = Vec::new();
+        let mut servers = Vec::new();
+        for name in ["seed-peer-1", "seed-peer-2", "seed-peer-3"] {
+            let mut mocks = MockSet::new();
+            mocks.mock(|when, then| {
+                when.path("/dfdaemon.v2.DfdaemonUpload/DownloadTask");
+                then.pb_stream(vec![DownloadTaskResponse {
+                    host_id: name.to_string(),
+                    task_id: "task-1".to_string(),
+                    peer_id: "peer-1".to_string(),
+                    ..Default::default()
+                }]);
+            });
+            let seed_peer = setup_mock_seed_peer(mocks).await.unwrap();
+
+            hosts.push(create_seed_peer_host(name, seed_peer.port().unwrap(), 0));
+            servers.push((name, seed_peer));
+        }
+
+        let mock_scheduler = setup_mock_scheduler(hosts).await.unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let request = PreheatRequest {
+            url: "http://example.com/payload.txt".to_string(),
+            replicas: 5,
+            scope: Scope::AllSeedPeers,
+            ..Default::default()
+        };
+        proxy.preheat(&request).await.unwrap();
+
+        for (name, server) in servers.iter() {
+            assert_eq!(seed_peer_calls(server), 1, "seed peer {name}");
+        }
     }
 
     #[tokio::test]
@@ -3647,6 +3743,63 @@ mod tests {
                     expected_calls,
                     "{url}: seed peer {name}"
                 );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn preheat_and_delete_all_seed_peers() {
+        let mut hosts = Vec::new();
+        let mut servers = Vec::new();
+        for name in ["seed-peer-1", "seed-peer-2", "seed-peer-3"] {
+            let mut mocks = MockSet::new();
+            mocks.mock(|when, then| {
+                when.path("/dfdaemon.v2.DfdaemonUpload/DownloadTask");
+                then.pb_stream(vec![DownloadTaskResponse {
+                    host_id: name.to_string(),
+                    task_id: "task-1".to_string(),
+                    peer_id: "peer-1".to_string(),
+                    ..Default::default()
+                }]);
+            });
+            mocks.mock(|when, then| {
+                when.path("/dfdaemon.v2.DfdaemonUpload/DeleteTask");
+                then.pb(());
+            });
+            let seed_peer = setup_mock_seed_peer(mocks).await.unwrap();
+
+            hosts.push(create_seed_peer_host(name, seed_peer.port().unwrap(), 0));
+            servers.push((name, seed_peer));
+        }
+
+        let mock_scheduler = setup_mock_scheduler(hosts).await.unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let url = "https://example.com/v2/foo/bar/blobs/sha256:b5f4dfca35398b36f61baa60e2bf2c242401c9d7db3de9168dcf780a2feedd2d";
+        let preheat_request = PreheatRequest {
+            url: url.to_string(),
+            replicas: 1,
+            scope: Scope::AllSeedPeers,
+            ..Default::default()
+        };
+        proxy.preheat(&preheat_request).await.unwrap();
+
+        let delete_request = DeleteRequest {
+            url: url.to_string(),
+            replicas: 1,
+            scope: Scope::AllSeedPeers,
+            ..Default::default()
+        };
+        proxy.delete(&delete_request).await.unwrap();
+
+        for (name, server) in servers.iter() {
+            for mock in server.mocks().iter().take(2) {
+                assert_eq!(mock.match_count() / 2, 1, "seed peer {name}");
             }
         }
     }

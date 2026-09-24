@@ -37,10 +37,11 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// Delete deletes a preheated file from the replicas of seed peers via the
-// Dragonfly. It has every replica seed peer delete the task by the dfdaemon
-// delete task API, clamping the replicas to the available seed peers instead
-// of failing when fewer are available.
+// Delete deletes a preheated file from the replicas of seed peers, or from all
+// seed peers with ScopeAllSeedPeers, via the Dragonfly. It has every selected
+// seed peer delete the task by the dfdaemon delete task API, clamping the
+// replicas to the available seed peers instead of failing when fewer are
+// available.
 func (p *Proxy) Delete(ctx context.Context, req *DeleteRequest) error {
 	if err := req.validate(); err != nil {
 		return err
@@ -53,7 +54,7 @@ func (p *Proxy) Delete(ctx context.Context, req *DeleteRequest) error {
 	}
 
 	// Select seed peers serving the task.
-	seedPeers, err := p.seedPeerSelector.Select(id, uint32(req.replicas))
+	seedPeers, err := p.selectSeedPeers(id, req.scope, req.replicas)
 	if err != nil {
 		return fmt.Errorf("%w: failed to select seed peers from scheduler: %v", ErrInternal, err)
 	}
@@ -114,6 +115,7 @@ func (p *Proxy) DeleteImage(ctx context.Context, req *DeleteImageRequest) error 
 				contentForCalculatingTaskID: req.contentForCalculatingTaskID,
 				enableTaskIDBasedBlobDigest: req.enableTaskIDBasedBlobDigest,
 				replicas:                    req.replicas,
+				scope:                       req.scope,
 				timeout:                     req.timeout,
 			}
 

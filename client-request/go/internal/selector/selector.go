@@ -22,7 +22,9 @@ package selector
 import (
 	"context"
 	"fmt"
+	"maps"
 	"net"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -50,6 +52,9 @@ const seedPeerType = 1
 type Selector interface {
 	// Select selects hosts based on the given taskID and number of replicas.
 	Select(taskID string, replicas uint32) ([]*commonv2.Host, error)
+
+	// SelectAll selects all hosts regardless of the taskID.
+	SelectAll() ([]*commonv2.Host, error)
 }
 
 // SeedPeerSelector selects seed peers from the scheduler service.
@@ -171,6 +176,18 @@ func (s *SeedPeerSelector) Select(taskID string, replicas uint32) ([]*commonv2.H
 	}
 
 	return seedPeers, nil
+}
+
+// SelectAll selects all seed peers regardless of the taskID.
+func (s *SeedPeerSelector) SelectAll() ([]*commonv2.Host, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if len(s.hosts) == 0 {
+		return nil, fmt.Errorf("host not found: seed peers")
+	}
+
+	return slices.Collect(maps.Values(s.hosts)), nil
 }
 
 // refresh updates the seed peers data.

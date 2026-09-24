@@ -26,6 +26,10 @@ const (
 	// DefaultReplicas is the default number of seed peers serving a task in the
 	// SDKs, the preheats land the task on this many seed peers.
 	DefaultReplicas = 2
+
+	// ScopeAllSeedPeers is the scope the drivers accept to preheat to, or delete
+	// from, all seed peers regardless of the replicas.
+	ScopeAllSeedPeers = "all_seed_peers"
 )
 
 // GetPreheatedSeedClients looks up the seed clients the SDK selects for the url
@@ -65,15 +69,8 @@ func GetPreheatedSeedClients(sdk *SDK, url, sha256 string) ([]*SeedClient, error
 		return nil, fmt.Errorf("expected endpoints %v to be seed clients, got %d", endpoints, len(selected))
 	}
 
-	for _, seedClient := range selected {
-		sha256sum, err := CalculateSha256ByTaskID([]*PodExec{seedClient.Pod}, taskID)
-		if err != nil {
-			return nil, fmt.Errorf("seed client %s should hold task %s: %w", seedClient.IP, taskID, err)
-		}
-
-		if sha256sum != sha256 {
-			return nil, fmt.Errorf("seed client %s holds task %s with sha256 %s, expected %s", seedClient.IP, taskID, sha256sum, sha256)
-		}
+	if err := checkSeedClientsHoldTask(selected, taskID, sha256); err != nil {
+		return nil, err
 	}
 
 	if CheckFilesExist(PodExecs(unselected), taskID) {
@@ -81,6 +78,43 @@ func GetPreheatedSeedClients(sdk *SDK, url, sha256 string) ([]*SeedClient, error
 	}
 
 	return selected, nil
+}
+
+// GetAllPreheatedSeedClients returns the seed clients and checks the preheat
+// with the all seed peers scope landed the task on every one of them: they all
+// hold the task content matching the sha256.
+func GetAllPreheatedSeedClients(url, sha256 string) ([]*SeedClient, error) {
+	seedClients, err := SeedClients()
+	if err != nil {
+		return nil, err
+	}
+
+	if len(seedClients) != SeedClientReplicas {
+		return nil, fmt.Errorf("expected %d seed clients, got %d", SeedClientReplicas, len(seedClients))
+	}
+
+	if err := checkSeedClientsHoldTask(seedClients, TaskID(url), sha256); err != nil {
+		return nil, err
+	}
+
+	return seedClients, nil
+}
+
+// checkSeedClientsHoldTask checks every seed client holds the task content
+// matching the sha256.
+func checkSeedClientsHoldTask(seedClients []*SeedClient, taskID, sha256 string) error {
+	for _, seedClient := range seedClients {
+		sha256sum, err := CalculateSha256ByTaskID([]*PodExec{seedClient.Pod}, taskID)
+		if err != nil {
+			return fmt.Errorf("seed client %s should hold task %s: %w", seedClient.IP, taskID, err)
+		}
+
+		if sha256sum != sha256 {
+			return fmt.Errorf("seed client %s holds task %s with sha256 %s, expected %s", seedClient.IP, taskID, sha256sum, sha256)
+		}
+	}
+
+	return nil
 }
 
 // CheckCacheHit reports whether the response of a get was served from the cache

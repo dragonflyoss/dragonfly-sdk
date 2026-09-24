@@ -40,11 +40,11 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 )
 
-// Preheat preheats a file by downloading it to the replicas of seed peers via
-// the Dragonfly. It triggers every replica seed peer to download the file by
-// the dfdaemon download task API, without streaming the file content back to
-// the client. It fails when the available seed peers are fewer than the
-// replicas of the request.
+// Preheat preheats a file by downloading it to the replicas of seed peers, or
+// to all seed peers with ScopeAllSeedPeers, via the Dragonfly. It triggers
+// every selected seed peer to download the file by the dfdaemon download task
+// API, without streaming the file content back to the client. It fails when
+// the available seed peers are fewer than the replicas of the request.
 func (p *Proxy) Preheat(ctx context.Context, req *PreheatRequest) error {
 	if err := req.validate(); err != nil {
 		return err
@@ -57,12 +57,12 @@ func (p *Proxy) Preheat(ctx context.Context, req *PreheatRequest) error {
 	}
 
 	// Select seed peers for downloading.
-	seedPeers, err := p.seedPeerSelector.Select(id, uint32(req.replicas))
+	seedPeers, err := p.selectSeedPeers(id, req.scope, req.replicas)
 	if err != nil {
 		return fmt.Errorf("%w: failed to select seed peers from scheduler: %v", ErrInternal, err)
 	}
 
-	if len(seedPeers) < req.replicas {
+	if req.scope == ScopeDefault && len(seedPeers) < req.replicas {
 		return fmt.Errorf("%w: insufficient seed peers for %d replicas, %d available", ErrInternal, req.replicas, len(seedPeers))
 	}
 
@@ -111,6 +111,16 @@ func (p *Proxy) Preheat(ctx context.Context, req *PreheatRequest) error {
 	}
 
 	return g.Wait()
+}
+
+// selectSeedPeers selects the seed peers the scope addresses for the task: the
+// replicas in the consistent hash ring order, or all seed peers.
+func (p *Proxy) selectSeedPeers(id string, scope Scope, replicas int) ([]*commonv2.Host, error) {
+	if scope == ScopeAllSeedPeers {
+		return p.seedPeerSelector.SelectAll()
+	}
+
+	return p.seedPeerSelector.Select(id, uint32(replicas))
 }
 
 // download has the seed peer download the task and drains the response stream,
@@ -229,6 +239,7 @@ func (p *Proxy) PreheatImage(ctx context.Context, req *PreheatImageRequest) erro
 				enableTaskIDBasedBlobDigest: req.enableTaskIDBasedBlobDigest,
 				priority:                    req.priority,
 				replicas:                    req.replicas,
+				scope:                       req.scope,
 				timeout:                     req.timeout,
 				certificates:                req.certificates,
 			}

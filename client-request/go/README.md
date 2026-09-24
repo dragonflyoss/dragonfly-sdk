@@ -105,9 +105,9 @@ for _, peer := range resp.Peers {
 ```
 
 Delete a preheated file or an OCI image from the seed peers. The request
-should carry the parameters the preheat used, such as the replicas and the
-platform, so the delete addresses the same tasks and seed peers. A seed peer
-answering `NotFound` for a task counts as deleted:
+should carry the parameters the preheat used, such as the replicas, the scope
+and the platform, so the delete addresses the same tasks and seed peers. A seed
+peer answering `NotFound` for a task counts as deleted:
 
 ```go
 if err := proxy.Delete(ctx, request.NewDeleteRequest("https://example.com/file.txt")); err != nil {
@@ -136,6 +136,25 @@ if err != nil {
     panic(err)
 }
 defer resp.Body.Close()
+```
+
+Preheat to all seed peers regardless of the replicas with the all seed peers
+scope, aligned with the `all_seed_peers` scope of the manager preheat job, so
+any seed peer a download picks holds the file. Delete with the same scope to
+remove the file from every seed peer:
+
+```go
+if err := proxy.Preheat(ctx, request.NewPreheatRequest("https://example.com/file.txt", request.WithPreheatRequestScope(request.ScopeAllSeedPeers))); err != nil {
+    panic(err)
+}
+
+if err := proxy.PreheatImage(ctx, request.NewPreheatImageRequest("docker.io/library/nginx:latest", request.WithPreheatImageRequestScope(request.ScopeAllSeedPeers))); err != nil {
+    panic(err)
+}
+
+if err := proxy.Delete(ctx, request.NewDeleteRequest("https://example.com/file.txt", request.WithDeleteRequestScope(request.ScopeAllSeedPeers))); err != nil {
+    panic(err)
+}
 ```
 
 Look up the endpoints of the seed peers serving a request, then create a proxy

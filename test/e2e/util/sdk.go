@@ -99,24 +99,39 @@ func (s *SDK) Get(url, output string, endpoints []string, header http.Header) (*
 	return &resp, nil
 }
 
-// Preheat preheats the url to the seed peers through the SDK.
-func (s *SDK) Preheat(url string) error {
-	return s.run(nil, "preheat", "--scheduler", SchedulerEndpoint, url)
+// Preheat preheats the url to the seed peers through the SDK, to the default
+// replicas or to the scope when given.
+func (s *SDK) Preheat(url, scope string) error {
+	return s.run(nil, append(scopeArgs("preheat", scope), url)...)
 }
 
-// PreheatImage preheats the image to the seed peers through the SDK.
-func (s *SDK) PreheatImage(image string) error {
-	return s.run(nil, "preheat-image", "--scheduler", SchedulerEndpoint, image)
+// PreheatImage preheats the image to the seed peers through the SDK, to the
+// default replicas or to the scope when given.
+func (s *SDK) PreheatImage(image, scope string) error {
+	return s.run(nil, append(scopeArgs("preheat-image", scope), image)...)
 }
 
-// Delete deletes the preheated url from the seed peers through the SDK.
-func (s *SDK) Delete(url string) error {
-	return s.run(nil, "delete", "--scheduler", SchedulerEndpoint, url)
+// Delete deletes the preheated url from the seed peers through the SDK, from
+// the default replicas or from the scope when given.
+func (s *SDK) Delete(url, scope string) error {
+	return s.run(nil, append(scopeArgs("delete", scope), url)...)
 }
 
-// DeleteImage deletes the preheated image from the seed peers through the SDK.
-func (s *SDK) DeleteImage(image string) error {
-	return s.run(nil, "delete-image", "--scheduler", SchedulerEndpoint, image)
+// DeleteImage deletes the preheated image from the seed peers through the SDK,
+// from the default replicas or from the scope when given.
+func (s *SDK) DeleteImage(image, scope string) error {
+	return s.run(nil, append(scopeArgs("delete-image", scope), image)...)
+}
+
+// scopeArgs returns the arguments of the command with the scheduler and the
+// scope flag when given.
+func scopeArgs(command, scope string) []string {
+	args := []string{command, "--scheduler", SchedulerEndpoint}
+	if scope != "" {
+		args = append(args, "--scope", scope)
+	}
+
+	return args
 }
 
 // run runs the driver in the runner pod and decodes its JSON output into out

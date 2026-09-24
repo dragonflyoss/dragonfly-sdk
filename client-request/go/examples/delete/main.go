@@ -15,7 +15,8 @@
  */
 
 // Command delete deletes a preheated file or an OCI image from the seed peers
-// via the Dragonfly.
+// via the Dragonfly, from the replicas of the task by default or from all seed
+// peers with the all_seed_peers scope.
 package main
 
 import (
@@ -29,9 +30,15 @@ import (
 )
 
 func main() {
-	if len(os.Args) != 4 || (os.Args[2] != "file" && os.Args[2] != "image") {
-		fmt.Fprintf(os.Stderr, "usage: %s <scheduler-endpoint> file|image <url-or-image>\n", os.Args[0])
+	if len(os.Args) < 4 || len(os.Args) > 5 || (os.Args[2] != "file" && os.Args[2] != "image") {
+		fmt.Fprintf(os.Stderr, "usage: %s <scheduler-endpoint> file|image <url-or-image> [default|all_seed_peers]\n", os.Args[0])
 		os.Exit(1)
+	}
+
+	// Address the replicas of the task unless the scope is given.
+	scope := request.ScopeDefault
+	if len(os.Args) == 5 {
+		scope = request.Scope(os.Args[4])
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -46,9 +53,9 @@ func main() {
 
 	switch os.Args[2] {
 	case "file":
-		err = proxy.Delete(ctx, request.NewDeleteRequest(os.Args[3]))
+		err = proxy.Delete(ctx, request.NewDeleteRequest(os.Args[3], request.WithDeleteRequestScope(scope)))
 	case "image":
-		err = proxy.DeleteImage(ctx, request.NewDeleteImageRequest(os.Args[3]))
+		err = proxy.DeleteImage(ctx, request.NewDeleteImageRequest(os.Args[3], request.WithDeleteImageRequestScope(scope)))
 	}
 
 	if err != nil {

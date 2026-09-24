@@ -15,7 +15,9 @@ the looked up endpoints, are served from the preheated cache: the response
 carries the task id, the ip of a preheated seed peer and the download finished
 flag, the content matches and the file server sees no further download. They
 also delete a preheated file and a preheated image and check no seed peer holds
-the task, or the manifest and any blob, afterwards.
+the task, or the manifest and any blob, afterwards. With the all seed peers
+scope, they check a preheat lands the task on every seed peer and a delete
+removes it from every one of them.
 
 ## Run locally
 
