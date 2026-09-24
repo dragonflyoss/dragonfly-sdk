@@ -162,9 +162,9 @@ let response = proxy
 
 Delete a preheated file or an OCI image from the seed peers, `delete_image`
 needing the `preheat` feature. The request should carry the parameters the
-preheat used, such as the replicas and the platform, so the delete addresses
-the same tasks and seed peers. A seed peer answering `NotFound` for a task
-counts as deleted:
+preheat used, such as the replicas, the scope and the platform, so the delete
+addresses the same tasks and seed peers. A seed peer answering `NotFound` for a
+task counts as deleted:
 
 ```rust
 proxy
