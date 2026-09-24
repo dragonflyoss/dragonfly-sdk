@@ -108,6 +108,28 @@ func TestSelectReplicasExceedsAvailable(t *testing.T) {
 	assert.Len(hosts, 2)
 }
 
+func TestSelectAll(t *testing.T) {
+	assert := assert.New(t)
+	s := createTestSelector()
+
+	_, err := s.SelectAll()
+	assert.Error(err)
+
+	for i := 1; i <= 5; i++ {
+		addTestHost(s, createTestHost(fmt.Sprint(i), fmt.Sprintf("192.168.1.%d", i), 8080, 1))
+	}
+
+	hosts, err := s.SelectAll()
+	assert.NoError(err)
+	assert.Len(hosts, 5)
+
+	seen := make(map[string]struct{}, len(hosts))
+	for _, host := range hosts {
+		seen[host.Id] = struct{}{}
+	}
+	assert.Len(seen, 5)
+}
+
 func TestSelectConsistency(t *testing.T) {
 	assert := assert.New(t)
 	s := createTestSelector()

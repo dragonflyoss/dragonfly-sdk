@@ -76,6 +76,48 @@ func TestPreheatInsufficientSeedPeers(t *testing.T) {
 	assert.ErrorContains(err, "insufficient seed peers")
 }
 
+func TestPreheatAllSeedPeers(t *testing.T) {
+	assert := assert.New(t)
+
+	var mu sync.Mutex
+	preheated := make(map[string]bool)
+	var hosts []*commonv2.Host
+	for _, name := range []string{"seed-peer-1", "seed-peer-2", "seed-peer-3"} {
+		port := setupMockSeedPeerServer(t, &mockSeedPeer{onDownload: func() {
+			mu.Lock()
+			preheated[name] = true
+			mu.Unlock()
+		}})
+		hosts = append(hosts, createSeedPeerHost(name, port, 0))
+	}
+	endpoint := setupMockScheduler(t, hosts)
+
+	proxy, err := New(context.Background(), endpoint)
+	assert.NoError(err)
+	defer proxy.Close()
+
+	req := NewPreheatRequest("http://example.com/payload.txt", WithPreheatRequestReplicas(5), WithPreheatRequestScope(ScopeAllSeedPeers))
+	assert.NoError(proxy.Preheat(context.Background(), req))
+
+	mu.Lock()
+	assert.Len(preheated, len(hosts))
+	mu.Unlock()
+}
+
+func TestPreheatInvalidScope(t *testing.T) {
+	assert := assert.New(t)
+	endpoint := setupMockScheduler(t, nil)
+
+	proxy, err := New(context.Background(), endpoint)
+	assert.NoError(err)
+	defer proxy.Close()
+
+	req := NewPreheatRequest("http://example.com/payload.txt", WithPreheatRequestScope(Scope("all_peers")))
+	err = proxy.Preheat(context.Background(), req)
+	assert.ErrorIs(err, ErrInvalidArgument)
+	assert.ErrorContains(err, "invalid scope")
+}
+
 func TestPreheatFailsWhenSeedPeerDownloadFails(t *testing.T) {
 	assert := assert.New(t)
 	port := setupMockSeedPeer(t, status.Error(codes.Internal, "storage is full"))

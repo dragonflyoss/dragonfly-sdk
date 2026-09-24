@@ -22,10 +22,10 @@
 //
 //	driver lookup-endpoints --scheduler <endpoint> <url>
 //	driver get --scheduler <endpoint> [--endpoint <endpoint>]... [--header <key: value>]... --output <path> <url>
-//	driver preheat --scheduler <endpoint> <url>
-//	driver preheat-image --scheduler <endpoint> <image>
-//	driver delete --scheduler <endpoint> <url>
-//	driver delete-image --scheduler <endpoint> <image>
+//	driver preheat --scheduler <endpoint> [--scope <scope>] <url>
+//	driver preheat-image --scheduler <endpoint> [--scope <scope>] <image>
+//	driver delete --scheduler <endpoint> [--scope <scope>] <url>
+//	driver delete-image --scheduler <endpoint> [--scope <scope>] <image>
 package main
 
 import (
@@ -208,6 +208,7 @@ func get(ctx context.Context, args []string) error {
 func preheat(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("preheat", flag.ExitOnError)
 	schedulerEndpoint := flags.String("scheduler", "", "scheduler endpoint")
+	scope := flags.String("scope", string(request.ScopeDefault), "seed peers to address, default or all_seed_peers")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -222,13 +223,14 @@ func preheat(ctx context.Context, args []string) error {
 	}
 	defer proxy.Close()
 
-	return proxy.Preheat(ctx, request.NewPreheatRequest(flags.Arg(0)))
+	return proxy.Preheat(ctx, request.NewPreheatRequest(flags.Arg(0), request.WithPreheatRequestScope(request.Scope(*scope))))
 }
 
 // preheatImage preheats the image to the seed peers.
 func preheatImage(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("preheat-image", flag.ExitOnError)
 	schedulerEndpoint := flags.String("scheduler", "", "scheduler endpoint")
+	scope := flags.String("scope", string(request.ScopeDefault), "seed peers to address, default or all_seed_peers")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -243,13 +245,14 @@ func preheatImage(ctx context.Context, args []string) error {
 	}
 	defer proxy.Close()
 
-	return proxy.PreheatImage(ctx, request.NewPreheatImageRequest(flags.Arg(0)))
+	return proxy.PreheatImage(ctx, request.NewPreheatImageRequest(flags.Arg(0), request.WithPreheatImageRequestScope(request.Scope(*scope))))
 }
 
 // delete deletes the preheated url from the seed peers.
 func delete(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("delete", flag.ExitOnError)
 	schedulerEndpoint := flags.String("scheduler", "", "scheduler endpoint")
+	scope := flags.String("scope", string(request.ScopeDefault), "seed peers to address, default or all_seed_peers")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -264,13 +267,14 @@ func delete(ctx context.Context, args []string) error {
 	}
 	defer proxy.Close()
 
-	return proxy.Delete(ctx, request.NewDeleteRequest(flags.Arg(0)))
+	return proxy.Delete(ctx, request.NewDeleteRequest(flags.Arg(0), request.WithDeleteRequestScope(request.Scope(*scope))))
 }
 
 // deleteImage deletes the preheated image from the seed peers.
 func deleteImage(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("delete-image", flag.ExitOnError)
 	schedulerEndpoint := flags.String("scheduler", "", "scheduler endpoint")
+	scope := flags.String("scope", string(request.ScopeDefault), "seed peers to address, default or all_seed_peers")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -285,7 +289,7 @@ func deleteImage(ctx context.Context, args []string) error {
 	}
 	defer proxy.Close()
 
-	return proxy.DeleteImage(ctx, request.NewDeleteImageRequest(flags.Arg(0)))
+	return proxy.DeleteImage(ctx, request.NewDeleteImageRequest(flags.Arg(0), request.WithDeleteImageRequestScope(request.Scope(*scope))))
 }
 
 // parseHeader parses the repeatable "Key: Value" header flags.

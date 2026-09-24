@@ -14,22 +14,31 @@
  * limitations under the License.
  */
 
-//! Deletes a preheated file or an OCI image from the seed peers via the Dragonfly.
+//! Deletes a preheated file or an OCI image from the seed peers via the Dragonfly,
+//! from the replicas of the task by default or from all seed peers with the
+//! `all_seed_peers` scope.
 //!
-//! Usage: cargo run --example delete --features preheat -- <scheduler-endpoint> file|image <url-or-image>
+//! Usage: cargo run --example delete --features preheat -- <scheduler-endpoint> file|image <url-or-image> [default|all_seed_peers]
 
-use dragonfly_client_request::{DeleteImageRequest, DeleteRequest, Proxy, Request};
+use dragonfly_client_request::{DeleteImageRequest, DeleteRequest, Proxy, Request, Scope};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 4 || (args[2] != "file" && args[2] != "image") {
+    if !(4..=5).contains(&args.len()) || (args[2] != "file" && args[2] != "image") {
         eprintln!(
-            "usage: {} <scheduler-endpoint> file|image <url-or-image>",
+            "usage: {} <scheduler-endpoint> file|image <url-or-image> [default|all_seed_peers]",
             args[0]
         );
         std::process::exit(1);
     }
+
+    // Address the replicas of the task unless the scope is given.
+    let scope = match args.get(4).map(String::as_str) {
+        None | Some("default") => Scope::Default,
+        Some("all_seed_peers") => Scope::AllSeedPeers,
+        Some(scope) => return Err(format!("invalid scope {scope:?}").into()),
+    };
 
     let proxy = Proxy::builder()
         .scheduler_endpoint(args[1].clone())
@@ -41,6 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             proxy
                 .delete(&DeleteRequest {
                     url: args[3].clone(),
+                    scope,
                     ..Default::default()
                 })
                 .await?
@@ -49,6 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             proxy
                 .delete_image(&DeleteImageRequest {
                     image: args[3].clone(),
+                    scope,
                     ..Default::default()
                 })
                 .await?

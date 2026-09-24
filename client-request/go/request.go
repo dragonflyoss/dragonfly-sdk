@@ -28,6 +28,7 @@ import (
 	"net/http"
 	"time"
 
+	managertypes "d7y.io/dragonfly/v2/manager/types"
 	"d7y.io/dragonfly/v2/pkg/idgen"
 )
 
@@ -40,6 +41,29 @@ const defaultConcurrentTaskCount = 4
 
 // defaultReplicas is the default number of seed peers serving a task.
 const defaultReplicas = 2
+
+// Scope is the seed peers a preheat or delete addresses.
+type Scope string
+
+const (
+	// ScopeDefault addresses the replicas of the task: the seed peers picked in
+	// the consistent hash ring order for its task id.
+	ScopeDefault Scope = "default"
+
+	// ScopeAllSeedPeers addresses all seed peers regardless of the replicas,
+	// aligned with the AllSeedPeersScope in the dragonfly manager types.
+	ScopeAllSeedPeers Scope = managertypes.AllSeedPeersScope
+)
+
+// validate validates the scope.
+func (s Scope) validate() error {
+	switch s {
+	case ScopeDefault, ScopeAllSeedPeers:
+		return nil
+	default:
+		return fmt.Errorf("%w: invalid scope %q", ErrInvalidArgument, s)
+	}
+}
 
 // Request is the interface for sending requests via the Dragonfly.
 //
@@ -66,10 +90,11 @@ type Request interface {
 	// the next seed peer, a failed body write is not since w cannot be rewound.
 	GetInto(ctx context.Context, req *GetRequest, w io.Writer) (*GetResponse, error)
 
-	// Preheat preheats a file: has every replica seed peer download it through
-	// the dfdaemon download task API without streaming it back. A transient
-	// failure is retried on the same seed peer, so the file lands on every
-	// replica. It fails when fewer seed peers than replicas are available.
+	// Preheat preheats a file: has every replica seed peer, or every seed peer
+	// with ScopeAllSeedPeers, download it through the dfdaemon download task API
+	// without streaming it back. A transient failure is retried on the same seed
+	// peer, so the file lands on every replica. It fails when fewer seed peers
+	// than replicas are available.
 	Preheat(ctx context.Context, req *PreheatRequest) error
 
 	// PreheatImage preheats an OCI image: resolves its manifest, multi-platform
@@ -81,10 +106,11 @@ type Request interface {
 	// resolved by the scheduler. Useful to verify a preheat.
 	StatImage(ctx context.Context, req *StatImageRequest) (*StatImageResponse, error)
 
-	// Delete deletes a preheated file: has every replica seed peer delete its
-	// task through the dfdaemon delete task API. A transient failure is retried
-	// on the same seed peer, so the task leaves every replica. A seed peer
-	// answering NotFound counts as deleted.
+	// Delete deletes a preheated file: has every replica seed peer, or every
+	// seed peer with ScopeAllSeedPeers, delete its task through the dfdaemon
+	// delete task API. A transient failure is retried on the same seed peer, so
+	// the task leaves every replica. A seed peer answering NotFound counts as
+	// deleted.
 	Delete(ctx context.Context, req *DeleteRequest) error
 
 	// DeleteImage deletes a preheated OCI image: resolves its manifest,
@@ -317,6 +343,9 @@ type PreheatRequest struct {
 	// replicas is the number of seed peers serving the task.
 	replicas int
 
+	// scope is the seed peers to preheat the task to.
+	scope Scope
+
 	// timeout is the timeout of each attempt of the request.
 	timeout time.Duration
 
@@ -379,6 +408,13 @@ func WithPreheatRequestReplicas(replicas int) PreheatRequestOption {
 	return func(r *PreheatRequest) { r.replicas = replicas }
 }
 
+// WithPreheatRequestScope sets the seed peers to preheat the task to, default
+// is ScopeDefault: the replicas of the task. ScopeAllSeedPeers preheats to all
+// seed peers regardless of the replicas.
+func WithPreheatRequestScope(scope Scope) PreheatRequestOption {
+	return func(r *PreheatRequest) { r.scope = scope }
+}
+
 // WithPreheatRequestTimeout sets the timeout of each attempt of the request.
 func WithPreheatRequestTimeout(timeout time.Duration) PreheatRequestOption {
 	return func(r *PreheatRequest) { r.timeout = timeout }
@@ -398,6 +434,7 @@ func NewPreheatRequest(url string, opts ...PreheatRequestOption) *PreheatRequest
 		filteredQueryParams:         idgen.DefaultFilteredQueryParams,
 		enableTaskIDBasedBlobDigest: true,
 		replicas:                    defaultReplicas,
+		scope:                       ScopeDefault,
 		timeout:                     defaultRequestTimeout,
 	}
 	for _, opt := range opts {
@@ -411,6 +448,10 @@ func NewPreheatRequest(url string, opts ...PreheatRequestOption) *PreheatRequest
 func (r *PreheatRequest) validate() error {
 	if r.replicas <= 0 {
 		return fmt.Errorf("%w: replicas must be positive", ErrInvalidArgument)
+	}
+
+	if err := r.scope.validate(); err != nil {
+		return err
 	}
 
 	return nil
@@ -458,6 +499,9 @@ type PreheatImageRequest struct {
 
 	// replicas is the number of seed peers serving each blob task.
 	replicas int
+
+	// scope is the seed peers to preheat each blob task to.
+	scope Scope
 
 	// timeout is the timeout for each blob download request.
 	timeout time.Duration
@@ -535,6 +579,13 @@ func WithPreheatImageRequestReplicas(replicas int) PreheatImageRequestOption {
 	return func(r *PreheatImageRequest) { r.replicas = replicas }
 }
 
+// WithPreheatImageRequestScope sets the seed peers to preheat each blob task
+// to, default is ScopeDefault: the replicas of the task. ScopeAllSeedPeers
+// preheats to all seed peers regardless of the replicas.
+func WithPreheatImageRequestScope(scope Scope) PreheatImageRequestOption {
+	return func(r *PreheatImageRequest) { r.scope = scope }
+}
+
 // WithPreheatImageRequestTimeout sets the timeout for each blob download request.
 func WithPreheatImageRequestTimeout(timeout time.Duration) PreheatImageRequestOption {
 	return func(r *PreheatImageRequest) { r.timeout = timeout }
@@ -560,6 +611,7 @@ func NewPreheatImageRequest(image string, opts ...PreheatImageRequestOption) *Pr
 		filteredQueryParams:         idgen.DefaultFilteredQueryParams,
 		enableTaskIDBasedBlobDigest: true,
 		replicas:                    defaultReplicas,
+		scope:                       ScopeDefault,
 		timeout:                     defaultRequestTimeout,
 		concurrentTaskCount:         defaultConcurrentTaskCount,
 	}
@@ -574,6 +626,10 @@ func NewPreheatImageRequest(image string, opts ...PreheatImageRequestOption) *Pr
 func (r *PreheatImageRequest) validate() error {
 	if r.replicas <= 0 {
 		return fmt.Errorf("%w: replicas must be positive", ErrInvalidArgument)
+	}
+
+	if err := r.scope.validate(); err != nil {
+		return err
 	}
 
 	if r.concurrentTaskCount <= 0 {
@@ -754,6 +810,9 @@ type DeleteRequest struct {
 	// replicas is the number of seed peers serving the task.
 	replicas int
 
+	// scope is the seed peers to delete the task from.
+	scope Scope
+
 	// timeout is the timeout of each attempt of the request.
 	timeout time.Duration
 }
@@ -803,6 +862,13 @@ func WithDeleteRequestReplicas(replicas int) DeleteRequestOption {
 	return func(r *DeleteRequest) { r.replicas = replicas }
 }
 
+// WithDeleteRequestScope sets the seed peers to delete the task from,
+// consistent with the scope used when the file was preheated, default is
+// ScopeDefault.
+func WithDeleteRequestScope(scope Scope) DeleteRequestOption {
+	return func(r *DeleteRequest) { r.scope = scope }
+}
+
 // WithDeleteRequestTimeout sets the timeout of each attempt of the request.
 func WithDeleteRequestTimeout(timeout time.Duration) DeleteRequestOption {
 	return func(r *DeleteRequest) { r.timeout = timeout }
@@ -815,6 +881,7 @@ func NewDeleteRequest(url string, opts ...DeleteRequestOption) *DeleteRequest {
 		filteredQueryParams:         idgen.DefaultFilteredQueryParams,
 		enableTaskIDBasedBlobDigest: true,
 		replicas:                    defaultReplicas,
+		scope:                       ScopeDefault,
 		timeout:                     defaultRequestTimeout,
 	}
 	for _, opt := range opts {
@@ -828,6 +895,10 @@ func NewDeleteRequest(url string, opts ...DeleteRequestOption) *DeleteRequest {
 func (r *DeleteRequest) validate() error {
 	if r.replicas <= 0 {
 		return fmt.Errorf("%w: replicas must be positive", ErrInvalidArgument)
+	}
+
+	if err := r.scope.validate(); err != nil {
+		return err
 	}
 
 	return nil
@@ -872,6 +943,9 @@ type DeleteImageRequest struct {
 
 	// replicas is the number of seed peers serving each task.
 	replicas int
+
+	// scope is the seed peers to delete each task from.
+	scope Scope
 
 	// timeout is the timeout of each attempt of a task delete.
 	timeout time.Duration
@@ -942,6 +1016,13 @@ func WithDeleteImageRequestReplicas(replicas int) DeleteImageRequestOption {
 	return func(r *DeleteImageRequest) { r.replicas = replicas }
 }
 
+// WithDeleteImageRequestScope sets the seed peers to delete each task from,
+// consistent with the scope used when the image was preheated, default is
+// ScopeDefault.
+func WithDeleteImageRequestScope(scope Scope) DeleteImageRequestOption {
+	return func(r *DeleteImageRequest) { r.scope = scope }
+}
+
 // WithDeleteImageRequestTimeout sets the timeout of each attempt of a task
 // delete.
 func WithDeleteImageRequestTimeout(timeout time.Duration) DeleteImageRequestOption {
@@ -962,6 +1043,7 @@ func NewDeleteImageRequest(image string, opts ...DeleteImageRequestOption) *Dele
 		filteredQueryParams:         idgen.DefaultFilteredQueryParams,
 		enableTaskIDBasedBlobDigest: true,
 		replicas:                    defaultReplicas,
+		scope:                       ScopeDefault,
 		timeout:                     defaultRequestTimeout,
 		concurrentTaskCount:         defaultConcurrentTaskCount,
 	}
@@ -976,6 +1058,10 @@ func NewDeleteImageRequest(image string, opts ...DeleteImageRequestOption) *Dele
 func (r *DeleteImageRequest) validate() error {
 	if r.replicas <= 0 {
 		return fmt.Errorf("%w: replicas must be positive", ErrInvalidArgument)
+	}
+
+	if err := r.scope.validate(); err != nil {
+		return err
 	}
 
 	if r.concurrentTaskCount <= 0 {

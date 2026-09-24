@@ -46,7 +46,7 @@ var _ = Describe("Lookup Endpoints", func() {
 
 			It("get with each endpoint and with all the endpoints should hit the preheated seed peers", Label("lookup", "file", sdk.Name), func() {
 				url := testFile.GetDownloadURL()
-				Expect(sdk.Preheat(url)).To(Succeed())
+				Expect(sdk.Preheat(url, "")).To(Succeed())
 
 				seedClients, err := util.GetPreheatedSeedClients(sdk, url, testFile.GetSha256())
 				Expect(err).NotTo(HaveOccurred())

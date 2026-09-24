@@ -138,6 +138,25 @@ if err != nil {
 defer resp.Body.Close()
 ```
 
+Preheat to all seed peers regardless of the replicas with the all seed peers
+scope, aligned with the `all_seed_peers` scope of the manager preheat job, so
+any seed peer a download picks holds the file. Delete with the same scope to
+remove the file from every seed peer:
+
+```go
+if err := proxy.Preheat(ctx, request.NewPreheatRequest("https://example.com/file.txt", request.WithPreheatRequestScope(request.ScopeAllSeedPeers))); err != nil {
+    panic(err)
+}
+
+if err := proxy.PreheatImage(ctx, request.NewPreheatImageRequest("docker.io/library/nginx:latest", request.WithPreheatImageRequestScope(request.ScopeAllSeedPeers))); err != nil {
+    panic(err)
+}
+
+if err := proxy.Delete(ctx, request.NewDeleteRequest("https://example.com/file.txt", request.WithDeleteRequestScope(request.ScopeAllSeedPeers))); err != nil {
+    panic(err)
+}
+```
+
 Look up the endpoints of the seed peers serving a request, then create a proxy
 bound to those endpoints and download from them directly, scattering the
 request across them. The endpoints proxy keeps a client with a reusable

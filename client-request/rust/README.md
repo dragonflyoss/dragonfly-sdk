@@ -58,6 +58,29 @@ let response = proxy
     .await?;
 ```
 
+Preheat to all seed peers regardless of the replicas with the all seed peers
+scope, aligned with the `all_seed_peers` scope of the manager preheat job, so
+any seed peer a download picks holds the file. Delete with the same scope to
+remove the file from every seed peer:
+
+```rust
+proxy
+    .preheat(&PreheatRequest {
+        url: "https://example.com/file.txt".to_string(),
+        scope: Scope::AllSeedPeers,
+        ..Default::default()
+    })
+    .await?;
+
+proxy
+    .delete(&DeleteRequest {
+        url: "https://example.com/file.txt".to_string(),
+        scope: Scope::AllSeedPeers,
+        ..Default::default()
+    })
+    .await?;
+```
+
 Retry transient failures. A request is retried on another seed peer when the
 peer cannot be reached or answers too slowly, or the proxy, backend or dfdaemon
 answers `5xx`, `408` or `429`, since another seed peer may not be rate limited or
@@ -118,7 +141,7 @@ deleting a preheated OCI image from the seed peers:
 
 ```toml
 [dependencies]
-dragonfly-client-request = { version = "1.8.0", features = ["preheat"] }
+dragonfly-client-request = { version = "1.9.0", features = ["preheat"] }
 ```
 
 ```rust

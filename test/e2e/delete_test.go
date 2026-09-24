@@ -46,16 +46,49 @@ var _ = Describe("Delete", func() {
 
 			It("delete should remove the task from all seed peers", Label("delete", "file", sdk.Name), func() {
 				url := testFile.GetDownloadURL()
-				Expect(sdk.Preheat(url)).To(Succeed())
+				Expect(sdk.Preheat(url, "")).To(Succeed())
 
 				_, err := util.GetPreheatedSeedClients(sdk, url, testFile.GetSha256())
 				Expect(err).NotTo(HaveOccurred())
 
-				Expect(sdk.Delete(url)).To(Succeed())
+				Expect(sdk.Delete(url, "")).To(Succeed())
 
 				seedClients, err := util.SeedClients()
 				Expect(err).NotTo(HaveOccurred())
 				Expect(seedClients).To(HaveLen(util.SeedClientReplicas))
+				Expect(util.CheckFilesExist(util.PodExecs(seedClients), testFile.GetTaskID())).To(BeFalse())
+			})
+		})
+	}
+})
+
+var _ = Describe("Delete All Seed Peers", func() {
+	for _, sdk := range util.SDKs {
+		Context(fmt.Sprintf("10MiB file using %s sdk", sdk.Name), func() {
+			var (
+				testFile *util.File
+				err      error
+			)
+
+			BeforeEach(func() {
+				testFile, err = util.GetFileServer().GenerateFile(util.FileSize10MiB)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(testFile).NotTo(BeNil())
+			})
+
+			AfterEach(func() {
+				err = util.GetFileServer().DeleteFile(testFile)
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			It("delete with the all seed peers scope should remove the task from every seed peer", Label("delete", "file", "all-seed-peers", sdk.Name), func() {
+				url := testFile.GetDownloadURL()
+				Expect(sdk.Preheat(url, util.ScopeAllSeedPeers)).To(Succeed())
+
+				seedClients, err := util.GetAllPreheatedSeedClients(url, testFile.GetSha256())
+				Expect(err).NotTo(HaveOccurred())
+
+				Expect(sdk.Delete(url, util.ScopeAllSeedPeers)).To(Succeed())
 				Expect(util.CheckFilesExist(util.PodExecs(seedClients), testFile.GetTaskID())).To(BeFalse())
 			})
 		})
@@ -67,14 +100,40 @@ var _ = Describe("Delete Image", func() {
 	for _, sdk := range util.SDKs {
 		Context(fmt.Sprintf("%s image using %s sdk", image.GetReference(), sdk.Name), func() {
 			It("delete should remove the manifest and every blob from all seed peers", Label("delete", "image", sdk.Name), func() {
-				Expect(sdk.PreheatImage(image.GetReference())).To(Succeed())
+				Expect(sdk.PreheatImage(image.GetReference(), "")).To(Succeed())
 
 				for _, blob := range image.GetBlobs() {
 					_, err := util.GetPreheatedSeedClients(sdk, blob.GetURL(), blob.GetSha256())
 					Expect(err).NotTo(HaveOccurred())
 				}
 
-				Expect(sdk.DeleteImage(image.GetReference())).To(Succeed())
+				Expect(sdk.DeleteImage(image.GetReference(), "")).To(Succeed())
+
+				seedClients, err := util.SeedClients()
+				Expect(err).NotTo(HaveOccurred())
+				Expect(seedClients).To(HaveLen(util.SeedClientReplicas))
+
+				for _, blob := range image.GetBlobs() {
+					Expect(util.CheckFilesExist(util.PodExecs(seedClients), blob.GetTaskID())).To(BeFalse())
+				}
+			})
+		})
+	}
+})
+
+var _ = Describe("Delete Image All Seed Peers", func() {
+	image := util.BusyboxImage
+	for _, sdk := range util.SDKs {
+		Context(fmt.Sprintf("%s image using %s sdk", image.GetReference(), sdk.Name), func() {
+			It("delete with the all seed peers scope should remove the manifest and every blob preheated to every seed peer", Label("delete", "image", "all-seed-peers", sdk.Name), func() {
+				Expect(sdk.PreheatImage(image.GetReference(), util.ScopeAllSeedPeers)).To(Succeed())
+
+				for _, blob := range image.GetBlobs() {
+					_, err := util.GetAllPreheatedSeedClients(blob.GetURL(), blob.GetSha256())
+					Expect(err).NotTo(HaveOccurred())
+				}
+
+				Expect(sdk.DeleteImage(image.GetReference(), util.ScopeAllSeedPeers)).To(Succeed())
 
 				seedClients, err := util.SeedClients()
 				Expect(err).NotTo(HaveOccurred())

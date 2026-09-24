@@ -26,10 +26,10 @@
 //! ```text
 //! driver lookup-endpoints --scheduler <endpoint> <url>
 //! driver get --scheduler <endpoint> [--endpoint <endpoint>]... [--header <key: value>]... --output <path> <url>
-//! driver preheat --scheduler <endpoint> <url>
-//! driver preheat-image --scheduler <endpoint> <image>
-//! driver delete --scheduler <endpoint> <url>
-//! driver delete-image --scheduler <endpoint> <image>
+//! driver preheat --scheduler <endpoint> [--scope <scope>] <url>
+//! driver preheat-image --scheduler <endpoint> [--scope <scope>] <image>
+//! driver delete --scheduler <endpoint> [--scope <scope>] <url>
+//! driver delete-image --scheduler <endpoint> [--scope <scope>] <image>
 //! ```
 
 use std::collections::BTreeMap;
@@ -38,7 +38,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use dragonfly_client_request::{
     DeleteImageRequest, DeleteRequest, GetRequest, PreheatImageRequest, PreheatRequest, Proxy,
-    ProxyWithEndpoints, Request, RequestWithEndpoints,
+    ProxyWithEndpoints, Request, RequestWithEndpoints, Scope,
 };
 use futures::TryStreamExt;
 use http::header::{HeaderMap, HeaderName, HeaderValue};
@@ -98,6 +98,10 @@ enum Command {
         #[arg(long)]
         scheduler: String,
 
+        /// Seed peers to address, "default" or "all_seed_peers".
+        #[arg(long, default_value = SCOPE_DEFAULT)]
+        scope: String,
+
         /// Url to preheat.
         url: String,
     },
@@ -107,6 +111,10 @@ enum Command {
         /// Scheduler endpoint.
         #[arg(long)]
         scheduler: String,
+
+        /// Seed peers to address, "default" or "all_seed_peers".
+        #[arg(long, default_value = SCOPE_DEFAULT)]
+        scope: String,
 
         /// Image reference, e.g., "docker.io/library/busybox:latest".
         image: String,
@@ -118,6 +126,10 @@ enum Command {
         #[arg(long)]
         scheduler: String,
 
+        /// Seed peers to address, "default" or "all_seed_peers".
+        #[arg(long, default_value = SCOPE_DEFAULT)]
+        scope: String,
+
         /// Url to preheat.
         url: String,
     },
@@ -128,10 +140,21 @@ enum Command {
         #[arg(long)]
         scheduler: String,
 
+        /// Seed peers to address, "default" or "all_seed_peers".
+        #[arg(long, default_value = SCOPE_DEFAULT)]
+        scope: String,
+
         /// Image reference, e.g., "docker.io/library/busybox:latest".
         image: String,
     },
 }
+
+/// The scope flag value addressing the replicas of the task, the same as the Go
+/// driver.
+const SCOPE_DEFAULT: &str = "default";
+
+/// The scope flag value addressing all seed peers, the same as the Go driver.
+const SCOPE_ALL_SEED_PEERS: &str = "all_seed_peers";
 
 /// The JSON output of the lookup-endpoints command.
 #[derive(Serialize)]
@@ -163,10 +186,26 @@ async fn main() -> Result<()> {
             output,
             url,
         } => get(scheduler, endpoint, header, output, url).await,
-        Command::Preheat { scheduler, url } => preheat(scheduler, url).await,
-        Command::PreheatImage { scheduler, image } => preheat_image(scheduler, image).await,
-        Command::Delete { scheduler, url } => delete(scheduler, url).await,
-        Command::DeleteImage { scheduler, image } => delete_image(scheduler, image).await,
+        Command::Preheat {
+            scheduler,
+            scope,
+            url,
+        } => preheat(scheduler, parse_scope(&scope)?, url).await,
+        Command::PreheatImage {
+            scheduler,
+            scope,
+            image,
+        } => preheat_image(scheduler, parse_scope(&scope)?, image).await,
+        Command::Delete {
+            scheduler,
+            scope,
+            url,
+        } => delete(scheduler, parse_scope(&scope)?, url).await,
+        Command::DeleteImage {
+            scheduler,
+            scope,
+            image,
+        } => delete_image(scheduler, parse_scope(&scope)?, image).await,
     }
 }
 
@@ -237,11 +276,12 @@ async fn get(
 }
 
 /// Preheats the url to the seed peers.
-async fn preheat(scheduler_endpoint: String, url: String) -> Result<()> {
+async fn preheat(scheduler_endpoint: String, scope: Scope, url: String) -> Result<()> {
     let proxy = new_proxy(scheduler_endpoint).await?;
     proxy
         .preheat(&PreheatRequest {
             url,
+            scope,
             ..Default::default()
         })
         .await?;
@@ -250,11 +290,12 @@ async fn preheat(scheduler_endpoint: String, url: String) -> Result<()> {
 }
 
 /// Preheats the image to the seed peers.
-async fn preheat_image(scheduler_endpoint: String, image: String) -> Result<()> {
+async fn preheat_image(scheduler_endpoint: String, scope: Scope, image: String) -> Result<()> {
     let proxy = new_proxy(scheduler_endpoint).await?;
     proxy
         .preheat_image(&PreheatImageRequest {
             image,
+            scope,
             ..Default::default()
         })
         .await?;
@@ -263,11 +304,12 @@ async fn preheat_image(scheduler_endpoint: String, image: String) -> Result<()> 
 }
 
 /// Deletes the preheated url from the seed peers.
-async fn delete(scheduler_endpoint: String, url: String) -> Result<()> {
+async fn delete(scheduler_endpoint: String, scope: Scope, url: String) -> Result<()> {
     let proxy = new_proxy(scheduler_endpoint).await?;
     proxy
         .delete(&DeleteRequest {
             url,
+            scope,
             ..Default::default()
         })
         .await?;
@@ -276,16 +318,29 @@ async fn delete(scheduler_endpoint: String, url: String) -> Result<()> {
 }
 
 /// Deletes the preheated image from the seed peers.
-async fn delete_image(scheduler_endpoint: String, image: String) -> Result<()> {
+async fn delete_image(scheduler_endpoint: String, scope: Scope, image: String) -> Result<()> {
     let proxy = new_proxy(scheduler_endpoint).await?;
     proxy
         .delete_image(&DeleteImageRequest {
             image,
+            scope,
             ..Default::default()
         })
         .await?;
 
     Ok(())
+}
+
+/// Parses the scope flag.
+fn parse_scope(value: &str) -> Result<Scope> {
+    match value {
+        SCOPE_DEFAULT => Ok(Scope::Default),
+        SCOPE_ALL_SEED_PEERS => Ok(Scope::AllSeedPeers),
+        _ => Err(format!(
+            "invalid scope {value:?}, expected {SCOPE_DEFAULT:?} or {SCOPE_ALL_SEED_PEERS:?}"
+        )
+        .into()),
+    }
 }
 
 /// Creates a Proxy connected to the scheduler.

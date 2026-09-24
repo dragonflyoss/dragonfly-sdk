@@ -57,6 +57,10 @@ func TestDeleteImageInvalidArguments(t *testing.T) {
 			name: "zero concurrent task count",
 			req:  NewDeleteImageRequest("docker.io/library/nginx:latest", WithDeleteImageRequestConcurrentTaskCount(0)),
 		},
+		{
+			name: "invalid scope",
+			req:  NewDeleteImageRequest("docker.io/library/nginx:latest", WithDeleteImageRequestScope(Scope("all_peers"))),
+		},
 	}
 
 	for _, tc := range tests {
@@ -169,6 +173,44 @@ func TestPreheatAndDeleteHitSameSeedPeers(t *testing.T) {
 			mu.Unlock()
 		})
 	}
+}
+
+func TestPreheatAndDeleteAllSeedPeers(t *testing.T) {
+	assert := assert.New(t)
+
+	var mu sync.Mutex
+	preheated := make(map[string]bool)
+	deleted := make(map[string]bool)
+	var hosts []*commonv2.Host
+	for _, name := range []string{"seed-peer-1", "seed-peer-2", "seed-peer-3"} {
+		port := setupMockSeedPeerServer(t, &mockSeedPeer{
+			onDownload: func() {
+				mu.Lock()
+				preheated[name] = true
+				mu.Unlock()
+			},
+			onDelete: func() {
+				mu.Lock()
+				deleted[name] = true
+				mu.Unlock()
+			},
+		})
+		hosts = append(hosts, createSeedPeerHost(name, port, 0))
+	}
+	endpoint := setupMockScheduler(t, hosts)
+
+	proxy, err := New(context.Background(), endpoint)
+	assert.NoError(err)
+	defer proxy.Close()
+
+	url := "https://example.com/v2/foo/bar/blobs/sha256:b5f4dfca35398b36f61baa60e2bf2c242401c9d7db3de9168dcf780a2feedd2d"
+	assert.NoError(proxy.Preheat(context.Background(), NewPreheatRequest(url, WithPreheatRequestReplicas(1), WithPreheatRequestScope(ScopeAllSeedPeers))))
+	assert.NoError(proxy.Delete(context.Background(), NewDeleteRequest(url, WithDeleteRequestReplicas(1), WithDeleteRequestScope(ScopeAllSeedPeers))))
+
+	mu.Lock()
+	assert.Len(preheated, len(hosts))
+	assert.Equal(preheated, deleted)
+	mu.Unlock()
 }
 
 func TestDeleteRetriesOnlyTransientDeleteFailures(t *testing.T) {

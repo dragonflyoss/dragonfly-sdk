@@ -39,6 +39,9 @@ use tracing::{debug, error, info, Instrument};
 pub(crate) trait Selector: Send + Sync {
     /// select selects items based on the given task_id and number of replicas.
     async fn select(&self, task_id: String, replicas: u32) -> Result<Vec<Host>>;
+
+    /// select_all selects all items regardless of the task_id.
+    async fn select_all(&self) -> Result<Vec<Host>>;
 }
 
 /// The health check timeout for seed peers.
@@ -260,6 +263,15 @@ impl Selector for SeedPeerSelector {
 
         Ok(selected)
     }
+
+    async fn select_all(&self) -> Result<Vec<Host>> {
+        let seed_peers = self.seed_peers.read().await;
+        if seed_peers.hosts.is_empty() {
+            return Err(Error::HostNotFound("seed peers".to_string()));
+        }
+
+        Ok(seed_peers.hosts.values().cloned().collect())
+    }
 }
 
 #[cfg(test)]
@@ -373,6 +385,25 @@ mod tests {
                 "host_count: {host_count}, replicas: {replicas}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn select_all() {
+        let selector = create_test_selector().await;
+
+        let result = selector.select_all().await;
+        assert!(matches!(result, Err(Error::HostNotFound(_))));
+
+        for i in 1..=5 {
+            let host = create_test_host(&i.to_string(), &format!("192.168.1.{i}"), 8080, 1);
+            add_test_host(&selector, host).await;
+        }
+
+        let hosts = selector.select_all().await.unwrap();
+        assert_eq!(hosts.len(), 5);
+
+        let seen: std::collections::HashSet<_> = hosts.iter().map(|host| &host.id).collect();
+        assert_eq!(seen.len(), 5);
     }
 
     #[tokio::test]

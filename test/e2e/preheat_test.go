@@ -57,7 +57,7 @@ var _ = Describe("Preheat", func() {
 
 				It("get should hit the preheated seed peers without fetching the file again", Label("preheat", "file", sdk.Name), func() {
 					url := testFile.GetDownloadURL()
-					Expect(sdk.Preheat(url)).To(Succeed())
+					Expect(sdk.Preheat(url, "")).To(Succeed())
 
 					seedClients, err := util.GetPreheatedSeedClients(sdk, url, testFile.GetSha256())
 					Expect(err).NotTo(HaveOccurred())
@@ -83,12 +83,58 @@ var _ = Describe("Preheat", func() {
 	}
 })
 
+var _ = Describe("Preheat All Seed Peers", func() {
+	for _, sdk := range util.SDKs {
+		Context(fmt.Sprintf("10MiB file using %s sdk", sdk.Name), func() {
+			var (
+				testFile *util.File
+				err      error
+			)
+
+			BeforeEach(func() {
+				testFile, err = util.GetFileServer().GenerateFile(util.FileSize10MiB)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(testFile).NotTo(BeNil())
+			})
+
+			AfterEach(func() {
+				err = util.GetFileServer().DeleteFile(testFile)
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			It("get should hit the seed peers preheated with the all seed peers scope", Label("preheat", "file", "all-seed-peers", sdk.Name), func() {
+				url := testFile.GetDownloadURL()
+				Expect(sdk.Preheat(url, util.ScopeAllSeedPeers)).To(Succeed())
+
+				seedClients, err := util.GetAllPreheatedSeedClients(url, testFile.GetSha256())
+				Expect(err).NotTo(HaveOccurred())
+
+				before, err := util.GetFileServer().RequestCount(testFile)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(before).To(BeNumerically(">=", 1))
+
+				resp, err := sdk.Get(url, testFile.GetOutputPath(), nil, nil)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(util.CheckCacheHit(resp, testFile.GetTaskID(), seedClients)).To(BeTrue())
+
+				sha256sum, err := util.CalculateSha256ByOutput([]*util.PodExec{util.RunnerExec()}, testFile.GetOutputPath())
+				Expect(err).NotTo(HaveOccurred())
+				Expect(testFile.GetSha256()).To(Equal(sha256sum))
+
+				after, err := util.GetFileServer().RequestCount(testFile)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(after).To(Equal(before))
+			})
+		})
+	}
+})
+
 var _ = Describe("Preheat Image", func() {
 	image := util.BusyboxImage
 	for _, sdk := range util.SDKs {
 		Context(fmt.Sprintf("%s image using %s sdk", image.GetReference(), sdk.Name), func() {
 			It("get should hit the preheated seed peers for the manifest and every blob", Label("preheat", "image", sdk.Name), func() {
-				Expect(sdk.PreheatImage(image.GetReference())).To(Succeed())
+				Expect(sdk.PreheatImage(image.GetReference(), "")).To(Succeed())
 
 				token, err := util.RegistryToken(image.GetRegistry(), image.GetRepository())
 				Expect(err).NotTo(HaveOccurred())
@@ -96,6 +142,38 @@ var _ = Describe("Preheat Image", func() {
 
 				for _, blob := range image.GetBlobs() {
 					seedClients, err := util.GetPreheatedSeedClients(sdk, blob.GetURL(), blob.GetSha256())
+					Expect(err).NotTo(HaveOccurred())
+
+					resp, err := sdk.Get(blob.GetURL(), blob.GetOutputPath(), nil, header)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(util.CheckCacheHit(resp, blob.GetTaskID(), seedClients)).To(BeTrue())
+
+					sha256sum, err := util.CalculateSha256ByOutput([]*util.PodExec{util.RunnerExec()}, blob.GetOutputPath())
+					Expect(err).NotTo(HaveOccurred())
+					Expect(blob.GetSha256()).To(Equal(sha256sum))
+				}
+			})
+		})
+	}
+})
+
+var _ = Describe("Preheat Image All Seed Peers", func() {
+	image := util.BusyboxImage
+	for _, sdk := range util.SDKs {
+		Context(fmt.Sprintf("%s image using %s sdk", image.GetReference(), sdk.Name), func() {
+			AfterEach(func() {
+				Expect(sdk.DeleteImage(image.GetReference(), util.ScopeAllSeedPeers)).To(Succeed())
+			})
+
+			It("get should hit the seed peers preheated with the all seed peers scope for the manifest and every blob", Label("preheat", "image", "all-seed-peers", sdk.Name), func() {
+				Expect(sdk.PreheatImage(image.GetReference(), util.ScopeAllSeedPeers)).To(Succeed())
+
+				token, err := util.RegistryToken(image.GetRegistry(), image.GetRepository())
+				Expect(err).NotTo(HaveOccurred())
+				header := http.Header{"Authorization": []string{token}}
+
+				for _, blob := range image.GetBlobs() {
+					seedClients, err := util.GetAllPreheatedSeedClients(blob.GetURL(), blob.GetSha256())
 					Expect(err).NotTo(HaveOccurred())
 
 					resp, err := sdk.Get(blob.GetURL(), blob.GetOutputPath(), nil, header)
