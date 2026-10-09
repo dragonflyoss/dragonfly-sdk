@@ -618,7 +618,7 @@ dependencies = [
  "rustls-pki-types",
  "serde_json",
  "sha2",
- "siphasher 1.0.3",
+ "siphasher 1.0.4",
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",
@@ -2578,9 +2578,9 @@ checksum = "38b58827f4464d87d377d175e90bf58eb00fd8716ff0a62f80356b5e61555d0d"
 
 [[package]]
 name = "siphasher"
-version = "1.0.3"
+version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
+checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
 
 [[package]]
 name = "slab"
