@@ -5,7 +5,7 @@ go 1.25.0
 require (
 	d7y.io/dragonfly-sdk/client-request/go v0.0.0
 	d7y.io/dragonfly/v2 v2.5.2-rc.3
-	github.com/onsi/ginkgo/v2 v2.28.2
+	github.com/onsi/ginkgo/v2 v2.33.1
 	github.com/onsi/gomega v1.43.1
 )
 
