@@ -3,10 +3,10 @@ name: CI (Rust)
 on:
   push:
     branches: [main, release-*]
-    paths: ['client-request/rust/**', '.github/workflows/ci-rust.yml']
+    paths: ['client-request/rust/**', 'test/e2e/driver/rust/**', '.github/workflows/ci-rust.yml']
   pull_request:
     branches: [main, release-*]
-    paths: ['client-request/rust/**', '.github/workflows/ci-rust.yml']
+    paths: ['client-request/rust/**', 'test/e2e/driver/rust/**', '.github/workflows/ci-rust.yml']
 
 defaults:
   run:
@@ -17,6 +17,12 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      matrix:
+        workspace: [client-request/rust, test/e2e/driver/rust]
+    defaults:
+      run:
+        working-directory: ${{ matrix.workspace }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
@@ -24,7 +30,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: client-request/rust
+          workspaces: ${{ matrix.workspace }}
           cache-on-failure: true
 
       - name: Install Protoc
