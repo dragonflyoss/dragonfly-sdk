@@ -3,10 +3,10 @@ name: CI (Go)
 on:
   push:
     branches: [main, release-*]
-    paths: ['client-request/go/**', '.github/workflows/ci-go.yml']
+    paths: ['client-request/go/**', 'test/e2e/**', '!test/e2e/driver/rust/**', '.github/workflows/ci-go.yml']
   pull_request:
     branches: [main, release-*]
-    paths: ['client-request/go/**', '.github/workflows/ci-go.yml']
+    paths: ['client-request/go/**', 'test/e2e/**', '!test/e2e/driver/rust/**', '.github/workflows/ci-go.yml']
 
 defaults:
   run:
@@ -17,6 +17,12 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      matrix:
+        module: [client-request/go, test/e2e]
+    defaults:
+      run:
+        working-directory: ${{ matrix.module }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
@@ -24,8 +30,8 @@ jobs:
       - name: Install Go
         uses: actions/setup-go@v7
         with:
-          go-version-file: client-request/go/go.mod
-          cache-dependency-path: client-request/go/go.sum
+          go-version-file: ${{ matrix.module }}/go.mod
+          cache-dependency-path: ${{ matrix.module }}/go.sum
 
       - name: Run gofmt
         run: |
@@ -38,7 +44,7 @@ jobs:
       - name: Run golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
-          working-directory: client-request/go
+          working-directory: ${{ matrix.module }}
 
   test:
     name: Test
