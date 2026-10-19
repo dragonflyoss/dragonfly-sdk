@@ -15,13 +15,13 @@
  */
 
 use crate::errors::Error;
-use crate::hashring::VNodeHashRing;
 use crate::net::format_url;
 use crate::shutdown;
 use crate::Result;
 use async_trait::async_trait;
 use dragonfly_api::common::v2::Host;
 use dragonfly_api::scheduler::v2::{scheduler_client::SchedulerClient, ListHostsRequest};
+use dragonfly_hashring::VNodeHashRing;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -46,9 +46,6 @@ pub(crate) trait Selector: Send + Sync {
 
 /// The health check timeout for seed peers.
 const SEED_PEERS_HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// The default number of virtual nodes per host.
-const DEFAULT_VNODES_PER_HOST: usize = 512;
 
 /// Holds the data of seed peers.
 struct SeedPeers {
@@ -86,7 +83,7 @@ impl SeedPeerSelector {
             scheduler_client,
             seed_peers: RwLock::new(SeedPeers {
                 hosts: HashMap::new(),
-                hashring: VNodeHashRing::new(DEFAULT_VNODES_PER_HOST),
+                hashring: VNodeHashRing::new(),
             }),
             mutex: Mutex::new(()),
         };
@@ -168,7 +165,7 @@ impl SeedPeerSelector {
             return Ok(());
         }
 
-        let mut hashring = VNodeHashRing::new(DEFAULT_VNODES_PER_HOST);
+        let mut hashring = VNodeHashRing::new();
         for name in hosts.keys() {
             hashring.add(name.clone());
         }
@@ -314,7 +311,7 @@ mod tests {
             scheduler_client: SchedulerClient::new(channel),
             seed_peers: RwLock::new(SeedPeers {
                 hosts: HashMap::new(),
-                hashring: VNodeHashRing::new(1),
+                hashring: VNodeHashRing::with_vnodes_per_node(1),
             }),
             mutex: Mutex::new(()),
         }

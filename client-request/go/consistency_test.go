@@ -16,81 +16,17 @@
 
 // Cross-language consistency vectors shared with the Rust SDK
 // (client-request/rust/tests/consistency.rs). Both test suites assert the same
-// fixed outputs, so a change on either side that breaks hashring or task id
-// compatibility fails the build.
+// fixed outputs, so a change on either side that breaks task id compatibility
+// fails the build.
 
 package request
 
 import (
-	"encoding/binary"
 	"testing"
 
 	"d7y.io/dragonfly/v2/pkg/idgen"
-	"github.com/dchest/siphash"
 	"github.com/stretchr/testify/assert"
-
-	"d7y.io/dragonfly-sdk/client-request/go/internal/hashring"
 )
-
-func vnodeHash(id uint64, name string) uint64 {
-	buf := make([]byte, 0, 8+len(name)+1)
-	buf = binary.LittleEndian.AppendUint64(buf, id)
-	buf = append(buf, name...)
-	buf = append(buf, 0xff)
-	return siphash.Hash(0, 0, buf)
-}
-
-func keyHash(key string) uint64 {
-	buf := make([]byte, 0, len(key)+1)
-	buf = append(buf, key...)
-	buf = append(buf, 0xff)
-	return siphash.Hash(0, 0, buf)
-}
-
-func TestSiphash(t *testing.T) {
-	assert := assert.New(t)
-
-	assert.Equal(uint64(0x1e5a582b8d945969), vnodeHash(0, "seed-peer-1"))
-	assert.Equal(uint64(0xb5db98265419376c), vnodeHash(1, "seed-peer-1"))
-	assert.Equal(uint64(0xf36f748c486b09ef), vnodeHash(0, "seed-peer-2"))
-	assert.Equal(uint64(0xf0eda07426c5cac1), vnodeHash(511, "seed-peer-3"))
-
-	assert.Equal(uint64(0xaa86f08bc4878a68), keyHash("b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e"))
-	assert.Equal(uint64(0xa78dd821b4023714), keyHash("test-task"))
-	assert.Equal(uint64(0x20dd4eb33d9590f2), keyHash(""))
-}
-
-func TestHashring(t *testing.T) {
-	assert := assert.New(t)
-
-	ring := hashring.New(3)
-	for _, name := range []string{"seed-peer-1", "seed-peer-2", "seed-peer-3"} {
-		ring.Add(name)
-	}
-
-	sel := func(key string, replicas int) []string {
-		var out []string
-		for _, vnode := range ring.GetWithReplicas(key, replicas) {
-			out = append(out, vnode.String())
-		}
-		return out
-	}
-
-	assert.Equal([]string{"seed-peer-3|2", "seed-peer-1|2", "seed-peer-3|0"}, sel("task-a", 2))
-	assert.Equal([]string{"seed-peer-2|0", "seed-peer-2|1", "seed-peer-1|0"}, sel("task-b", 2))
-	assert.Equal([]string{"seed-peer-2|1", "seed-peer-1|0", "seed-peer-3|2"}, sel("task-c", 2))
-	assert.Equal([]string{
-		"seed-peer-3|2",
-		"seed-peer-1|2",
-		"seed-peer-3|0",
-		"seed-peer-1|1",
-		"seed-peer-2|2",
-		"seed-peer-3|1",
-		"seed-peer-2|0",
-		"seed-peer-2|1",
-		"seed-peer-1|0",
-	}, sel("task-a", 100))
-}
 
 func TestTaskID(t *testing.T) {
 	assert := assert.New(t)

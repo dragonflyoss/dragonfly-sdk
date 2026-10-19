@@ -141,7 +141,7 @@ deleting a preheated OCI image from the seed peers:
 
 ```toml
 [dependencies]
-dragonfly-client-request = { version = "1.9.0", features = ["preheat"] }
+dragonfly-client-request = { version = "1.10.0", features = ["preheat"] }
 ```
 
 ```rust

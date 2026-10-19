@@ -72,8 +72,9 @@ use tracing::Instrument;
 
 pub mod digest;
 pub mod errors;
-pub mod hashring;
 pub mod id_generator;
+
+pub use dragonfly_hashring as hashring;
 
 pub use backon::ExponentialBuilder;
 

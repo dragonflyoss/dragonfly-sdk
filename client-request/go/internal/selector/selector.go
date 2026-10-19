@@ -31,18 +31,14 @@ import (
 
 	commonv2 "d7y.io/api/v2/pkg/apis/common/v2"
 	schedulerv2 "d7y.io/api/v2/pkg/apis/scheduler/v2"
+	"d7y.io/hashring"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
-
-	"d7y.io/dragonfly-sdk/client-request/go/internal/hashring"
 )
 
 // healthCheckTimeout is the health check timeout for seed peers.
 const healthCheckTimeout = 5 * time.Second
-
-// vnodesPerHost is the default number of virtual nodes per host.
-const vnodesPerHost = 512
 
 // seedPeerType is the host type of seed peers, refer to
 // dragonfly-client-config/src/dfdaemon.rs#HostType.
@@ -94,7 +90,7 @@ func New(ctx context.Context, schedulerClient schedulerv2.SchedulerClient, healt
 		requestTimeout:      requestTimeout,
 		schedulerClient:     schedulerClient,
 		hosts:               make(map[string]*commonv2.Host),
-		ring:                hashring.New(vnodesPerHost),
+		ring:                hashring.New(),
 		done:                make(chan struct{}),
 	}
 
@@ -226,7 +222,7 @@ func (s *SeedPeerSelector) refresh(ctx context.Context) error {
 		hosts[peer.Name] = peer
 	}
 
-	// Rebuilding the ring costs vnodesPerHost hashes per host and a full sort,
+	// Rebuilding the ring costs DefaultVNodesPerNode hashes per host and a full sort,
 	// so reuse the current ring when the healthy host names are unchanged and
 	// only refresh the host records.
 	s.mu.RLock()
@@ -240,7 +236,7 @@ func (s *SeedPeerSelector) refresh(ctx context.Context) error {
 		return nil
 	}
 
-	ring := hashring.New(vnodesPerHost)
+	ring := hashring.New()
 	for name := range hosts {
 		ring.Add(name)
 	}

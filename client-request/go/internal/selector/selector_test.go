@@ -23,9 +23,8 @@ import (
 	"time"
 
 	commonv2 "d7y.io/api/v2/pkg/apis/common/v2"
+	"d7y.io/hashring"
 	"github.com/stretchr/testify/assert"
-
-	"d7y.io/dragonfly-sdk/client-request/go/internal/hashring"
 )
 
 func createTestHost(id, ip string, port int32, hostType uint32) *commonv2.Host {
@@ -44,7 +43,7 @@ func createTestSelector() *SeedPeerSelector {
 		healthCheckInterval: 10 * time.Second,
 		requestTimeout:      5 * time.Second,
 		hosts:               make(map[string]*commonv2.Host),
-		ring:                hashring.New(1),
+		ring:                hashring.New(hashring.WithVNodesPerNode(1)),
 		done:                make(chan struct{}),
 	}
 }
