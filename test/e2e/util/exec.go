@@ -19,6 +19,7 @@ package util
 import (
 	"fmt"
 	"os/exec"
+	"slices"
 	"strings"
 )
 
@@ -26,6 +27,29 @@ import (
 func KubeCtlCommand(arg ...string) *exec.Cmd {
 	fmt.Printf(`kubectl command: "kubectl" "%s"`+"\n", strings.Join(arg, `" "`))
 	return exec.Command("kubectl", arg...)
+}
+
+// PodUID returns the uid of the pod in the namespace, which changes when a
+// statefulset recreates the pod under the same name.
+func PodUID(namespace, name string) (string, error) {
+	out, err := KubeCtlCommand("-n", namespace, "get", "pod", name, "-o", "jsonpath={.metadata.uid}").CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("get pod %s/%s: %w, output: %s", namespace, name, err, out)
+	}
+
+	return strings.TrimSpace(string(out)), nil
+}
+
+// IsPodReady reports whether the pod in the namespace exists and is ready.
+func IsPodReady(namespace, name string) bool {
+	out, err := KubeCtlCommand("-n", namespace, "get", "pod", name,
+		"-o", `jsonpath={.status.conditions[?(@.type=="Ready")].status}`).CombinedOutput()
+	if err != nil {
+		fmt.Printf("get pod %s/%s: %s, output: %s\n", namespace, name, err, out)
+		return false
+	}
+
+	return strings.TrimSpace(string(out)) == "True"
 }
 
 // GetPodNames returns the names of the pods of the component in the namespace.
@@ -91,6 +115,27 @@ type SeedClient struct {
 // the SDK's LookupEndpoints.
 func (s *SeedClient) ProxyEndpoint() string {
 	return fmt.Sprintf("http://%s:%d", s.IP, SeedClientProxyPort)
+}
+
+// SeedClientNames returns the pod names of the seed clients behind the proxy
+// endpoints, in the order of the endpoints.
+func SeedClientNames(endpoints []string) ([]string, error) {
+	seedClients, err := SeedClients()
+	if err != nil {
+		return nil, err
+	}
+
+	names := make([]string, 0, len(endpoints))
+	for _, endpoint := range endpoints {
+		i := slices.IndexFunc(seedClients, func(seedClient *SeedClient) bool { return seedClient.ProxyEndpoint() == endpoint })
+		if i < 0 {
+			return nil, fmt.Errorf("no seed client serves endpoint %s", endpoint)
+		}
+
+		names = append(names, seedClients[i].Pod.Name())
+	}
+
+	return names, nil
 }
 
 // SeedClients returns the seed clients in the cluster.

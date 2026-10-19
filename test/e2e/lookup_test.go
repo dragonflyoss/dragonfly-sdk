@@ -18,6 +18,7 @@ package e2e
 
 import (
 	"fmt"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2" //nolint
 	. "github.com/onsi/gomega"    //nolint
@@ -112,6 +113,48 @@ var _ = Describe("Lookup Endpoints", func() {
 				}
 
 				Expect(endpoints).To(Equal(expected))
+			}
+		})
+
+		It("every sdk should look up the same seed clients after one of them restarts", Label("lookup", "restart"), func() {
+			url := testFile.GetDownloadURL()
+			before := make(map[string][]string, len(util.SDKs))
+			for _, sdk := range util.SDKs {
+				endpoints, err := sdk.LookupEndpoints(url)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(endpoints).To(HaveLen(util.DefaultReplicas))
+
+				names, err := util.SeedClientNames(endpoints)
+				Expect(err).NotTo(HaveOccurred())
+				before[sdk.Name] = names
+			}
+
+			// Restart the first seed client selected for the task, the statefulset
+			// recreates the pod with the same name and a new ip.
+			podName := before[util.SDKs[0].Name][0]
+			uid, err := util.PodUID(util.DragonflyNamespace, podName)
+			Expect(err).NotTo(HaveOccurred())
+
+			out, err := util.KubeCtlCommand("-n", util.DragonflyNamespace, "delete", "pod", podName).CombinedOutput()
+			fmt.Println(string(out))
+			Expect(err).NotTo(HaveOccurred())
+			Eventually(func() bool {
+				newUID, err := util.PodUID(util.DragonflyNamespace, podName)
+				return err == nil && newUID != uid && util.IsPodReady(util.DragonflyNamespace, podName)
+			}, 5*time.Minute, 5*time.Second).Should(BeTrue())
+
+			// Wait for the seed client to announce itself to the scheduler, then
+			// the same seed clients must be selected since the hashring is keyed
+			// by their names.
+			for _, sdk := range util.SDKs {
+				Eventually(func() ([]string, error) {
+					endpoints, err := sdk.LookupEndpoints(url)
+					if err != nil {
+						return nil, err
+					}
+
+					return util.SeedClientNames(endpoints)
+				}, 3*time.Minute, 5*time.Second).Should(Equal(before[sdk.Name]))
 			}
 		})
 	})
