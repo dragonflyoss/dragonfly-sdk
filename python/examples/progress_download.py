@@ -1,0 +1,44 @@
+# Copyright 2026 The Dragonfly Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Report download progress while dfdaemon downloads a file."""
+
+from __future__ import annotations
+
+from dragonfly_sdk import Client, DownloadProgress
+
+
+def show_progress(progress: DownloadProgress) -> None:
+    speed_mib = progress.speed_bytes_per_second / (1024 * 1024)
+    print(
+        f"{progress.percent:5.1f}% "
+        f"{progress.completed_pieces}/{progress.total_pieces} pieces "
+        f"{speed_mib:.1f} MiB/s",
+        flush=True,
+    )
+
+
+def main() -> None:
+    with Client() as client:
+        result = client.download(
+            "https://example.com/dataset.tar",
+            "./dataset.tar",
+            on_progress=show_progress,
+        )
+
+    print(f"finished in {result.elapsed.total_seconds():.2f}s")
+
+
+if __name__ == "__main__":
+    main()
