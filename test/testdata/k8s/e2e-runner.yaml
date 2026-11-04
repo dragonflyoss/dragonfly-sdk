@@ -1,0 +1,27 @@
+---
+# The runner pod runs the SDK drivers inside the cluster, since the seed peer
+# pods are not reachable from the host. The drivers are built on the host into
+# /tmp/artifact/bin, which the kind nodes mount. The image is Ubuntu 24.04 with
+# the CA certificates, matching the GitHub Actions runner so the Rust driver
+# finds the glibc it was linked against.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: e2e-runner
+  namespace: dragonfly-e2e
+  labels:
+    app: dragonfly
+    component: e2e-runner
+spec:
+  containers:
+    - name: e2e-runner
+      image: buildpack-deps:noble-curl
+      command: ['sleep', 'infinity']
+      imagePullPolicy: 'IfNotPresent'
+      volumeMounts:
+        - name: artifact
+          mountPath: /tmp/artifact
+  volumes:
+    - name: artifact
+      hostPath:
+        path: /tmp/artifact

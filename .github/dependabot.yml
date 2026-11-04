@@ -1,0 +1,22 @@
+version: 2
+updates:
+- package-ecosystem: "cargo"
+  directory: "/client-request/rust"
+  schedule:
+    interval: "weekly"
+- package-ecosystem: "gomod"
+  directory: "/client-request/go"
+  schedule:
+    interval: "weekly"
+- package-ecosystem: "cargo"
+  directory: "/test/e2e/driver/rust"
+  schedule:
+    interval: "weekly"
+- package-ecosystem: "gomod"
+  directory: "/test/e2e"
+  schedule:
+    interval: "weekly"
+- package-ecosystem: "github-actions"
+  directory: "/"
+  schedule:
+    interval: "weekly"

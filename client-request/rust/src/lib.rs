@@ -1,0 +1,4373 @@
+/*
+ *     Copyright 2026 The Dragonfly Authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+//! Request library for the Dragonfly client. It sends requests to remote
+//! servers via the Dragonfly P2P network, supporting streaming and buffered
+//! GET requests and preheating files or OCI images through seed peers.
+
+use async_trait::async_trait;
+use bytes::{Bytes, BytesMut};
+use digest::{is_blob_url, is_manifest_digest_url};
+use dragonfly_api::common::v2::{Download, Host, Priority, SchedulingPolicy, TaskType};
+use dragonfly_api::dfdaemon::v2::{
+    dfdaemon_upload_client::DfdaemonUploadClient as DfdaemonUploadGRPCClient, DeleteTaskRequest,
+    DownloadTaskRequest,
+};
+use dragonfly_api::scheduler::v2::scheduler_client::SchedulerClient;
+use errors::{BackendError, DfdaemonError, Error, ProxyError};
+use futures::{Stream, TryStreamExt};
+use http::{default_proxy_rule_filtered_query_params, headermap_to_hashmap};
+use id_generator::{IDGenerator, TaskIDParameter};
+use net::{format_url, preferred_local_ip};
+use pool::{Builder as PoolBuilder, Factory, Pool};
+use reqwest::{
+    header::{HeaderMap, HeaderValue},
+    Client,
+};
+use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
+use reqwest_tracing::TracingMiddleware;
+use retry::{retry, retry_with_endpoints, RetryPolicy};
+use rustls_pki_types::CertificateDer;
+use selector::{SeedPeerSelector, Selector};
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
+use tonic::transport::{Channel, Endpoint};
+use tracing::debug;
+
+#[cfg(feature = "preheat")]
+use dragonfly_api::scheduler::v2::StatImageRequest as SchedulerStatImageRequest;
+#[cfg(feature = "preheat")]
+use oci::{blob_digests, build_blob_url, build_manifest_url, oci_client, resolve_registry};
+#[cfg(feature = "preheat")]
+use oci_client::{
+    manifest::{
+        IMAGE_MANIFEST_LIST_MEDIA_TYPE, IMAGE_MANIFEST_MEDIA_TYPE, OCI_IMAGE_INDEX_MEDIA_TYPE,
+        OCI_IMAGE_MEDIA_TYPE,
+    },
+    secrets::RegistryAuth,
+    Reference, RegistryOperation,
+};
+#[cfg(feature = "preheat")]
+use reqwest::header::{ACCEPT, AUTHORIZATION};
+#[cfg(feature = "preheat")]
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
+use tracing::Instrument;
+
+pub mod digest;
+pub mod errors;
+pub mod id_generator;
+
+pub use dragonfly_hashring as hashring;
+
+pub use backon::ExponentialBuilder;
+
+mod http;
+mod net;
+#[cfg(feature = "preheat")]
+mod oci;
+mod pool;
+mod retry;
+mod selector;
+mod shutdown;
+mod url;
+
+/// The max idle connections per host.
+const POOL_MAX_IDLE_PER_HOST: usize = 1024;
+
+/// The maximum amount of time an idle connection remains idle in the pool
+/// before closing itself.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// The maximum amount of time a connect waits to complete.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The keep alive interval for TCP connection.
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The default idle timeout(30 minutes) for clients in the pool.
+const DEFAULT_CLIENT_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// The default capacity of the client pool.
+const DEFAULT_CLIENT_POOL_CAPACITY: usize = 128;
+
+/// The default timeout(5 seconds) for requests to the
+/// scheduler service.
+const DEFAULT_SCHEDULER_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The default timeout(10 minutes) for requests.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// The default number of seed peers serving a task.
+const DEFAULT_REPLICAS: usize = 2;
+
+/// The seed peers a preheat or delete addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Scope {
+    /// The replicas of the task: the seed peers picked in the consistent hash
+    /// ring order for its task id.
+    #[default]
+    Default,
+
+    /// All seed peers regardless of the replicas, aligned with the
+    /// AllSeedPeersScope in the dragonfly manager types.
+    AllSeedPeers,
+}
+
+/// The scope that queries only the seed peers for the image distribution, aligned
+/// with the AllSeedPeersScope in the dragonfly manager types.
+#[cfg(feature = "preheat")]
+const STAT_IMAGE_SCOPE_ALL_SEED_PEERS: &str = "all_seed_peers";
+
+/// The media types of the manifests for the accept header, identical to the
+/// MIME_TYPES_DISTRIBUTION_MANIFEST used by the oci-client to pull manifests,
+/// so the registry returns the exact representation matching the digest.
+#[cfg(feature = "preheat")]
+const MIME_TYPES_DISTRIBUTION_MANIFEST: &[&str] = &[
+    IMAGE_MANIFEST_MEDIA_TYPE,
+    IMAGE_MANIFEST_LIST_MEDIA_TYPE,
+    OCI_IMAGE_MEDIA_TYPE,
+    OCI_IMAGE_INDEX_MEDIA_TYPE,
+];
+
+/// A specialized Result type for the proxy module.
+pub type Result<T> = std::result::Result<T, Error>;
+
+/// The type alias for the response body stream of zero-copy `Bytes` chunks.
+pub type Body = Box<dyn Stream<Item = Result<Bytes>> + Send + Unpin>;
+
+/// The interface for sending requests via the Dragonfly.
+///
+/// A request is served by the seed peers the scheduler picks for its task, and a
+/// seed peer's dfdaemon fetches from the origin only what the P2P network does
+/// not hold yet:
+///
+/// ```text
+/// client ──lookup──▶ scheduler ──▶ seed peers [B, A]
+///   │
+///   └──GET──▶ B (seed peer proxy) ──miss──▶ origin
+///                 │
+///                 └──5xx / timeout──▶ retry on A
+/// ```
+///
+/// Implemented by [`Proxy`].
+#[async_trait]
+pub trait Request {
+    /// Sends a GET request via the Dragonfly and returns a response with a
+    /// streaming body. A transient failure before the body starts is retried on
+    /// the next seed peer, a failure while streaming it is not.
+    async fn get(&self, request: &GetRequest) -> Result<GetResponse<Body>>;
+
+    /// Sends a GET request via the Dragonfly and appends the response body to
+    /// `buf`. A transient failure, a failed body read included, is retried on the
+    /// next seed peer after `buf` is truncated back to its previous length.
+    async fn get_into(&self, request: &GetRequest, buf: &mut BytesMut) -> Result<GetResponse>;
+
+    /// Preheats an OCI image: resolves its manifest, multi-platform indexes
+    /// included, and has the seed peers download every config and layer blob
+    /// without streaming them back.
+    #[cfg(feature = "preheat")]
+    async fn preheat_image(&self, request: &PreheatImageRequest) -> Result<()>;
+
+    /// Reports which seed peers hold which layers of an OCI image, as resolved by
+    /// the scheduler. Useful to verify a preheat.
+    #[cfg(feature = "preheat")]
+    async fn stat_image(&self, request: &StatImageRequest) -> Result<StatImageResponse>;
+
+    /// Deletes a preheated OCI image: resolves its manifest, multi-platform
+    /// indexes included, and has the replica seed peers delete every manifest,
+    /// config and layer blob task. A seed peer answering `NotFound` counts as
+    /// deleted.
+    #[cfg(feature = "preheat")]
+    async fn delete_image(&self, request: &DeleteImageRequest) -> Result<()>;
+
+    /// Preheats a file: has every replica seed peer, or every seed peer with
+    /// `Scope::AllSeedPeers`, download it through the dfdaemon download task API
+    /// without streaming it back. A transient failure is retried on the same seed
+    /// peer, so the file lands on every replica. Fails when fewer seed peers than
+    /// replicas are available.
+    async fn preheat(&self, request: &PreheatRequest) -> Result<()>;
+
+    /// Deletes a preheated file: has every replica seed peer, or every seed peer
+    /// with `Scope::AllSeedPeers`, delete its task through the dfdaemon delete
+    /// task API. A transient failure is retried on the same seed peer, so the
+    /// task leaves every replica. A seed peer answering `NotFound` counts as
+    /// deleted.
+    async fn delete(&self, request: &DeleteRequest) -> Result<()>;
+
+    /// Returns the proxy endpoints of the seed peers that would serve the request,
+    /// in consistent hash ring order for its task id, up to `replicas` of them and
+    /// clamped to the available seed peers.
+    async fn lookup_endpoints(&self, request: &GetRequest) -> Result<Vec<String>>;
+}
+
+/// The interface for sending requests via fixed seed peer endpoints.
+///
+/// The endpoints are given at construction, typically from
+/// [`Request::lookup_endpoints`], so no scheduler is consulted:
+///
+/// ```text
+/// client ──GET──▶ endpoint B ──5xx / timeout──▶ retry on endpoint A
+/// ```
+///
+/// Implemented by [`ProxyWithEndpoints`].
+#[async_trait]
+pub trait RequestWithEndpoints {
+    /// Sends a GET request to the endpoints and returns a response with a
+    /// streaming body. A transient failure before the body starts is retried on
+    /// the next endpoint, a failure while streaming it is not.
+    async fn get(&self, request: &GetRequest) -> Result<GetResponse<Body>>;
+
+    /// Sends a GET request to the endpoints and appends the response body to
+    /// `buf`. A transient failure, a failed body read included, is retried on the
+    /// next endpoint after `buf` is truncated back to its previous length.
+    async fn get_into(&self, request: &GetRequest, buf: &mut BytesMut) -> Result<GetResponse>;
+}
+
+/// Represents a GET request to be sent via the Dragonfly.
+pub struct GetRequest {
+    /// The url of the request.
+    pub url: String,
+
+    /// The headers of the request.
+    pub header: HeaderMap,
+
+    /// Task piece length.
+    pub piece_length: Option<u64>,
+
+    /// URL tag identifies different task for same url.
+    pub tag: Option<String>,
+
+    /// Application of task identifies different task for same url.
+    pub application: Option<String>,
+
+    /// Filtered query params to generate the task id.
+    /// When filter is ["Signature", "Expires", "ns"], for example:
+    /// `http://example.com/xyz?Expires=e1&Signature=s1&ns=docker.io` and
+    /// `http://example.com/xyz?Expires=e2&Signature=s2&ns=docker.io` will generate the same task id.
+    /// Default value includes the filtered query params of s3, gcs, oss, obs, cos.
+    pub filtered_query_params: Vec<String>,
+
+    /// Content for calculating task id. This is used when the task ID cannot be calculated based
+    /// on URL and other parameters, such as when the URL contains dynamic query parameters that
+    /// cannot be filtered out.
+    pub content_for_calculating_task_id: Option<String>,
+
+    /// Enable task id based blob digest. It indicates whether to use the blob digest for task ID calculation
+    /// when downloading from OCI registries. When enabled for OCI blob URLs (e.g., `/v2/<name>/blobs/sha256:<digest>`),
+    /// the task ID is derived from the blob digest rather than the full URL. This enables deduplication across
+    /// registries - the same blob from different registries shares one task ID, eliminating redundant downloads
+    /// and storage, default is true.
+    pub enable_task_id_based_blob_digest: bool,
+
+    /// Refer to <https://github.com/dragonflyoss/api/blob/main/proto/common.proto#L67>.
+    pub priority: Option<i32>,
+
+    /// The number of seed peers serving the task, default is 2.
+    pub replicas: usize,
+
+    /// The timeout of each attempt of the request, default is 10 minutes.
+    pub timeout: Duration,
+
+    /// The client certificates for the request.
+    pub client_cert: Option<Vec<CertificateDer<'static>>>,
+}
+
+/// Default implementation for GetRequest.
+impl Default for GetRequest {
+    /// Returns a default GetRequest with empty url and default values for other fields.
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            header: HeaderMap::new(),
+            piece_length: None,
+            tag: None,
+            application: None,
+            filtered_query_params: default_proxy_rule_filtered_query_params(),
+            content_for_calculating_task_id: None,
+            enable_task_id_based_blob_digest: true,
+            priority: None,
+            replicas: DEFAULT_REPLICAS,
+            timeout: DEFAULT_REQUEST_TIMEOUT,
+            client_cert: None,
+        }
+    }
+}
+
+/// Implements methods for validating the request.
+impl GetRequest {
+    /// Validates the request parameters.
+    fn validate(&self) -> Result<()> {
+        if self.replicas == 0 {
+            return Err(Error::InvalidArgument(
+                "replicas must be positive".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+/// Represents a GET response received via the Dragonfly.
+pub struct GetResponse<R = Body> {
+    /// The success of the response.
+    pub success: bool,
+
+    /// The headers of the response.
+    pub header: HeaderMap,
+
+    /// The status code of the response.
+    pub status_code: Option<reqwest::StatusCode>,
+
+    /// The body of the response.
+    pub body: Option<R>,
+}
+
+/// Represents a request to preheat an OCI image through the
+/// Dragonfly seed client. The preheat downloads all blobs (config and layers)
+/// of the specified image via the Dragonfly proxy, effectively caching them
+/// in the P2P network for faster downloading.
+#[cfg(feature = "preheat")]
+pub struct PreheatImageRequest {
+    /// The OCI image reference (e.g., "docker.io/library/nginx:latest").
+    pub image: String,
+
+    /// Username for registry authentication. If not provided, anonymous access is used.
+    pub username: Option<String>,
+
+    /// Password for registry authentication. If not provided, anonymous access is used.
+    pub password: Option<String>,
+
+    /// Platform specifies the target platform in the format "os/arch"
+    /// (e.g., "linux/amd64", "linux/arm64"). This is used to select the correct
+    /// manifest from a multi-platform image index, default is current platform.
+    pub platform: Option<String>,
+
+    /// The optional piece length for the Dragonfly task.
+    pub piece_length: Option<u64>,
+
+    /// Tag identifies different tasks for the same URL.
+    pub tag: Option<String>,
+
+    /// Application identifies different tasks for the same URL.
+    pub application: Option<String>,
+
+    /// Filtered query params to generate the task id.
+    /// When filter is ["Signature", "Expires", "ns"], for example:
+    /// `http://example.com/xyz?Expires=e1&Signature=s1&ns=docker.io` and
+    /// `http://example.com/xyz?Expires=e2&Signature=s2&ns=docker.io` will generate the same task id.
+    /// Default value includes the filtered query params of s3, gcs, oss, obs, cos.
+    pub filtered_query_params: Vec<String>,
+
+    /// Content for calculating task id. This is used when the task ID cannot be calculated based
+    /// on URL and other parameters, such as when the URL contains dynamic query parameters that
+    /// cannot be filtered out.
+    pub content_for_calculating_task_id: Option<String>,
+
+    /// Enable task id based blob digest. It indicates whether to use the blob digest for task ID calculation
+    /// when downloading from OCI registries. When enabled for OCI blob URLs (e.g., `/v2/<name>/blobs/sha256:<digest>`),
+    /// the task ID is derived from the blob digest rather than the full URL. This enables deduplication across
+    /// registries - the same blob from different registries shares one task ID, eliminating redundant downloads
+    /// and storage, default is true.
+    pub enable_task_id_based_blob_digest: bool,
+
+    /// Refer to <https://github.com/dragonflyoss/api/blob/main/proto/common.proto#L67>.
+    pub priority: Option<i32>,
+
+    /// The number of seed peers serving the task, default is 2.
+    pub replicas: usize,
+
+    /// The seed peers to preheat each blob task to, default is the replicas of the
+    /// task. `Scope::AllSeedPeers` preheats to all seed peers regardless of the
+    /// replicas.
+    pub scope: Scope,
+
+    /// The timeout for each blob download request, default is 10 minutes.
+    pub timeout: Duration,
+
+    /// The number of blobs to preheat concurrently, default is 4.
+    pub concurrent_task_count: usize,
+
+    /// The optional client certificates for the request.
+    pub client_cert: Option<Vec<CertificateDer<'static>>>,
+}
+
+/// Default implementation for PreheatImageRequest.
+#[cfg(feature = "preheat")]
+impl Default for PreheatImageRequest {
+    /// Returns a default PreheatImageRequest with empty image and default values for other
+    /// fields.
+    fn default() -> Self {
+        Self {
+            image: String::new(),
+            username: None,
+            password: None,
+            platform: None,
+            piece_length: None,
+            tag: None,
+            application: None,
+            filtered_query_params: default_proxy_rule_filtered_query_params(),
+            content_for_calculating_task_id: None,
+            enable_task_id_based_blob_digest: true,
+            priority: None,
+            replicas: DEFAULT_REPLICAS,
+            scope: Scope::default(),
+            timeout: DEFAULT_REQUEST_TIMEOUT,
+            concurrent_task_count: 4,
+            client_cert: None,
+        }
+    }
+}
+
+#[cfg(feature = "preheat")]
+/// Implements methods for validating the request.
+impl PreheatImageRequest {
+    /// Validates the request parameters.
+    fn validate(&self) -> Result<()> {
+        if self.replicas == 0 {
+            return Err(Error::InvalidArgument(
+                "replicas must be positive".to_string(),
+            ));
+        }
+
+        if self.concurrent_task_count == 0 {
+            return Err(Error::InvalidArgument(
+                "concurrent task count must be positive".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+/// Represents a request to preheat a file through the Dragonfly seed client. The preheat
+/// downloads the specified file via the Dragonfly proxy, effectively caching it in the P2P
+/// network for faster downloading.
+pub struct PreheatRequest {
+    /// The url of the request.
+    pub url: String,
+
+    /// The headers of the request.
+    pub header: HeaderMap,
+
+    /// Task piece length.
+    pub piece_length: Option<u64>,
+
+    /// URL tag identifies different task for same url.
+    pub tag: Option<String>,
+
+    /// Application of task identifies different task for same url.
+    pub application: Option<String>,
+
+    /// Filtered query params to generate the task id.
+    /// When filter is ["Signature", "Expires", "ns"], for example:
+    /// `http://example.com/xyz?Expires=e1&Signature=s1&ns=docker.io` and
+    /// `http://example.com/xyz?Expires=e2&Signature=s2&ns=docker.io` will generate the same task id.
+    /// Default value includes the filtered query params of s3, gcs, oss, obs, cos.
+    pub filtered_query_params: Vec<String>,
+
+    /// Content for calculating task id. This is used when the task ID cannot be calculated based
+    /// on URL and other parameters, such as when the URL contains dynamic query parameters that
+    /// cannot be filtered out.
+    pub content_for_calculating_task_id: Option<String>,
+
+    /// Enable task id based blob digest. It indicates whether to use the blob digest for task ID calculation
+    /// when downloading from OCI registries. When enabled for OCI blob URLs (e.g., `/v2/<name>/blobs/sha256:<digest>`),
+    /// the task ID is derived from the blob digest rather than the full URL. This enables deduplication across
+    /// registries - the same blob from different registries shares one task ID, eliminating redundant downloads
+    /// and storage, default is true.
+    pub enable_task_id_based_blob_digest: bool,
+
+    /// Refer to <https://github.com/dragonflyoss/api/blob/main/proto/common.proto#L67>.
+    pub priority: Option<i32>,
+
+    /// The number of seed peers serving the task, default is 2.
+    pub replicas: usize,
+
+    /// The seed peers to preheat the task to, default is the replicas of the task.
+    /// `Scope::AllSeedPeers` preheats to all seed peers regardless of the replicas.
+    pub scope: Scope,
+
+    /// The timeout of each attempt of the request, default is 10 minutes.
+    pub timeout: Duration,
+
+    /// The client certificates for the request.
+    pub client_cert: Option<Vec<CertificateDer<'static>>>,
+}
+
+/// Default implementation for PreheatRequest.
+impl Default for PreheatRequest {
+    /// Returns a default PreheatRequest with empty image and default values for other fields.
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            header: HeaderMap::new(),
+            piece_length: None,
+            tag: None,
+            application: None,
+            filtered_query_params: default_proxy_rule_filtered_query_params(),
+            content_for_calculating_task_id: None,
+            enable_task_id_based_blob_digest: true,
+            priority: None,
+            replicas: DEFAULT_REPLICAS,
+            scope: Scope::default(),
+            timeout: DEFAULT_REQUEST_TIMEOUT,
+            client_cert: None,
+        }
+    }
+}
+
+/// Implements methods for validating the request.
+impl PreheatRequest {
+    /// Validates the request parameters.
+    fn validate(&self) -> Result<()> {
+        if self.replicas == 0 {
+            return Err(Error::InvalidArgument(
+                "replicas must be positive".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+/// Represents a request to query the distribution of an OCI image in the
+/// Dragonfly. The scheduler resolves the image manifest and collects the
+/// cached layers on each peer.
+#[cfg(feature = "preheat")]
+pub struct StatImageRequest {
+    /// The OCI image reference (e.g., "docker.io/library/nginx:latest").
+    pub image: String,
+
+    /// Username for registry authentication. If not provided, anonymous access is used.
+    pub username: Option<String>,
+
+    /// Password for registry authentication. If not provided, anonymous access is used.
+    pub password: Option<String>,
+
+    /// Platform specifies the target platform in the format "os/arch"
+    /// (e.g., "linux/amd64", "linux/arm64"). This is used by the scheduler to select
+    /// the correct manifest from a multi-platform image index, default is the
+    /// scheduler's platform. It should be consistent with the platform used when the
+    /// image was preheated, otherwise the layers can not be found on the peers.
+    pub platform: Option<String>,
+
+    /// The optional piece length for the Dragonfly task.
+    pub piece_length: Option<u64>,
+
+    /// Tag identifies different tasks for the same URL.
+    pub tag: Option<String>,
+
+    /// Application identifies different tasks for the same URL.
+    pub application: Option<String>,
+
+    /// Filtered query params to generate the task id.
+    /// When filter is ["Signature", "Expires", "ns"], for example:
+    /// `http://example.com/xyz?Expires=e1&Signature=s1&ns=docker.io` and
+    /// `http://example.com/xyz?Expires=e2&Signature=s2&ns=docker.io` will generate the same task id.
+    /// Default value includes the filtered query params of s3, gcs, oss, obs, cos.
+    pub filtered_query_params: Vec<String>,
+
+    /// Enable task id based blob digest. It indicates whether to use the blob digest for
+    /// task id calculation when the layer url is an OCI blob url. It should be consistent
+    /// with the value used when the image was preheated, otherwise the tasks can not be
+    /// found on the peers, default is true.
+    pub enable_task_id_based_blob_digest: bool,
+
+    /// The timeout for the request, default is 10 minutes.
+    pub timeout: Duration,
+}
+
+/// Default implementation for StatImageRequest.
+#[cfg(feature = "preheat")]
+impl Default for StatImageRequest {
+    /// Returns a default StatImageRequest with empty image and default values for other
+    /// fields.
+    fn default() -> Self {
+        Self {
+            image: String::new(),
+            username: None,
+            password: None,
+            platform: None,
+            piece_length: None,
+            tag: None,
+            application: None,
+            filtered_query_params: default_proxy_rule_filtered_query_params(),
+            enable_task_id_based_blob_digest: true,
+            timeout: DEFAULT_REQUEST_TIMEOUT,
+        }
+    }
+}
+
+/// Represents the distribution of an OCI image in the Dragonfly.
+#[cfg(feature = "preheat")]
+pub struct StatImageResponse {
+    /// The blob urls of the image.
+    pub layers: Vec<String>,
+
+    /// The peers that have cached layers of the image.
+    pub peers: Vec<PeerImage>,
+}
+
+/// Represents a peer and the image layers it has cached.
+#[cfg(feature = "preheat")]
+pub struct PeerImage {
+    /// The IP address of the peer.
+    pub ip: String,
+
+    /// The hostname of the peer.
+    pub hostname: String,
+
+    /// The layers that the peer has downloaded.
+    pub cached_layers: Vec<Layer>,
+}
+
+/// Represents the download state of an image layer on a peer.
+#[cfg(feature = "preheat")]
+pub struct Layer {
+    /// The blob url of the layer.
+    pub url: String,
+
+    /// Whether the peer has finished downloading the layer.
+    pub is_finished: bool,
+}
+
+/// Represents a request to delete a preheated file from the Dragonfly seed peers.
+/// The delete removes the task of the specified url from the seed peers serving
+/// it.
+pub struct DeleteRequest {
+    /// The url of the request.
+    pub url: String,
+
+    /// Task piece length.
+    pub piece_length: Option<u64>,
+
+    /// URL tag identifies different task for same url.
+    pub tag: Option<String>,
+
+    /// Application of task identifies different task for same url.
+    pub application: Option<String>,
+
+    /// Filtered query params to generate the task id.
+    /// When filter is ["Signature", "Expires", "ns"], for example:
+    /// `http://example.com/xyz?Expires=e1&Signature=s1&ns=docker.io` and
+    /// `http://example.com/xyz?Expires=e2&Signature=s2&ns=docker.io` will generate the same task id.
+    /// Default value includes the filtered query params of s3, gcs, oss, obs, cos.
+    pub filtered_query_params: Vec<String>,
+
+    /// Content for calculating task id. This is used when the task ID cannot be calculated based
+    /// on URL and other parameters, such as when the URL contains dynamic query parameters that
+    /// cannot be filtered out.
+    pub content_for_calculating_task_id: Option<String>,
+
+    /// Enable task id based blob digest. It indicates whether to use the blob digest for
+    /// task id calculation when the url is an OCI blob url. It should be consistent with
+    /// the value used when the file was preheated, default is true.
+    pub enable_task_id_based_blob_digest: bool,
+
+    /// The number of seed peers serving the task, consistent with the replicas used
+    /// when the file was preheated, default is 2.
+    pub replicas: usize,
+
+    /// The seed peers to delete the task from, consistent with the scope used when
+    /// the file was preheated, default is the replicas of the task.
+    pub scope: Scope,
+
+    /// The timeout of each attempt of the request, default is 10 minutes.
+    pub timeout: Duration,
+}
+
+/// Default implementation for DeleteRequest.
+impl Default for DeleteRequest {
+    /// Returns a default DeleteRequest with empty url and default values for other fields.
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            piece_length: None,
+            tag: None,
+            application: None,
+            filtered_query_params: default_proxy_rule_filtered_query_params(),
+            content_for_calculating_task_id: None,
+            enable_task_id_based_blob_digest: true,
+            replicas: DEFAULT_REPLICAS,
+            scope: Scope::default(),
+            timeout: DEFAULT_REQUEST_TIMEOUT,
+        }
+    }
+}
+
+/// Implements methods for validating the request.
+impl DeleteRequest {
+    /// Validates the request parameters.
+    fn validate(&self) -> Result<()> {
+        if self.replicas == 0 {
+            return Err(Error::InvalidArgument(
+                "replicas must be positive".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+/// Represents a request to delete a preheated OCI image from the Dragonfly seed
+/// peers. The delete removes the manifests and blobs (config and layers) of the
+/// specified image from the seed peers serving them.
+#[cfg(feature = "preheat")]
+pub struct DeleteImageRequest {
+    /// The OCI image reference (e.g., "docker.io/library/nginx:latest").
+    pub image: String,
+
+    /// Username for registry authentication. If not provided, anonymous access is used.
+    pub username: Option<String>,
+
+    /// Password for registry authentication. If not provided, anonymous access is used.
+    pub password: Option<String>,
+
+    /// Platform specifies the target platform in the format "os/arch"
+    /// (e.g., "linux/amd64", "linux/arm64"). It should be consistent with the
+    /// platform used when the image was preheated, default is current platform.
+    pub platform: Option<String>,
+
+    /// The optional piece length for the Dragonfly task.
+    pub piece_length: Option<u64>,
+
+    /// Tag identifies different tasks for the same URL.
+    pub tag: Option<String>,
+
+    /// Application identifies different tasks for the same URL.
+    pub application: Option<String>,
+
+    /// Filtered query params to generate the task id.
+    /// When filter is ["Signature", "Expires", "ns"], for example:
+    /// `http://example.com/xyz?Expires=e1&Signature=s1&ns=docker.io` and
+    /// `http://example.com/xyz?Expires=e2&Signature=s2&ns=docker.io` will generate the same task id.
+    /// Default value includes the filtered query params of s3, gcs, oss, obs, cos.
+    pub filtered_query_params: Vec<String>,
+
+    /// Content for calculating task id. This is used when the task ID cannot be calculated based
+    /// on URL and other parameters, such as when the URL contains dynamic query parameters that
+    /// cannot be filtered out.
+    pub content_for_calculating_task_id: Option<String>,
+
+    /// Enable task id based blob digest. It indicates whether to use the blob digest for
+    /// task id calculation when the url is an OCI blob url. It should be consistent with
+    /// the value used when the image was preheated, otherwise the tasks can not be found
+    /// on the seed peers, default is true.
+    pub enable_task_id_based_blob_digest: bool,
+
+    /// The number of seed peers serving each task, consistent with the replicas used
+    /// when the image was preheated, default is 2.
+    pub replicas: usize,
+
+    /// The seed peers to delete each task from, consistent with the scope used when
+    /// the image was preheated, default is the replicas of the task.
+    pub scope: Scope,
+
+    /// The timeout of each attempt of a task delete, default is 10 minutes.
+    pub timeout: Duration,
+
+    /// The number of blobs to delete concurrently, default is 4.
+    pub concurrent_task_count: usize,
+}
+
+/// Default implementation for DeleteImageRequest.
+#[cfg(feature = "preheat")]
+impl Default for DeleteImageRequest {
+    /// Returns a default DeleteImageRequest with empty image and default values for other
+    /// fields.
+    fn default() -> Self {
+        Self {
+            image: String::new(),
+            username: None,
+            password: None,
+            platform: None,
+            piece_length: None,
+            tag: None,
+            application: None,
+            filtered_query_params: default_proxy_rule_filtered_query_params(),
+            content_for_calculating_task_id: None,
+            enable_task_id_based_blob_digest: true,
+            replicas: DEFAULT_REPLICAS,
+            scope: Scope::default(),
+            timeout: DEFAULT_REQUEST_TIMEOUT,
+            concurrent_task_count: 4,
+        }
+    }
+}
+
+/// Implements methods for validating the request.
+#[cfg(feature = "preheat")]
+impl DeleteImageRequest {
+    /// Validates the request parameters.
+    fn validate(&self) -> Result<()> {
+        if self.replicas == 0 {
+            return Err(Error::InvalidArgument(
+                "replicas must be positive".to_string(),
+            ));
+        }
+
+        if self.concurrent_task_count == 0 {
+            return Err(Error::InvalidArgument(
+                "concurrent task count must be positive".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+/// Factory for creating HTTPClient instances.
+#[derive(Debug, Clone, Default)]
+struct HTTPClientFactory {}
+
+/// Implements Factory for creating reqwest::Client instances with proxy support.
+#[async_trait]
+impl Factory<String, ClientWithMiddleware> for HTTPClientFactory {
+    type Error = Error;
+
+    /// Creates a new reqwest::Client configured to use the specified proxy address.
+    async fn make_client(&self, proxy_addr: &String) -> Result<ClientWithMiddleware> {
+        // TODO(chlins): Support client certificates and set `danger_accept_invalid_certs`
+        // based on the certificates.
+        let client = Client::builder()
+            .hickory_dns(true)
+            .danger_accept_invalid_certs(true)
+            .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+            .tcp_keepalive(KEEP_ALIVE_INTERVAL)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .proxy(reqwest::Proxy::all(proxy_addr).map_err(|err| {
+                Error::Internal(format!("failed to set proxy {proxy_addr}: {err}"))
+            })?)
+            .build()
+            .map_err(|err| Error::Internal(format!("failed to build reqwest client: {err}")))?;
+
+        Ok(ClientBuilder::new(client)
+            .with(TracingMiddleware::default())
+            .build())
+    }
+}
+
+/// The builder for Proxy.
+pub struct ProxyBuilder {
+    /// The endpoint of the scheduler service.
+    scheduler_endpoint: String,
+
+    /// The timeout of the request to the scheduler service.
+    scheduler_request_timeout: Duration,
+
+    /// The interval of health check for selector(seed peers).
+    health_check_interval: Duration,
+
+    /// The retry policy of the requests.
+    retry: RetryPolicy,
+}
+
+/// Implements Default trait.
+impl Default for ProxyBuilder {
+    /// Returns a default ProxyBuilder.
+    fn default() -> Self {
+        Self {
+            scheduler_endpoint: "".to_string(),
+            scheduler_request_timeout: DEFAULT_SCHEDULER_REQUEST_TIMEOUT,
+            health_check_interval: Duration::from_secs(60),
+            retry: RetryPolicy::default(),
+        }
+    }
+}
+
+/// Implements the builder pattern for Proxy.
+impl ProxyBuilder {
+    /// Sets the scheduler endpoint.
+    pub fn scheduler_endpoint(mut self, endpoint: String) -> Self {
+        self.scheduler_endpoint = endpoint;
+        self
+    }
+
+    /// Sets the scheduler request timeout.
+    pub fn scheduler_request_timeout(mut self, timeout: Duration) -> Self {
+        self.scheduler_request_timeout = timeout;
+        self
+    }
+
+    /// Sets the health check interval.
+    pub fn health_check_interval(mut self, interval: Duration) -> Self {
+        self.health_check_interval = interval;
+        self
+    }
+
+    /// Sets how many times a request is retried after a transient failure, each
+    /// retry on the next seed peer. Default `1`, at most `10`.
+    ///
+    /// A transient failure is a timeout, a connection error, or a `5xx`, `408` or
+    /// `429` answer. Any other answer returns at once.
+    pub fn max_retries(mut self, retries: u8) -> Self {
+        self.retry.max_retries = retries;
+        self
+    }
+
+    /// Sets the exponential backoff between retries, none retrying at once. The
+    /// builder's own `max_times` is ignored in favor of
+    /// [`max_retries`](Self::max_retries).
+    pub fn backoff(mut self, backoff: ExponentialBuilder) -> Self {
+        self.retry.backoff = Some(backoff);
+        self
+    }
+
+    /// Builds and returns a Proxy instance.
+    pub async fn build(self) -> Result<Proxy> {
+        // Validate input parameters.
+        self.validate()?;
+
+        // Create the scheduler channel.
+        let scheduler_channel = Endpoint::from_shared(self.scheduler_endpoint.to_string())
+            .map_err(|err| Error::InvalidArgument(err.to_string()))?
+            .connect_timeout(self.scheduler_request_timeout)
+            .timeout(self.scheduler_request_timeout)
+            .connect()
+            .await
+            .map_err(|err| {
+                Error::Internal(format!(
+                    "failed to connect to scheduler {}: {}",
+                    self.scheduler_endpoint, err
+                ))
+            })?;
+
+        // Create scheduler client.
+        let scheduler_client = SchedulerClient::new(scheduler_channel);
+
+        // Create seed peer selector.
+        let seed_peer_selector = Arc::new(
+            SeedPeerSelector::new(scheduler_client, self.health_check_interval)
+                .await
+                .map_err(|err| {
+                    Error::Internal(format!("failed to create seed peer selector: {err}"))
+                })?,
+        );
+
+        let seed_peer_selector_clone = seed_peer_selector.clone();
+        tokio::spawn(async move {
+            // Run the selector service in the background to refresh the seed peers periodically.
+            seed_peer_selector_clone.run().await;
+        });
+
+        // Get local IP address and hostname.
+        // In IPv6-only environments, IPv4 detection may fail, so we use a best-effort IPv4->IPv6 fallback.
+        let local_ip = preferred_local_ip()
+            .ok_or_else(|| {
+                Error::Internal("failed to detect a preferred local IP address".to_string())
+            })?
+            .to_string();
+        let hostname = hostname::get()
+            .map_err(|err| Error::Internal(format!("failed to get hostname: {err}")))?
+            .to_string_lossy()
+            .to_string();
+        let id_generator = IDGenerator::new(local_ip, hostname, true);
+        let proxy = Proxy {
+            #[cfg(feature = "preheat")]
+            scheduler_endpoint: self.scheduler_endpoint,
+            seed_peer_selector,
+            retry: self.retry,
+            client_pool: Arc::new(
+                PoolBuilder::new(HTTPClientFactory::default())
+                    .capacity(DEFAULT_CLIENT_POOL_CAPACITY)
+                    .idle_timeout(DEFAULT_CLIENT_POOL_IDLE_TIMEOUT)
+                    .build(),
+            ),
+            id_generator: Arc::new(id_generator),
+        };
+
+        Ok(proxy)
+    }
+
+    /// Validates the input parameters.
+    fn validate(&self) -> Result<()> {
+        if let Err(err) = ::url::Url::parse(&self.scheduler_endpoint) {
+            return Err(Error::InvalidArgument(err.to_string()));
+        };
+
+        if self.scheduler_request_timeout.as_millis() < 100 {
+            return Err(Error::InvalidArgument(
+                "scheduler request timeout must be at least 100 milliseconds".to_string(),
+            ));
+        }
+
+        if self.health_check_interval.as_secs() < 1 || self.health_check_interval.as_secs() > 600 {
+            return Err(Error::InvalidArgument(
+                "health check interval must be between 1 and 600 seconds".to_string(),
+            ));
+        }
+
+        if self.retry.max_retries > 10 {
+            return Err(Error::InvalidArgument(
+                "max retries must be between 0 and 10".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+/// The HTTP proxy client that sends requests via Dragonfly.
+#[derive(Clone)]
+pub struct Proxy {
+    /// The endpoint of the scheduler service.
+    #[cfg(feature = "preheat")]
+    scheduler_endpoint: String,
+
+    /// The selector service for selecting seed peers.
+    seed_peer_selector: Arc<SeedPeerSelector>,
+
+    /// The retry policy of the requests.
+    retry: RetryPolicy,
+
+    /// The pool of clients.
+    client_pool: Arc<Pool<String, String, ClientWithMiddleware, HTTPClientFactory>>,
+
+    /// The task id generator.
+    id_generator: Arc<IDGenerator>,
+}
+
+/// Implements the proxy client that sends requests via Dragonfly.
+impl Proxy {
+    /// Returns a new ProxyBuilder for Proxy.
+    pub fn builder() -> ProxyBuilder {
+        ProxyBuilder::default()
+    }
+}
+
+/// Implements the interface for sending requests via the Dragonfly.
+///
+/// This struct enables interaction with remote servers through the Dragonfly, providing methods
+/// for performing GET requests with flexible response handling. It is designed for clients that
+/// need to communicate with Dragonfly seed client efficiently, supporting both streaming and buffered
+/// response processing. The trait shields the complex request logic between the client and the
+/// Dragonfly seed client's proxy, abstracting the underlying communication details to simplify
+/// client implementation and usage.
+#[async_trait]
+impl Request for Proxy {
+    /// Sends a GET request via the Dragonfly and returns a response with a
+    /// streaming body, see [`Request::get`].
+    async fn get(&self, request: &GetRequest) -> Result<GetResponse> {
+        request.validate()?;
+        let response = self.try_send(request).await?;
+        let header = response.headers().clone();
+        let status_code = response.status();
+        let body: Body = Box::new(
+            response
+                .bytes_stream()
+                .map_err(|err| Error::Internal(err.to_string())),
+        );
+
+        Ok(GetResponse {
+            success: status_code.is_success(),
+            header,
+            status_code: Some(status_code),
+            body: Some(body),
+        })
+    }
+
+    /// Sends a GET request via the Dragonfly and appends the response body to
+    /// `buf`, see [`Request::get_into`].
+    async fn get_into(&self, request: &GetRequest, buf: &mut BytesMut) -> Result<GetResponse> {
+        request.validate()?;
+        let endpoints = self.lookup_proxy_endpoints(request).await?;
+        let (body, result) = retry_with_endpoints(
+            self.retry,
+            &endpoints,
+            std::mem::take(buf),
+            |mut body, endpoint| async move {
+                let result = match self.send_to(endpoint, request).await {
+                    Ok(mut response) => {
+                        let status = response.status();
+                        let header = response.headers().clone();
+                        let len = body.len();
+                        if let Some(content_length) = response.content_length() {
+                            body.reserve(content_length as usize);
+                        }
+
+                        loop {
+                            match response.chunk().await {
+                                Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+                                Ok(None) => {
+                                    break Ok(GetResponse {
+                                        success: status.is_success(),
+                                        header,
+                                        status_code: Some(status),
+                                        body: None,
+                                    })
+                                }
+                                Err(err) => {
+                                    body.truncate(len);
+                                    if err.is_timeout() {
+                                        break Err(Error::RequestTimeout(err.to_string()));
+                                    }
+
+                                    break Err(Error::Internal(format!(
+                                        "failed to read response body: {err}"
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => Err(err),
+                };
+                (body, result)
+            },
+        )
+        .await;
+
+        *buf = body;
+        result
+    }
+
+    /// Preheats an OCI image by downloading all its blobs via the Dragonfly.
+    ///
+    /// This method is designed for scenarios where OCI image content needs to be pre-cached in
+    /// the seed client before actual consumption, ensuring faster subsequent access across the
+    /// cluster. It parses the image reference, authenticates with the OCI registry, resolves
+    /// the image manifest (including multi-platform image indexes), and triggers the seed
+    /// client to download each blob (config and layers).
+    #[cfg(feature = "preheat")]
+    async fn preheat_image(&self, request: &PreheatImageRequest) -> Result<()> {
+        request.validate()?;
+
+        // Parse image reference.
+        let client = oci_client(request.platform.clone())?;
+        let reference: Reference = request
+            .image
+            .parse()
+            .map_err(|err| Error::InvalidArgument(format!("invalid image reference: {err}")))?;
+
+        // Create registry authentication.
+        let auth = match (&request.username, &request.password) {
+            (Some(username), Some(password)) => {
+                RegistryAuth::Basic(username.clone(), password.clone())
+            }
+            _ => RegistryAuth::Anonymous,
+        };
+
+        // Pull image manifest. This handles multi-platform image index manifests
+        // by selecting the platform-specific manifest using our resolver. The
+        // digest of the platform manifest is used to preheat the manifest, so it
+        // can be addressed independently of the tag.
+        let (manifest, manifest_digest) = client
+            .pull_image_manifest(&reference, &auth)
+            .await
+            .map_err(|err| Error::Internal(format!("failed to pull image manifest: {err}")))?;
+        debug!(
+            "pulled manifest for image {} with digest {}, layers: {}",
+            request.image,
+            manifest_digest,
+            manifest.layers.len()
+        );
+
+        // Authenticate with the registry and get a bearer token if available.
+        let token = client
+            .auth(&reference, &auth, RegistryOperation::Pull)
+            .await
+            .map_err(|err| Error::Internal(format!("failed to authenticate with registry: {err}")))?
+            .ok_or_else(|| {
+                Error::Internal("registry did not return authentication token".to_string())
+            })?;
+
+        // Build authorization header for blob downloads through the Dragonfly.
+        let mut header = HeaderMap::new();
+        header.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|err| Error::Internal(format!("invalid auth token: {err}")))?,
+        );
+
+        // Build the accept header with the manifest media types for downloading manifests,
+        // so the registry returns the exact representation matching the digest.
+        let mut manifest_header = header.clone();
+        manifest_header.insert(
+            ACCEPT,
+            HeaderValue::from_str(&MIME_TYPES_DISTRIBUTION_MANIFEST.join(","))
+                .map_err(|err| Error::Internal(format!("invalid accept header: {err}")))?,
+        );
+        let registry = resolve_registry(&reference);
+        let repository = reference.repository();
+
+        // Collect the preheat targets. The manifest is the platform manifest referenced by its digest,
+        // excluding the multi-platform image index. The blobs include the config and the layers of
+        // the platform manifest.
+        let digests = blob_digests(&manifest);
+        let mut targets = Vec::with_capacity(digests.len() + 1);
+        targets.push((
+            build_manifest_url(registry, repository, &manifest_digest),
+            manifest_header.clone(),
+        ));
+
+        for digest in digests {
+            targets.push((build_blob_url(registry, repository, digest), header.clone()));
+        }
+
+        // Preheat the manifests and blobs concurrently, limited by the concurrent
+        // task count.
+        let semaphore = Arc::new(Semaphore::new(request.concurrent_task_count));
+        let mut join_set: JoinSet<Result<()>> = JoinSet::new();
+        for (url, header) in targets {
+            let semaphore = semaphore.clone();
+            let proxy = self.clone();
+            let preheat_request = PreheatRequest {
+                url,
+                header,
+                piece_length: request.piece_length,
+                tag: request.tag.clone(),
+                application: request.application.clone(),
+                filtered_query_params: request.filtered_query_params.clone(),
+                content_for_calculating_task_id: request.content_for_calculating_task_id.clone(),
+                enable_task_id_based_blob_digest: request.enable_task_id_based_blob_digest,
+                priority: request.priority,
+                replicas: request.replicas,
+                scope: request.scope,
+                timeout: request.timeout,
+                client_cert: request.client_cert.clone(),
+            };
+
+            join_set.spawn(
+                async move {
+                    let _permit = semaphore
+                        .acquire()
+                        .await
+                        .map_err(|err| Error::Internal(err.to_string()))?;
+
+                    proxy.preheat(&preheat_request).await?;
+                    debug!("preheated: {}", preheat_request.url);
+                    Ok(())
+                }
+                .in_current_span(),
+            );
+        }
+
+        // Wait for the preheats to finish.
+        while let Some(result) = join_set.join_next().await {
+            result.map_err(|err| Error::Internal(err.to_string()))??;
+        }
+
+        debug!("preheat completed for image: {}", request.image);
+        Ok(())
+    }
+
+    /// Provides detailed status for an OCI image's distribution in the Dragonfly.
+    ///
+    /// This method is designed for scenarios where clients need to know which peers have
+    /// cached the image layers, such as verifying a preheat. It parses the image reference
+    /// and requests the scheduler to resolve the image manifest and collect the cached
+    /// layers on each peer. It only queries the seed peers.
+    #[cfg(feature = "preheat")]
+    async fn stat_image(&self, request: &StatImageRequest) -> Result<StatImageResponse> {
+        let reference: Reference = request
+            .image
+            .parse()
+            .map_err(|err| Error::InvalidArgument(format!("invalid image reference: {err}")))?;
+
+        let registry = resolve_registry(&reference);
+        let stat_image_request = SchedulerStatImageRequest {
+            url: build_manifest_url(
+                registry,
+                reference.repository(),
+                reference
+                    .digest()
+                    .or_else(|| reference.tag())
+                    .unwrap_or("latest"),
+            ),
+            piece_length: request.piece_length,
+            tag: request.tag.clone(),
+            application: request.application.clone(),
+            filtered_query_params: request.filtered_query_params.clone(),
+            username: request.username.clone(),
+            password: request.password.clone(),
+            platform: request.platform.clone(),
+            timeout: Some(
+                prost_wkt_types::Duration::try_from(request.timeout).map_err(|err| {
+                    Error::InvalidArgument(format!("invalid request timeout: {err}"))
+                })?,
+            ),
+            scope: STAT_IMAGE_SCOPE_ALL_SEED_PEERS.to_string(),
+            enable_task_id_based_blob_digest: request.enable_task_id_based_blob_digest,
+            ..Default::default()
+        };
+
+        let channel = Channel::from_shared(self.scheduler_endpoint.clone())
+            .map_err(|err| Error::InvalidArgument(err.to_string()))?
+            .connect_timeout(request.timeout)
+            .timeout(request.timeout)
+            .connect()
+            .await
+            .map_err(|err| {
+                Error::Internal(format!(
+                    "failed to connect to scheduler {}: {}",
+                    self.scheduler_endpoint, err
+                ))
+            })?;
+
+        let response = SchedulerClient::new(channel)
+            .max_decoding_message_size(i32::MAX as usize)
+            .max_encoding_message_size(i32::MAX as usize)
+            .stat_image(stat_image_request)
+            .await
+            .map_err(|err| match err.code() {
+                tonic::Code::InvalidArgument => Error::InvalidArgument(format!(
+                    "failed to stat image {}: {}",
+                    request.image, err
+                )),
+                _ => Error::Internal(format!("failed to stat image {}: {}", request.image, err)),
+            })?
+            .into_inner();
+
+        Ok(StatImageResponse {
+            layers: response
+                .image
+                .map(|image| image.layers.into_iter().map(|layer| layer.url).collect())
+                .unwrap_or_default(),
+            peers: response
+                .peers
+                .into_iter()
+                .map(|peer| PeerImage {
+                    ip: peer.ip,
+                    hostname: peer.hostname,
+                    cached_layers: peer
+                        .cached_layers
+                        .into_iter()
+                        .map(|layer| Layer {
+                            url: layer.url,
+                            is_finished: layer.is_finished.unwrap_or_default(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+        })
+    }
+
+    /// Deletes a preheated OCI image from the seed peers via the Dragonfly.
+    ///
+    /// This method is designed for scenarios where a preheated image is no longer
+    /// needed and its storage on the seed peers should be reclaimed. It resolves the
+    /// image like [`Request::preheat_image`] and has the replica seed peers serving
+    /// the platform manifest and each blob (config and layers) delete the task by the
+    /// dfdaemon delete task API. A seed peer answering `NotFound` counts as deleted.
+    #[cfg(feature = "preheat")]
+    async fn delete_image(&self, request: &DeleteImageRequest) -> Result<()> {
+        request.validate()?;
+
+        // Parse image reference.
+        let client = oci_client(request.platform.clone())?;
+        let reference: Reference = request
+            .image
+            .parse()
+            .map_err(|err| Error::InvalidArgument(format!("invalid image reference: {err}")))?;
+
+        // Create registry authentication.
+        let auth = match (&request.username, &request.password) {
+            (Some(username), Some(password)) => {
+                RegistryAuth::Basic(username.clone(), password.clone())
+            }
+            _ => RegistryAuth::Anonymous,
+        };
+
+        // Pull image manifest, selecting the platform manifest from a multi-platform
+        // image index like the preheat does, so the delete targets the same tasks.
+        let (manifest, manifest_digest) = client
+            .pull_image_manifest(&reference, &auth)
+            .await
+            .map_err(|err| Error::Internal(format!("failed to pull image manifest: {err}")))?;
+        debug!(
+            "pulled manifest for image {} with digest {}, layers: {}",
+            request.image,
+            manifest_digest,
+            manifest.layers.len()
+        );
+
+        // Collect the delete targets, identical to the preheat targets.
+        let registry = resolve_registry(&reference);
+        let repository = reference.repository();
+        let digests = blob_digests(&manifest);
+        let mut urls = Vec::with_capacity(digests.len() + 1);
+        urls.push(build_manifest_url(registry, repository, &manifest_digest));
+        for digest in digests {
+            urls.push(build_blob_url(registry, repository, digest));
+        }
+
+        // Delete the manifests and blobs concurrently, limited by the concurrent
+        // task count.
+        let semaphore = Arc::new(Semaphore::new(request.concurrent_task_count));
+        let mut join_set: JoinSet<Result<()>> = JoinSet::new();
+        for url in urls {
+            let semaphore = semaphore.clone();
+            let proxy = self.clone();
+            let delete_request = DeleteRequest {
+                url,
+                piece_length: request.piece_length,
+                tag: request.tag.clone(),
+                application: request.application.clone(),
+                filtered_query_params: request.filtered_query_params.clone(),
+                content_for_calculating_task_id: request.content_for_calculating_task_id.clone(),
+                enable_task_id_based_blob_digest: request.enable_task_id_based_blob_digest,
+                replicas: request.replicas,
+                scope: request.scope,
+                timeout: request.timeout,
+            };
+
+            join_set.spawn(
+                async move {
+                    let _permit = semaphore
+                        .acquire()
+                        .await
+                        .map_err(|err| Error::Internal(err.to_string()))?;
+
+                    proxy.delete(&delete_request).await?;
+                    debug!("deleted: {}", delete_request.url);
+                    Ok(())
+                }
+                .in_current_span(),
+            );
+        }
+
+        // Wait for the deletes to finish.
+        while let Some(result) = join_set.join_next().await {
+            result.map_err(|err| Error::Internal(err.to_string()))??;
+        }
+
+        debug!("delete completed for image: {}", request.image);
+        Ok(())
+    }
+
+    /// Preheats a file by downloading it to the replicas of seed peers, or to all seed
+    /// peers with `Scope::AllSeedPeers`, via the Dragonfly.
+    ///
+    /// This method is designed for scenarios where file content needs to be pre-cached in
+    /// the seed client before actual consumption, ensuring faster subsequent access across
+    /// the cluster. It triggers every selected seed peer to download the file by the
+    /// dfdaemon download task API.
+    async fn preheat(&self, request: &PreheatRequest) -> Result<()> {
+        request.validate()?;
+
+        // Generate task id for selecting seed peer.
+        let task_id = self.task_id(
+            &request.url,
+            request.piece_length,
+            request.tag.clone(),
+            request.application.clone(),
+            request.filtered_query_params.clone(),
+            request.content_for_calculating_task_id.clone(),
+            request.enable_task_id_based_blob_digest,
+        )?;
+
+        // Select seed peers for downloading.
+        let seed_peers = self
+            .select_seed_peers(task_id.clone(), request.scope, request.replicas)
+            .await
+            .map_err(|err| {
+                Error::Internal(format!("failed to select seed peers from scheduler: {err}"))
+            })?;
+        debug!("task {} selected seed peers: {:?}", task_id, seed_peers);
+
+        if request.scope == Scope::Default && seed_peers.len() < request.replicas {
+            return Err(Error::Internal(format!(
+                "insufficient seed peers for {} replicas, {} available",
+                request.replicas,
+                seed_peers.len()
+            )));
+        }
+
+        // Construct the download task request for preheating.
+        let download_task_request = DownloadTaskRequest {
+            download: Some(Download {
+                url: request.url.clone(),
+                r#type: TaskType::Standard as i32,
+                tag: request.tag.clone(),
+                application: request.application.clone(),
+                priority: request.priority.unwrap_or(Priority::Level6 as i32),
+                filtered_query_params: request.filtered_query_params.clone(),
+                request_header: headermap_to_hashmap(&request.header),
+                piece_length: request.piece_length,
+                timeout: Some(
+                    prost_wkt_types::Duration::try_from(request.timeout).map_err(|err| {
+                        Error::InvalidArgument(format!("invalid request timeout: {err}"))
+                    })?,
+                ),
+                content_for_calculating_task_id: request.content_for_calculating_task_id.clone(),
+                remote_ip: preferred_local_ip().map(|ip| ip.to_string()),
+                enable_task_id_based_blob_digest: request.enable_task_id_based_blob_digest,
+                scheduling_policy: SchedulingPolicy::Always as i32,
+                ..Default::default()
+            }),
+        };
+
+        // Trigger every replica seed peer to download the task concurrently and
+        // wait for the download tasks to finish, without streaming the file
+        // content back to the client. A transient failure is retried on the same
+        // seed peer, so the file lands on every replica.
+        let mut join_set: JoinSet<Result<()>> = JoinSet::new();
+        for peer in seed_peers.iter() {
+            let addr = format_url(
+                "http",
+                IpAddr::from_str(&peer.ip).map_err(|err| Error::Internal(err.to_string()))?,
+                peer.port as u16,
+            );
+
+            let download_task_request = download_task_request.clone();
+            let timeout = request.timeout;
+            let retry_policy = self.retry;
+            join_set.spawn(
+                async move {
+                    retry(retry_policy, || async {
+                        let channel = Channel::from_shared(addr.clone())
+                            .map_err(|err| Error::InvalidArgument(err.to_string()))?
+                            .connect_timeout(timeout)
+                            .timeout(timeout)
+                            .connect()
+                            .await
+                            .map_err(|err| {
+                                Error::Internal(format!(
+                                    "failed to connect to seed peer {addr}: {err}"
+                                ))
+                            })?;
+
+                        let mut client = DfdaemonUploadGRPCClient::new(channel)
+                            .max_decoding_message_size(usize::MAX)
+                            .max_encoding_message_size(usize::MAX);
+
+                        let mut response = client
+                            .download_task(download_task_request.clone())
+                            .await
+                            .map_err(Error::from_status)?
+                            .into_inner();
+                        while response
+                            .message()
+                            .await
+                            .map_err(Error::from_status)?
+                            .is_some()
+                        {}
+
+                        Ok(())
+                    })
+                    .await
+                }
+                .in_current_span(),
+            );
+        }
+
+        // Wait for the download tasks on every replica seed peer to finish.
+        while let Some(result) = join_set.join_next().await {
+            result.map_err(|err| Error::Internal(err.to_string()))??;
+        }
+
+        Ok(())
+    }
+
+    /// Deletes a preheated file from the replicas of seed peers, or from all seed
+    /// peers with `Scope::AllSeedPeers`, via the Dragonfly.
+    ///
+    /// This method is designed for scenarios where a preheated file is no longer
+    /// needed and its storage on the seed peers should be reclaimed. It has every
+    /// selected seed peer delete the task by the dfdaemon delete task API, clamping
+    /// the replicas to the available seed peers instead of failing when fewer are
+    /// available.
+    async fn delete(&self, request: &DeleteRequest) -> Result<()> {
+        request.validate()?;
+
+        // Generate task id for selecting seed peer.
+        let task_id = self.task_id(
+            &request.url,
+            request.piece_length,
+            request.tag.clone(),
+            request.application.clone(),
+            request.filtered_query_params.clone(),
+            request.content_for_calculating_task_id.clone(),
+            request.enable_task_id_based_blob_digest,
+        )?;
+
+        // Select the seed peers serving the task.
+        let seed_peers = self
+            .select_seed_peers(task_id.clone(), request.scope, request.replicas)
+            .await
+            .map_err(|err| {
+                Error::Internal(format!("failed to select seed peers from scheduler: {err}"))
+            })?;
+        debug!("task {} selected seed peers: {:?}", task_id, seed_peers);
+
+        // Construct the delete task request.
+        let delete_task_request = DeleteTaskRequest {
+            task_id: task_id.clone(),
+            remote_ip: preferred_local_ip().map(|ip| ip.to_string()),
+        };
+
+        // Delete the task from every replica seed peer concurrently and wait for the
+        // deletes to finish. A transient failure is retried on the same seed peer, so
+        // the task leaves every replica.
+        let mut join_set: JoinSet<Result<()>> = JoinSet::new();
+        for peer in seed_peers.iter() {
+            let addr = format_url(
+                "http",
+                IpAddr::from_str(&peer.ip).map_err(|err| Error::Internal(err.to_string()))?,
+                peer.port as u16,
+            );
+
+            let delete_task_request = delete_task_request.clone();
+            let timeout = request.timeout;
+            let retry_policy = self.retry;
+            join_set.spawn(
+                async move {
+                    retry(retry_policy, || async {
+                        let channel = Channel::from_shared(addr.clone())
+                            .map_err(|err| Error::InvalidArgument(err.to_string()))?
+                            .connect_timeout(timeout)
+                            .timeout(timeout)
+                            .connect()
+                            .await
+                            .map_err(|err| {
+                                Error::Internal(format!(
+                                    "failed to connect to seed peer {addr}: {err}"
+                                ))
+                            })?;
+
+                        let mut client = DfdaemonUploadGRPCClient::new(channel)
+                            .max_decoding_message_size(usize::MAX)
+                            .max_encoding_message_size(usize::MAX);
+
+                        match client.delete_task(delete_task_request.clone()).await {
+                            Ok(_) => Ok(()),
+                            Err(status) if status.code() == tonic::Code::NotFound => Ok(()),
+                            Err(status) => Err(Error::from_status(status)),
+                        }
+                    })
+                    .await
+                }
+                .in_current_span(),
+            );
+        }
+
+        // Wait for the deletes on every replica seed peer to finish.
+        while let Some(result) = join_set.join_next().await {
+            result.map_err(|err| Error::Internal(err.to_string()))??;
+        }
+
+        Ok(())
+    }
+
+    /// Looks up the proxy endpoints of the seed peers serving the request, in the
+    /// consistent hash ring selection order for the request's task id. It returns up
+    /// to the replicas of the request distinct endpoints, clamped to the number of
+    /// available seed peers.
+    async fn lookup_endpoints(&self, request: &GetRequest) -> Result<Vec<String>> {
+        request.validate()?;
+        self.lookup_proxy_endpoints(request).await
+    }
+}
+
+/// Implements proxy request logic.
+impl Proxy {
+    /// Selects the seed peers the scope addresses for the task: the replicas in
+    /// the consistent hash ring order, or all seed peers.
+    async fn select_seed_peers(
+        &self,
+        task_id: String,
+        scope: Scope,
+        replicas: usize,
+    ) -> Result<Vec<Host>> {
+        match scope {
+            Scope::Default => {
+                self.seed_peer_selector
+                    .select(task_id, replicas as u32)
+                    .await
+            }
+            Scope::AllSeedPeers => self.seed_peer_selector.select_all().await,
+        }
+    }
+
+    /// Generates the task id of the url with the request parameters. It uses the
+    /// content when given, else the blob or manifest digest of an OCI url when the
+    /// digest based task id is enabled, else the url and its metadata.
+    #[allow(clippy::too_many_arguments)]
+    fn task_id(
+        &self,
+        url: &str,
+        piece_length: Option<u64>,
+        tag: Option<String>,
+        application: Option<String>,
+        filtered_query_params: Vec<String>,
+        content_for_calculating_task_id: Option<String>,
+        enable_task_id_based_blob_digest: bool,
+    ) -> Result<String> {
+        self.id_generator
+            .task_id(if let Some(content) = content_for_calculating_task_id {
+                TaskIDParameter::Content(content)
+            } else if enable_task_id_based_blob_digest && is_blob_url(url) {
+                TaskIDParameter::BlobDigestBased(url.to_string())
+            } else if enable_task_id_based_blob_digest && is_manifest_digest_url(url) {
+                TaskIDParameter::ManifestDigestBased(url.to_string())
+            } else {
+                TaskIDParameter::URLBased {
+                    url: url.to_string(),
+                    piece_length,
+                    tag,
+                    application,
+                    filtered_query_params,
+                    revision: None,
+                }
+            })
+            .map_err(|err| Error::Internal(format!("failed to generate task id: {err}")))
+    }
+
+    /// Looks up the proxy endpoints of the seed peers serving the request, in the
+    /// consistent hash ring selection order.
+    async fn lookup_proxy_endpoints(&self, request: &GetRequest) -> Result<Vec<String>> {
+        // Generate task id for selecting seed peer.
+        let task_id = self.task_id(
+            &request.url,
+            request.piece_length,
+            request.tag.clone(),
+            request.application.clone(),
+            request.filtered_query_params.clone(),
+            request.content_for_calculating_task_id.clone(),
+            request.enable_task_id_based_blob_digest,
+        )?;
+
+        // Select seed peers for downloading.
+        let seed_peers = self
+            .seed_peer_selector
+            .select(task_id.clone(), request.replicas as u32)
+            .await
+            .map_err(|err| {
+                Error::Internal(format!("failed to select seed peers from scheduler: {err}"))
+            })?;
+
+        debug!("task {} selected seed peers: {:?}", task_id, seed_peers);
+
+        let mut endpoints = Vec::with_capacity(seed_peers.len());
+        for peer in seed_peers.iter() {
+            // TODO(chlins): Support client https scheme.
+            endpoints.push(format_url(
+                "http",
+                IpAddr::from_str(&peer.ip).map_err(|err| Error::Internal(err.to_string()))?,
+                peer.proxy_port as u16,
+            ));
+        }
+
+        Ok(endpoints)
+    }
+
+    /// Sends the request to the seed peers serving it, retrying a transient failure
+    /// on the next one, see [`retry_with_endpoints`].
+    async fn try_send(&self, request: &GetRequest) -> Result<reqwest::Response> {
+        let endpoints = self.lookup_proxy_endpoints(request).await?;
+        let ((), result) =
+            retry_with_endpoints(self.retry, &endpoints, (), |(), endpoint| async move {
+                ((), self.send_to(endpoint, request).await)
+            })
+            .await;
+        result
+    }
+
+    /// Sends the request through the pooled client of the seed peer proxy endpoint.
+    async fn send_to(&self, endpoint: String, request: &GetRequest) -> Result<reqwest::Response> {
+        let entry = self.client_pool.entry(&endpoint, &endpoint).await?;
+        self.send(&entry.client, request).await
+    }
+
+    /// Send a request to the specified URL via the client with the given headers.
+    async fn send(
+        &self,
+        client: &ClientWithMiddleware,
+        request: &GetRequest,
+    ) -> Result<reqwest::Response> {
+        let headers = self.make_request_headers(request)?;
+        let response = client
+            .get(&request.url)
+            .headers(headers)
+            .timeout(request.timeout)
+            .send()
+            .await
+            .map_err(|err| match err {
+                reqwest_middleware::Error::Reqwest(err) if err.is_timeout() => {
+                    Error::RequestTimeout(err.to_string())
+                }
+                err => Error::Internal(err.to_string()),
+            })?;
+
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+
+        let response_headers = response.headers().clone();
+        let header_map = headermap_to_hashmap(&response_headers);
+        let message = response.text().await.ok();
+        let error_type = response_headers
+            .get("X-Dragonfly-Error-Type")
+            .and_then(|v| v.to_str().ok());
+
+        match error_type {
+            Some("backend") => Err(Error::BackendError(BackendError {
+                message,
+                header: header_map,
+                status_code: Some(status),
+            })),
+            Some("proxy") => Err(Error::ProxyError(ProxyError {
+                message,
+                header: header_map,
+                status_code: Some(status),
+            })),
+            Some("dfdaemon") => Err(Error::DfdaemonError(DfdaemonError {
+                message,
+                header: header_map,
+                status_code: Some(status),
+            })),
+            Some(other) => Err(Error::ProxyError(ProxyError {
+                message: Some(format!("unknown error type from proxy: {other}")),
+                header: header_map,
+                status_code: Some(status),
+            })),
+            None => Err(Error::ProxyError(ProxyError {
+                message: Some(format!("unexpected status code from proxy: {status}")),
+                header: header_map,
+                status_code: Some(status),
+            })),
+        }
+    }
+
+    /// Make request headers applies p2p related headers to the request headers.
+    fn make_request_headers(&self, request: &GetRequest) -> Result<HeaderMap> {
+        let mut headers = request.header.clone();
+        if let Some(piece_length) = request.piece_length {
+            headers.insert(
+                "X-Dragonfly-Piece-Length",
+                piece_length.to_string().parse().map_err(|err| {
+                    Error::InvalidArgument(format!("invalid piece length: {err}"))
+                })?,
+            );
+        }
+
+        if let Some(tag) = request.tag.clone() {
+            headers.insert(
+                "X-Dragonfly-Tag",
+                tag.to_string()
+                    .parse()
+                    .map_err(|err| Error::InvalidArgument(format!("invalid tag: {err}")))?,
+            );
+        }
+
+        if let Some(application) = request.application.clone() {
+            headers.insert(
+                "X-Dragonfly-Application",
+                application
+                    .to_string()
+                    .parse()
+                    .map_err(|err| Error::InvalidArgument(format!("invalid application: {err}")))?,
+            );
+        }
+
+        if let Some(content_for_calculating_task_id) =
+            request.content_for_calculating_task_id.clone()
+        {
+            headers.insert(
+                "X-Dragonfly-Content-For-Calculating-Task-ID",
+                content_for_calculating_task_id
+                    .to_string()
+                    .parse()
+                    .map_err(|err| {
+                        Error::InvalidArgument(format!(
+                            "invalid content for calculating task id: {err}"
+                        ))
+                    })?,
+            );
+        }
+
+        headers.insert(
+            "X-Dragonfly-Enable-Task-ID-Based-Blob-Digest",
+            request
+                .enable_task_id_based_blob_digest
+                .to_string()
+                .parse()
+                .map_err(|err| {
+                    Error::InvalidArgument(format!(
+                        "invalid enable task id based blob digest: {err}"
+                    ))
+                })?,
+        );
+
+        if let Some(priority) = request.priority {
+            headers.insert(
+                "X-Dragonfly-Priority",
+                priority
+                    .to_string()
+                    .parse()
+                    .map_err(|err| Error::InvalidArgument(format!("invalid priority: {err}")))?,
+            );
+        }
+
+        if !request.filtered_query_params.is_empty() {
+            let value = request.filtered_query_params.join(",");
+            headers.insert(
+                "X-Dragonfly-Filtered-Query-Params",
+                value.parse().map_err(|err| {
+                    Error::InvalidArgument(format!("invalid filtered query params: {err}"))
+                })?,
+            );
+        }
+
+        headers.insert("X-Dragonfly-Use-P2P", HeaderValue::from_static("true"));
+        Ok(headers)
+    }
+}
+
+/// The builder for ProxyWithEndpoints.
+pub struct ProxyWithEndpointsBuilder {
+    /// The seed peer endpoints serving the requests.
+    endpoints: Vec<String>,
+
+    /// The retry policy of the requests.
+    retry: RetryPolicy,
+}
+
+/// Implements Default trait.
+impl Default for ProxyWithEndpointsBuilder {
+    /// Returns a default ProxyWithEndpointsBuilder.
+    fn default() -> Self {
+        Self {
+            endpoints: Vec::new(),
+            retry: RetryPolicy::default(),
+        }
+    }
+}
+
+/// Implements the builder pattern for ProxyWithEndpoints.
+impl ProxyWithEndpointsBuilder {
+    /// Sets the seed peer endpoints serving the requests.
+    pub fn endpoints(mut self, endpoints: Vec<String>) -> Self {
+        self.endpoints = endpoints;
+        self
+    }
+
+    /// Sets how many times a request is retried after a transient failure, each
+    /// retry on the next seed peer. Default `1`, at most `10`.
+    ///
+    /// A transient failure is a timeout, a connection error, or a `5xx`, `408` or
+    /// `429` answer. Any other answer returns at once.
+    pub fn max_retries(mut self, retries: u8) -> Self {
+        self.retry.max_retries = retries;
+        self
+    }
+
+    /// Sets the exponential backoff between retries, none retrying at once. The
+    /// builder's own `max_times` is ignored in favor of
+    /// [`max_retries`](Self::max_retries).
+    pub fn backoff(mut self, backoff: ExponentialBuilder) -> Self {
+        self.retry.backoff = Some(backoff);
+        self
+    }
+
+    /// Builds and returns a ProxyWithEndpoints instance.
+    pub async fn build(self) -> Result<ProxyWithEndpoints> {
+        // Validate input parameters.
+        self.validate()?;
+
+        // Create a client per endpoint, so every endpoint has its own reusable
+        // connection pool.
+        let factory = HTTPClientFactory::default();
+        let mut clients = HashMap::with_capacity(self.endpoints.len());
+        for endpoint in self.endpoints.iter() {
+            if clients.contains_key(endpoint) {
+                continue;
+            }
+
+            clients.insert(endpoint.clone(), factory.make_client(endpoint).await?);
+        }
+
+        Ok(ProxyWithEndpoints {
+            endpoints: self.endpoints,
+            retry: self.retry,
+            clients,
+        })
+    }
+
+    /// Validates the input parameters.
+    fn validate(&self) -> Result<()> {
+        if self.endpoints.is_empty() {
+            return Err(Error::InvalidArgument(
+                "endpoints must not be empty".to_string(),
+            ));
+        }
+
+        if self.retry.max_retries > 10 {
+            return Err(Error::InvalidArgument(
+                "max retries must be between 0 and 10".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+/// The HTTP proxy client that sends requests via the fixed seed peer endpoints of the
+/// Dragonfly given at construction, without selecting seed peers by the consistent hash
+/// ring or syncing them from the scheduler.
+#[derive(Clone)]
+pub struct ProxyWithEndpoints {
+    /// The seed peer endpoints serving the requests.
+    endpoints: Vec<String>,
+
+    /// The retry policy of the requests.
+    retry: RetryPolicy,
+
+    /// The clients keyed by endpoint, so every endpoint has its own reusable
+    /// connection pool.
+    clients: HashMap<String, ClientWithMiddleware>,
+}
+
+/// Implements the proxy client that sends requests via the fixed seed peer endpoints.
+impl ProxyWithEndpoints {
+    /// Returns a new ProxyWithEndpointsBuilder for ProxyWithEndpoints.
+    pub fn builder() -> ProxyWithEndpointsBuilder {
+        ProxyWithEndpointsBuilder::default()
+    }
+
+    /// Sends the request to the endpoints, retrying a transient failure on the next
+    /// one, see [`retry_with_endpoints`].
+    async fn try_send(&self, request: &GetRequest) -> Result<reqwest::Response> {
+        let ((), result) =
+            retry_with_endpoints(self.retry, &self.endpoints, (), |(), endpoint| async move {
+                ((), self.send_to(&endpoint, request).await)
+            })
+            .await;
+        result
+    }
+
+    /// Sends the request through the client of the endpoint.
+    async fn send_to(&self, endpoint: &str, request: &GetRequest) -> Result<reqwest::Response> {
+        let client = self
+            .clients
+            .get(endpoint)
+            .ok_or_else(|| Error::Internal(format!("no client for endpoint {endpoint}")))?;
+        self.send(client, request).await
+    }
+
+    /// Send a request to the specified URL via the client with the given headers.
+    async fn send(
+        &self,
+        client: &ClientWithMiddleware,
+        request: &GetRequest,
+    ) -> Result<reqwest::Response> {
+        let headers = self.make_request_headers(request)?;
+        let response = client
+            .get(&request.url)
+            .headers(headers)
+            .timeout(request.timeout)
+            .send()
+            .await
+            .map_err(|err| match err {
+                reqwest_middleware::Error::Reqwest(err) if err.is_timeout() => {
+                    Error::RequestTimeout(err.to_string())
+                }
+                err => Error::Internal(err.to_string()),
+            })?;
+
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+
+        let response_headers = response.headers().clone();
+        let header_map = headermap_to_hashmap(&response_headers);
+        let message = response.text().await.ok();
+        let error_type = response_headers
+            .get("X-Dragonfly-Error-Type")
+            .and_then(|v| v.to_str().ok());
+
+        match error_type {
+            Some("backend") => Err(Error::BackendError(BackendError {
+                message,
+                header: header_map,
+                status_code: Some(status),
+            })),
+            Some("proxy") => Err(Error::ProxyError(ProxyError {
+                message,
+                header: header_map,
+                status_code: Some(status),
+            })),
+            Some("dfdaemon") => Err(Error::DfdaemonError(DfdaemonError {
+                message,
+                header: header_map,
+                status_code: Some(status),
+            })),
+            Some(other) => Err(Error::ProxyError(ProxyError {
+                message: Some(format!("unknown error type from proxy: {other}")),
+                header: header_map,
+                status_code: Some(status),
+            })),
+            None => Err(Error::ProxyError(ProxyError {
+                message: Some(format!("unexpected status code from proxy: {status}")),
+                header: header_map,
+                status_code: Some(status),
+            })),
+        }
+    }
+
+    /// Make request headers applies p2p related headers to the request headers.
+    fn make_request_headers(&self, request: &GetRequest) -> Result<HeaderMap> {
+        let mut headers = request.header.clone();
+        if let Some(piece_length) = request.piece_length {
+            headers.insert(
+                "X-Dragonfly-Piece-Length",
+                piece_length.to_string().parse().map_err(|err| {
+                    Error::InvalidArgument(format!("invalid piece length: {err}"))
+                })?,
+            );
+        }
+
+        if let Some(tag) = request.tag.clone() {
+            headers.insert(
+                "X-Dragonfly-Tag",
+                tag.to_string()
+                    .parse()
+                    .map_err(|err| Error::InvalidArgument(format!("invalid tag: {err}")))?,
+            );
+        }
+
+        if let Some(application) = request.application.clone() {
+            headers.insert(
+                "X-Dragonfly-Application",
+                application
+                    .to_string()
+                    .parse()
+                    .map_err(|err| Error::InvalidArgument(format!("invalid application: {err}")))?,
+            );
+        }
+
+        if let Some(content_for_calculating_task_id) =
+            request.content_for_calculating_task_id.clone()
+        {
+            headers.insert(
+                "X-Dragonfly-Content-For-Calculating-Task-ID",
+                content_for_calculating_task_id
+                    .to_string()
+                    .parse()
+                    .map_err(|err| {
+                        Error::InvalidArgument(format!(
+                            "invalid content for calculating task id: {err}"
+                        ))
+                    })?,
+            );
+        }
+
+        headers.insert(
+            "X-Dragonfly-Enable-Task-ID-Based-Blob-Digest",
+            request
+                .enable_task_id_based_blob_digest
+                .to_string()
+                .parse()
+                .map_err(|err| {
+                    Error::InvalidArgument(format!(
+                        "invalid enable task id based blob digest: {err}"
+                    ))
+                })?,
+        );
+
+        if let Some(priority) = request.priority {
+            headers.insert(
+                "X-Dragonfly-Priority",
+                priority
+                    .to_string()
+                    .parse()
+                    .map_err(|err| Error::InvalidArgument(format!("invalid priority: {err}")))?,
+            );
+        }
+
+        if !request.filtered_query_params.is_empty() {
+            let value = request.filtered_query_params.join(",");
+            headers.insert(
+                "X-Dragonfly-Filtered-Query-Params",
+                value.parse().map_err(|err| {
+                    Error::InvalidArgument(format!("invalid filtered query params: {err}"))
+                })?,
+            );
+        }
+
+        headers.insert("X-Dragonfly-Use-P2P", HeaderValue::from_static("true"));
+        Ok(headers)
+    }
+}
+
+/// Implements the interface for sending requests via the fixed seed peer endpoints of the
+/// Dragonfly given at construction, without selecting seed peers by the consistent hash
+/// ring or syncing them from the scheduler.
+#[async_trait]
+impl RequestWithEndpoints for ProxyWithEndpoints {
+    /// Sends a GET request to the endpoints and returns a response with a
+    /// streaming body, see [`RequestWithEndpoints::get`].
+    async fn get(&self, request: &GetRequest) -> Result<GetResponse> {
+        request.validate()?;
+        let response = self.try_send(request).await?;
+        let header = response.headers().clone();
+        let status_code = response.status();
+        let body: Body = Box::new(
+            response
+                .bytes_stream()
+                .map_err(|err| Error::Internal(err.to_string())),
+        );
+
+        Ok(GetResponse {
+            success: status_code.is_success(),
+            header,
+            status_code: Some(status_code),
+            body: Some(body),
+        })
+    }
+
+    /// Sends a GET request to the endpoints and appends the response body to
+    /// `buf`, see [`RequestWithEndpoints::get_into`].
+    async fn get_into(&self, request: &GetRequest, buf: &mut BytesMut) -> Result<GetResponse> {
+        request.validate()?;
+        let (body, result) = retry_with_endpoints(
+            self.retry,
+            &self.endpoints,
+            std::mem::take(buf),
+            |mut body, endpoint| async move {
+                let result = match self.send_to(&endpoint, request).await {
+                    Ok(mut response) => {
+                        let status = response.status();
+                        let header = response.headers().clone();
+                        let len = body.len();
+                        if let Some(content_length) = response.content_length() {
+                            body.reserve(content_length as usize);
+                        }
+
+                        loop {
+                            match response.chunk().await {
+                                Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+                                Ok(None) => {
+                                    break Ok(GetResponse {
+                                        success: status.is_success(),
+                                        header,
+                                        status_code: Some(status),
+                                        body: None,
+                                    })
+                                }
+                                Err(err) => {
+                                    body.truncate(len);
+                                    if err.is_timeout() {
+                                        break Err(Error::RequestTimeout(err.to_string()));
+                                    }
+
+                                    break Err(Error::Internal(format!(
+                                        "failed to read response body: {err}"
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => Err(err),
+                };
+                (body, result)
+            },
+        )
+        .await;
+        *buf = body;
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Request;
+    use dragonfly_api::common::v2::Host;
+    use dragonfly_api::dfdaemon::v2::DownloadTaskResponse;
+    use dragonfly_api::scheduler::v2::ListHostsResponse;
+    use mocktail::prelude::*;
+    use std::time::Duration;
+    use tonic_health::pb::health_check_response::ServingStatus;
+    use tonic_health::pb::HealthCheckResponse;
+
+    async fn setup_mock_scheduler(hosts: Vec<Host>) -> Result<mocktail::server::MockServer> {
+        setup_mock_scheduler_with_mocks(hosts, MockSet::new()).await
+    }
+
+    async fn setup_mock_scheduler_with_mocks(
+        hosts: Vec<Host>,
+        mut mocks: MockSet,
+    ) -> Result<mocktail::server::MockServer> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        mocks.mock(|when, then| {
+            when.path("/scheduler.v2.Scheduler/ListHosts");
+            then.pb(ListHostsResponse { hosts });
+        });
+
+        let server = MockServer::new_grpc("scheduler.v2.Scheduler").with_mocks(mocks);
+        server.start().await.map_err(|err| {
+            Error::Internal(format!("failed to start mock scheduler server: {err}"))
+        })?;
+
+        Ok(server)
+    }
+
+    async fn setup_mock_seed_peer(mut mocks: MockSet) -> Result<mocktail::server::MockServer> {
+        mocks.mock(|when, then| {
+            when.path("/grpc.health.v1.Health/Check");
+            then.pb(HealthCheckResponse {
+                status: ServingStatus::Serving as i32,
+            });
+        });
+
+        let server = MockServer::new_grpc("dfdaemon.v2.DfdaemonUpload").with_mocks(mocks);
+        server.start().await.map_err(|err| {
+            Error::Internal(format!("failed to start mock seed peer server: {err}"))
+        })?;
+
+        Ok(server)
+    }
+
+    fn create_seed_peer_host(name: &str, port: u16, proxy_port: u16) -> Host {
+        Host {
+            id: name.to_string(),
+            r#type: 1,
+            hostname: name.to_string(),
+            ip: "127.0.0.1".to_string(),
+            port: port as i32,
+            proxy_port: proxy_port as i32,
+            name: name.to_string(),
+            ..Default::default()
+        }
+    }
+
+    async fn setup_mock_seed_peer_proxy(mocks: MockSet) -> Result<mocktail::server::MockServer> {
+        let server = MockServer::new_http("seed-peer-proxy").with_mocks(mocks);
+        server.start().await.map_err(|err| {
+            Error::Internal(format!("failed to start mock seed peer proxy: {err}"))
+        })?;
+
+        Ok(server)
+    }
+
+    async fn setup_flaky_seed_peer_proxy(
+        first: FlakyFirstConnection,
+        body: &'static str,
+    ) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counter = connections.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let flaky = counter.fetch_add(1, Ordering::SeqCst) == 0;
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !request.ends_with(b"\r\n\r\n") {
+                        match stream.read(&mut byte).await {
+                            Ok(1) => request.push(byte[0]),
+                            _ => return,
+                        }
+                    }
+
+                    if flaky && first == FlakyFirstConnection::Hang {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                        return;
+                    }
+
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let served = if flaky { &body[..body.len() / 2] } else { body };
+                    let _ = stream.write_all(served.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        (port, connections)
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum FlakyFirstConnection {
+        Hang,
+        TruncateBody,
+    }
+
+    type ExpectElapsed = fn(Duration);
+
+    #[tokio::test]
+    async fn new_success() {
+        let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
+        let result = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().retry.max_retries, 1);
+    }
+
+    #[tokio::test]
+    async fn new_invalid_params() {
+        let test_cases = vec![
+            ("", None, None),
+            ("http://0.0.0.0:4000", Some(11), None),
+            ("http://0.0.0.0:4000", None, Some(Duration::from_secs(0))),
+            ("http://0.0.0.0:4000", None, Some(Duration::from_secs(601))),
+        ];
+
+        for (endpoint, max_retries, health_check_interval) in test_cases {
+            let mut builder = Proxy::builder().scheduler_endpoint(endpoint.to_string());
+            if let Some(max_retries) = max_retries {
+                builder = builder.max_retries(max_retries);
+            }
+            if let Some(health_check_interval) = health_check_interval {
+                builder = builder.health_check_interval(health_check_interval);
+            }
+
+            let result = builder.build().await;
+            assert!(
+                matches!(result, Err(Error::InvalidArgument(_))),
+                "endpoint: {endpoint}, max_retries: {max_retries:?}, health_check_interval: {health_check_interval:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn preheat_no_available_seed_peers() {
+        let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let request = PreheatRequest {
+            url: "http://example.com/payload.txt".to_string(),
+            tag: Some("preheat".to_string()),
+            application: Some("dfctl".to_string()),
+            replicas: 1,
+            ..Default::default()
+        };
+
+        let result = proxy.preheat(&request).await;
+        assert!(
+            matches!(result, Err(Error::Internal(message)) if message.contains("failed to select seed peers"))
+        );
+    }
+
+    #[tokio::test]
+    async fn preheat_succeeds_with_seed_peer() {
+        let mut mocks = MockSet::new();
+        mocks.mock(|when, then| {
+            when.path("/dfdaemon.v2.DfdaemonUpload/DownloadTask");
+            then.pb_stream(vec![
+                DownloadTaskResponse {
+                    host_id: "seed-peer-1".to_string(),
+                    task_id: "task-1".to_string(),
+                    peer_id: "peer-1".to_string(),
+                    ..Default::default()
+                },
+                DownloadTaskResponse {
+                    host_id: "seed-peer-1".to_string(),
+                    task_id: "task-1".to_string(),
+                    peer_id: "peer-1".to_string(),
+                    ..Default::default()
+                },
+            ]);
+        });
+
+        let mock_seed_peer = setup_mock_seed_peer(mocks).await.unwrap();
+        let mock_scheduler = setup_mock_scheduler(vec![create_seed_peer_host(
+            "seed-peer-1",
+            mock_seed_peer.port().unwrap(),
+            0,
+        )])
+        .await
+        .unwrap();
+
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let request = PreheatRequest {
+            url: "http://example.com/payload.txt".to_string(),
+            tag: Some("preheat".to_string()),
+            application: Some("dfctl".to_string()),
+            replicas: 1,
+            ..Default::default()
+        };
+
+        let result = proxy.preheat(&request).await;
+        assert!(result.is_ok(), "preheat should succeed: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn preheat_all_seed_peers() {
+        let mut hosts = Vec::new();
+        let mut servers = Vec::new();
+        for name in ["seed-peer-1", "seed-peer-2", "seed-peer-3"] {
+            let mut mocks = MockSet::new();
+            mocks.mock(|when, then| {
+                when.path("/dfdaemon.v2.DfdaemonUpload/DownloadTask");
+                then.pb_stream(vec![DownloadTaskResponse {
+                    host_id: name.to_string(),
+                    task_id: "task-1".to_string(),
+                    peer_id: "peer-1".to_string(),
+                    ..Default::default()
+                }]);
+            });
+            let seed_peer = setup_mock_seed_peer(mocks).await.unwrap();
+
+            hosts.push(create_seed_peer_host(name, seed_peer.port().unwrap(), 0));
+            servers.push((name, seed_peer));
+        }
+
+        let mock_scheduler = setup_mock_scheduler(hosts).await.unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let request = PreheatRequest {
+            url: "http://example.com/payload.txt".to_string(),
+            replicas: 5,
+            scope: Scope::AllSeedPeers,
+            ..Default::default()
+        };
+        proxy.preheat(&request).await.unwrap();
+
+        for (name, server) in servers.iter() {
+            assert_eq!(seed_peer_calls(server), 1, "seed peer {name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn preheat_insufficient_seed_peers() {
+        let mock_seed_peer = setup_mock_seed_peer(MockSet::new()).await.unwrap();
+        let mock_scheduler = setup_mock_scheduler(vec![create_seed_peer_host(
+            "seed-peer-1",
+            mock_seed_peer.port().unwrap(),
+            0,
+        )])
+        .await
+        .unwrap();
+
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let request = PreheatRequest {
+            url: "http://example.com/payload.txt".to_string(),
+            ..Default::default()
+        };
+
+        let result = proxy.preheat(&request).await;
+        assert!(
+            matches!(result, Err(Error::Internal(message)) if message.contains("insufficient seed peers"))
+        );
+    }
+
+    #[tokio::test]
+    async fn get_streams_the_body() {
+        let mut mocks = MockSet::new();
+        mocks.mock(|when, then| {
+            when.get().path("/file.txt");
+            then.text("hello dragonfly");
+        });
+        let mock_proxy = setup_mock_seed_peer_proxy(mocks).await.unwrap();
+
+        let mock_seed_peer = setup_mock_seed_peer(MockSet::new()).await.unwrap();
+        let mock_scheduler = setup_mock_scheduler(vec![create_seed_peer_host(
+            "seed-peer-1",
+            mock_seed_peer.port().unwrap(),
+            mock_proxy.port().unwrap(),
+        )])
+        .await
+        .unwrap();
+
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let request = GetRequest {
+            url: "http://example.com/file.txt".to_string(),
+            replicas: 1,
+            ..Default::default()
+        };
+
+        let response = proxy.get(&request).await.unwrap();
+        assert!(response.success);
+        assert_eq!(response.status_code, Some(reqwest::StatusCode::OK));
+
+        let mut body = response.body.unwrap();
+        let mut content = Vec::new();
+        while let Some(chunk) = body.try_next().await.unwrap() {
+            content.extend_from_slice(&chunk);
+        }
+        assert_eq!(content, b"hello dragonfly");
+    }
+
+    #[tokio::test]
+    async fn get_into_fills_the_buffer() {
+        let mut mocks = MockSet::new();
+        mocks.mock(|when, then| {
+            when.get().path("/file.txt");
+            then.text("hello dragonfly");
+        });
+        let mock_proxy = setup_mock_seed_peer_proxy(mocks).await.unwrap();
+
+        let mock_seed_peer = setup_mock_seed_peer(MockSet::new()).await.unwrap();
+        let mock_scheduler = setup_mock_scheduler(vec![create_seed_peer_host(
+            "seed-peer-1",
+            mock_seed_peer.port().unwrap(),
+            mock_proxy.port().unwrap(),
+        )])
+        .await
+        .unwrap();
+
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let request = GetRequest {
+            url: "http://example.com/file.txt".to_string(),
+            replicas: 1,
+            ..Default::default()
+        };
+
+        let mut buf = BytesMut::new();
+        let response = proxy.get_into(&request, &mut buf).await.unwrap();
+        assert!(response.success);
+        assert_eq!(response.status_code, Some(reqwest::StatusCode::OK));
+        assert!(response.body.is_none());
+        assert_eq!(&buf[..], b"hello dragonfly");
+    }
+
+    #[tokio::test]
+    async fn get_scatters_across_replicas() {
+        let mut bad_mocks = MockSet::new();
+        bad_mocks.mock(|when, then| {
+            when.get().path("/file.txt");
+            then.status(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+                .text("boom");
+        });
+        let bad_proxy = setup_mock_seed_peer_proxy(bad_mocks).await.unwrap();
+
+        let mut good_mocks = MockSet::new();
+        good_mocks.mock(|when, then| {
+            when.get().path("/file.txt");
+            then.text("ok");
+        });
+        let good_proxy = setup_mock_seed_peer_proxy(good_mocks).await.unwrap();
+
+        let seed_peer_1 = setup_mock_seed_peer(MockSet::new()).await.unwrap();
+        let seed_peer_2 = setup_mock_seed_peer(MockSet::new()).await.unwrap();
+        let mock_scheduler = setup_mock_scheduler(vec![
+            create_seed_peer_host(
+                "seed-peer-1",
+                seed_peer_1.port().unwrap(),
+                bad_proxy.port().unwrap(),
+            ),
+            create_seed_peer_host(
+                "seed-peer-2",
+                seed_peer_2.port().unwrap(),
+                good_proxy.port().unwrap(),
+            ),
+        ])
+        .await
+        .unwrap();
+
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .backoff(
+                ExponentialBuilder::new()
+                    .with_min_delay(Duration::from_millis(1))
+                    .with_max_delay(Duration::from_millis(2))
+                    .with_jitter(),
+            )
+            .build()
+            .await
+            .unwrap();
+
+        let request = GetRequest {
+            url: "http://example.com/file.txt".to_string(),
+            ..Default::default()
+        };
+
+        let mut buf = BytesMut::new();
+        let response = proxy.get_into(&request, &mut buf).await.unwrap();
+        assert!(response.success);
+        assert_eq!(&buf[..], b"ok");
+        assert_eq!(
+            good_proxy
+                .mocks()
+                .iter()
+                .map(|mock| mock.match_count())
+                .sum::<usize>(),
+            1
+        );
+        assert!(
+            bad_proxy
+                .mocks()
+                .iter()
+                .map(|mock| mock.match_count())
+                .sum::<usize>()
+                <= 1
+        );
+    }
+
+    #[tokio::test]
+    async fn get_retries_only_transient_answers() {
+        let test_cases = vec![
+            (reqwest::StatusCode::SERVICE_UNAVAILABLE, "backend", 2, 3),
+            (reqwest::StatusCode::SERVICE_UNAVAILABLE, "proxy", 2, 3),
+            (reqwest::StatusCode::INTERNAL_SERVER_ERROR, "backend", 1, 2),
+            (reqwest::StatusCode::INTERNAL_SERVER_ERROR, "proxy", 1, 2),
+            (reqwest::StatusCode::INTERNAL_SERVER_ERROR, "dfdaemon", 1, 2),
+            (reqwest::StatusCode::INSUFFICIENT_STORAGE, "dfdaemon", 2, 3),
+            (reqwest::StatusCode::UNPROCESSABLE_ENTITY, "dfdaemon", 3, 1),
+            (reqwest::StatusCode::REQUEST_TIMEOUT, "backend", 1, 2),
+            (reqwest::StatusCode::REQUEST_TIMEOUT, "proxy", 1, 2),
+            (reqwest::StatusCode::TOO_MANY_REQUESTS, "backend", 3, 4),
+            (reqwest::StatusCode::TOO_MANY_REQUESTS, "proxy", 3, 4),
+            (reqwest::StatusCode::TOO_MANY_REQUESTS, "proxy", 0, 1),
+            (reqwest::StatusCode::UNAUTHORIZED, "backend", 3, 1),
+            (reqwest::StatusCode::UNAUTHORIZED, "proxy", 3, 1),
+            (reqwest::StatusCode::FORBIDDEN, "backend", 3, 1),
+            (reqwest::StatusCode::FORBIDDEN, "proxy", 3, 1),
+            (reqwest::StatusCode::NOT_FOUND, "backend", 3, 1),
+            (reqwest::StatusCode::NOT_FOUND, "proxy", 3, 1),
+        ];
+
+        for (status, error_type, max_retries, expected_calls) in test_cases {
+            let mut mocks = MockSet::new();
+            mocks.mock(|when, then| {
+                when.get().path("/file.txt");
+                then.status(status)
+                    .headers([("X-Dragonfly-Error-Type", error_type)])
+                    .text("no");
+            });
+            let mock_proxy = setup_mock_seed_peer_proxy(mocks).await.unwrap();
+
+            let mock_seed_peer = setup_mock_seed_peer(MockSet::new()).await.unwrap();
+            let mock_scheduler = setup_mock_scheduler(vec![create_seed_peer_host(
+                "seed-peer-1",
+                mock_seed_peer.port().unwrap(),
+                mock_proxy.port().unwrap(),
+            )])
+            .await
+            .unwrap();
+
+            let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+            let proxy = Proxy::builder()
+                .scheduler_endpoint(scheduler_endpoint)
+                .max_retries(max_retries)
+                .build()
+                .await
+                .unwrap();
+
+            let request = GetRequest {
+                url: "http://example.com/file.txt".to_string(),
+                replicas: 1,
+                ..Default::default()
+            };
+
+            let err = proxy.get(&request).await.err().unwrap();
+            assert!(
+                err.to_string()
+                    .contains(&format!("status_code: Some({status:?})")),
+                "status: {status}, error_type: {error_type}, error: {err}"
+            );
+            assert_eq!(
+                mock_proxy
+                    .mocks()
+                    .iter()
+                    .map(|mock| mock.match_count())
+                    .sum::<usize>(),
+                expected_calls,
+                "status: {status}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_into_retries_a_flaky_first_attempt() {
+        let test_cases: Vec<(FlakyFirstConnection, Duration, ExpectElapsed)> = vec![
+            (
+                FlakyFirstConnection::TruncateBody,
+                DEFAULT_REQUEST_TIMEOUT,
+                |_elapsed| {},
+            ),
+            (
+                FlakyFirstConnection::Hang,
+                Duration::from_millis(300),
+                |elapsed| {
+                    assert!(
+                        (Duration::from_millis(300)..Duration::from_millis(900)).contains(&elapsed),
+                        "elapsed: {elapsed:?}"
+                    );
+                },
+            ),
+        ];
+
+        for (first, timeout, expect) in test_cases {
+            let (port, connections) = setup_flaky_seed_peer_proxy(first, "hello dragonfly").await;
+            let mock_seed_peer = setup_mock_seed_peer(MockSet::new()).await.unwrap();
+            let mock_scheduler = setup_mock_scheduler(vec![create_seed_peer_host(
+                "seed-peer-1",
+                mock_seed_peer.port().unwrap(),
+                port,
+            )])
+            .await
+            .unwrap();
+
+            let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+            let proxy = Proxy::builder()
+                .scheduler_endpoint(scheduler_endpoint)
+                .build()
+                .await
+                .unwrap();
+
+            let request = GetRequest {
+                url: "http://example.com/file.txt".to_string(),
+                replicas: 1,
+                timeout,
+                ..Default::default()
+            };
+
+            let start = std::time::Instant::now();
+            let mut buf = BytesMut::from(&b"prefix:"[..]);
+            let response = proxy.get_into(&request, &mut buf).await.unwrap();
+            assert!(response.success, "first: {first:?}");
+            assert_eq!(&buf[..], b"prefix:hello dragonfly", "first: {first:?}");
+            assert_eq!(
+                connections.load(std::sync::atomic::Ordering::SeqCst),
+                2,
+                "first: {first:?}"
+            );
+            expect(start.elapsed());
+        }
+    }
+
+    #[tokio::test]
+    async fn get_into_with_endpoints_retries_a_flaky_first_attempt() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let test_cases: Vec<(FlakyFirstConnection, Duration, ExpectElapsed)> = vec![
+            (
+                FlakyFirstConnection::TruncateBody,
+                DEFAULT_REQUEST_TIMEOUT,
+                |_elapsed| {},
+            ),
+            (
+                FlakyFirstConnection::Hang,
+                Duration::from_millis(300),
+                |elapsed| {
+                    assert!(
+                        (Duration::from_millis(300)..Duration::from_millis(900)).contains(&elapsed),
+                        "elapsed: {elapsed:?}"
+                    );
+                },
+            ),
+        ];
+
+        for (first, timeout, expect) in test_cases {
+            let (port, connections) = setup_flaky_seed_peer_proxy(first, "hello dragonfly").await;
+            let proxy = ProxyWithEndpoints::builder()
+                .endpoints(vec![format!("http://127.0.0.1:{port}")])
+                .build()
+                .await
+                .unwrap();
+
+            let request = GetRequest {
+                url: "http://example.com/file.txt".to_string(),
+                timeout,
+                ..Default::default()
+            };
+
+            let start = std::time::Instant::now();
+            let mut buf = BytesMut::from(&b"prefix:"[..]);
+            let response = proxy.get_into(&request, &mut buf).await.unwrap();
+            assert!(response.success, "first: {first:?}");
+            assert_eq!(&buf[..], b"prefix:hello dragonfly", "first: {first:?}");
+            assert_eq!(
+                connections.load(std::sync::atomic::Ordering::SeqCst),
+                2,
+                "first: {first:?}"
+            );
+            expect(start.elapsed());
+        }
+    }
+
+    #[tokio::test]
+    async fn get_with_endpoints_streams_a_truncated_body_without_retrying() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (port, connections) =
+            setup_flaky_seed_peer_proxy(FlakyFirstConnection::TruncateBody, "hello dragonfly")
+                .await;
+        let proxy = ProxyWithEndpoints::builder()
+            .endpoints(vec![format!("http://127.0.0.1:{port}")])
+            .max_retries(3)
+            .build()
+            .await
+            .unwrap();
+
+        let request = GetRequest {
+            url: "http://example.com/file.txt".to_string(),
+            ..Default::default()
+        };
+
+        let response = proxy.get(&request).await.unwrap();
+        assert!(response.success);
+
+        let mut body = response.body.unwrap();
+        let mut content = Vec::new();
+        let err = loop {
+            match body.try_next().await {
+                Ok(Some(chunk)) => content.extend_from_slice(&chunk),
+                Ok(None) => panic!("truncated body must not end cleanly"),
+                Err(err) => break err,
+            }
+        };
+        assert!(matches!(err, Error::Internal(_)), "unexpected: {err:?}");
+        assert!(content.len() < b"hello dragonfly".len());
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn get_with_endpoints_retries_only_transient_answers() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let test_cases = vec![
+            (reqwest::StatusCode::SERVICE_UNAVAILABLE, "backend", 2, 3),
+            (reqwest::StatusCode::SERVICE_UNAVAILABLE, "proxy", 2, 3),
+            (reqwest::StatusCode::INSUFFICIENT_STORAGE, "dfdaemon", 2, 3),
+            (reqwest::StatusCode::UNPROCESSABLE_ENTITY, "dfdaemon", 3, 1),
+            (reqwest::StatusCode::REQUEST_TIMEOUT, "proxy", 1, 2),
+            (reqwest::StatusCode::TOO_MANY_REQUESTS, "backend", 3, 4),
+            (reqwest::StatusCode::TOO_MANY_REQUESTS, "proxy", 3, 4),
+            (reqwest::StatusCode::TOO_MANY_REQUESTS, "proxy", 0, 1),
+            (reqwest::StatusCode::UNAUTHORIZED, "proxy", 3, 1),
+            (reqwest::StatusCode::FORBIDDEN, "proxy", 3, 1),
+            (reqwest::StatusCode::NOT_FOUND, "backend", 3, 1),
+        ];
+
+        for (status, error_type, max_retries, expected_calls) in test_cases {
+            let mut mocks = MockSet::new();
+            mocks.mock(|when, then| {
+                when.get().path("/file.txt");
+                then.status(status)
+                    .headers([("X-Dragonfly-Error-Type", error_type)])
+                    .text("no");
+            });
+            let mock_proxy = setup_mock_seed_peer_proxy(mocks).await.unwrap();
+
+            let proxy = ProxyWithEndpoints::builder()
+                .endpoints(vec![format!(
+                    "http://127.0.0.1:{}",
+                    mock_proxy.port().unwrap()
+                )])
+                .max_retries(max_retries)
+                .build()
+                .await
+                .unwrap();
+
+            let request = GetRequest {
+                url: "http://example.com/file.txt".to_string(),
+                ..Default::default()
+            };
+
+            let err = proxy.get(&request).await.err().unwrap();
+            assert!(
+                err.to_string()
+                    .contains(&format!("status_code: Some({status:?})")),
+                "status: {status}, error_type: {error_type}, error: {err}"
+            );
+            assert_eq!(
+                mock_proxy
+                    .mocks()
+                    .iter()
+                    .map(|mock| mock.match_count())
+                    .sum::<usize>(),
+                expected_calls,
+                "status: {status}, error_type: {error_type}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_error_type_backend() {
+        let mut mocks = MockSet::new();
+        mocks.mock(|when, then| {
+            when.get().path("/file.txt");
+            then.status(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+                .headers([("X-Dragonfly-Error-Type", "backend")])
+                .text("boom");
+        });
+        let mock_proxy = setup_mock_seed_peer_proxy(mocks).await.unwrap();
+
+        let mock_seed_peer = setup_mock_seed_peer(MockSet::new()).await.unwrap();
+        let mock_scheduler = setup_mock_scheduler(vec![create_seed_peer_host(
+            "seed-peer-1",
+            mock_seed_peer.port().unwrap(),
+            mock_proxy.port().unwrap(),
+        )])
+        .await
+        .unwrap();
+
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let request = GetRequest {
+            url: "http://example.com/file.txt".to_string(),
+            replicas: 1,
+            ..Default::default()
+        };
+
+        let result = proxy.get(&request).await;
+        assert!(
+            matches!(result, Err(Error::BackendError(err)) if err.message.as_deref() == Some("boom"))
+        );
+    }
+
+    #[tokio::test]
+    async fn new_with_endpoints_invalid_params() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+        let test_cases = vec![
+            (vec![], 1, true),
+            (vec!["http://127.0.0.1:4001".to_string()], 11, true),
+            (vec!["://".to_string()], 1, false),
+        ];
+
+        for (endpoints, max_retries, expected_invalid_argument) in test_cases {
+            let result = ProxyWithEndpoints::builder()
+                .endpoints(endpoints.clone())
+                .max_retries(max_retries)
+                .build()
+                .await;
+            if expected_invalid_argument {
+                assert!(
+                    matches!(result, Err(Error::InvalidArgument(_))),
+                    "endpoints: {endpoints:?}, max_retries: {max_retries}"
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(Error::Internal(_))),
+                    "endpoints: {endpoints:?}, max_retries: {max_retries}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn get_into_with_endpoints() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut mocks = MockSet::new();
+        mocks.mock(|when, then| {
+            when.get().path("/file.txt");
+            then.text("hello dragonfly");
+        });
+        let mock_proxy = setup_mock_seed_peer_proxy(mocks).await.unwrap();
+
+        let endpoints = vec![
+            "http://127.0.0.1:1".to_string(),
+            format!("http://127.0.0.1:{}", mock_proxy.port().unwrap()),
+        ];
+        let proxy = ProxyWithEndpoints::builder()
+            .endpoints(endpoints)
+            .build()
+            .await
+            .unwrap();
+
+        let request = GetRequest {
+            url: "http://example.com/file.txt".to_string(),
+            ..Default::default()
+        };
+
+        let mut buf = BytesMut::new();
+        let response = proxy.get_into(&request, &mut buf).await.unwrap();
+        assert!(response.success);
+        assert_eq!(response.status_code, Some(reqwest::StatusCode::OK));
+        assert_eq!(&buf[..], b"hello dragonfly");
+    }
+
+    #[tokio::test]
+    async fn new_with_endpoints() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let endpoints = vec![
+            "http://127.0.0.1:4001".to_string(),
+            "http://127.0.0.1:4001".to_string(),
+            "http://127.0.0.1:4002".to_string(),
+        ];
+        let proxy = ProxyWithEndpoints::builder()
+            .endpoints(endpoints.clone())
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(proxy.retry.max_retries, 1);
+        assert_eq!(proxy.endpoints, endpoints);
+        assert_eq!(proxy.clients.len(), 2);
+        assert!(proxy.clients.contains_key("http://127.0.0.1:4001"));
+        assert!(proxy.clients.contains_key("http://127.0.0.1:4002"));
+    }
+
+    #[tokio::test]
+    async fn get_with_endpoints() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut mocks = MockSet::new();
+        mocks.mock(|when, then| {
+            when.get().path("/file.txt");
+            then.text("hello dragonfly");
+        });
+        let mock_proxy = setup_mock_seed_peer_proxy(mocks).await.unwrap();
+
+        let endpoints = vec![
+            "http://127.0.0.1:1".to_string(),
+            format!("http://127.0.0.1:{}", mock_proxy.port().unwrap()),
+        ];
+        let proxy = ProxyWithEndpoints::builder()
+            .endpoints(endpoints)
+            .build()
+            .await
+            .unwrap();
+
+        let request = GetRequest {
+            url: "http://example.com/file.txt".to_string(),
+            ..Default::default()
+        };
+
+        let response = proxy.get(&request).await.unwrap();
+        assert!(response.success);
+        assert_eq!(response.status_code, Some(reqwest::StatusCode::OK));
+
+        let mut body = response.body.unwrap();
+        let mut content = Vec::new();
+        while let Some(chunk) = body.try_next().await.unwrap() {
+            content.extend_from_slice(&chunk);
+        }
+        assert_eq!(content, b"hello dragonfly");
+    }
+
+    #[tokio::test]
+    async fn get_with_endpoints_all_endpoints_down() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let proxy = ProxyWithEndpoints::builder()
+            .endpoints(vec!["http://127.0.0.1:1".to_string()])
+            .build()
+            .await
+            .unwrap();
+
+        let request = GetRequest {
+            url: "http://example.com/file.txt".to_string(),
+            ..Default::default()
+        };
+
+        let result = proxy.get(&request).await;
+        assert!(matches!(result, Err(Error::Internal(_))));
+    }
+
+    #[tokio::test]
+    async fn get_with_endpoints_invalid_replicas() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let proxy = ProxyWithEndpoints::builder()
+            .endpoints(vec!["http://127.0.0.1:4001".to_string()])
+            .build()
+            .await
+            .unwrap();
+
+        let request = GetRequest {
+            url: "http://example.com/file.txt".to_string(),
+            replicas: 0,
+            ..Default::default()
+        };
+
+        let result = proxy.get(&request).await;
+        assert!(matches!(result, Err(Error::InvalidArgument(_))));
+    }
+
+    #[tokio::test]
+    async fn get_with_endpoints_error_type_backend() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut mocks = MockSet::new();
+        mocks.mock(|when, then| {
+            when.get().path("/file.txt");
+            then.status(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+                .headers([("X-Dragonfly-Error-Type", "backend")])
+                .text("boom");
+        });
+        let mock_proxy = setup_mock_seed_peer_proxy(mocks).await.unwrap();
+
+        let proxy = ProxyWithEndpoints::builder()
+            .endpoints(vec![format!(
+                "http://127.0.0.1:{}",
+                mock_proxy.port().unwrap()
+            )])
+            .build()
+            .await
+            .unwrap();
+
+        let request = GetRequest {
+            url: "http://example.com/file.txt".to_string(),
+            ..Default::default()
+        };
+
+        let result = proxy.get(&request).await;
+        assert!(
+            matches!(result, Err(Error::BackendError(err)) if err.message.as_deref() == Some("boom"))
+        );
+    }
+
+    #[tokio::test]
+    async fn get_invalid_replicas() {
+        let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let request = GetRequest {
+            url: "http://example.com/file.txt".to_string(),
+            replicas: 0,
+            ..Default::default()
+        };
+
+        let result = proxy.get(&request).await;
+        assert!(matches!(result, Err(Error::InvalidArgument(_))));
+    }
+
+    #[tokio::test]
+    async fn preheat_and_get_hit_same_seed_peers() {
+        let cases = [
+            ("http://example.com/replicas-1.txt", 1, vec!["seed-peer-1"]),
+            (
+                "http://example.com/replicas-2.txt",
+                2,
+                vec!["seed-peer-1", "seed-peer-2"],
+            ),
+            (
+                "http://example.com/replicas-3.txt",
+                3,
+                vec!["seed-peer-1", "seed-peer-2", "seed-peer-3"],
+            ),
+        ];
+
+        for (url, replicas, expected) in cases {
+            let path = url.strip_prefix("http://example.com").unwrap();
+            let mut hosts = Vec::new();
+            let mut servers = Vec::new();
+            let mut proxy_servers = Vec::new();
+            for name in ["seed-peer-1", "seed-peer-2", "seed-peer-3"] {
+                let mut mocks = MockSet::new();
+                if expected.contains(&name) {
+                    mocks.mock(|when, then| {
+                        when.path("/dfdaemon.v2.DfdaemonUpload/DownloadTask");
+                        then.pb_stream(vec![DownloadTaskResponse {
+                            host_id: name.to_string(),
+                            task_id: "task-1".to_string(),
+                            peer_id: "peer-1".to_string(),
+                            ..Default::default()
+                        }]);
+                    });
+                }
+                let seed_peer = setup_mock_seed_peer(mocks).await.unwrap();
+
+                let mut proxy_mocks = MockSet::new();
+                proxy_mocks.mock(|when, then| {
+                    when.get().path(path);
+                    then.status(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+                        .text(name);
+                });
+                let seed_peer_proxy = setup_mock_seed_peer_proxy(proxy_mocks).await.unwrap();
+
+                hosts.push(create_seed_peer_host(
+                    name,
+                    seed_peer.port().unwrap(),
+                    seed_peer_proxy.port().unwrap(),
+                ));
+                servers.push(seed_peer);
+                proxy_servers.push((name, seed_peer_proxy));
+            }
+
+            let mock_scheduler = setup_mock_scheduler(hosts).await.unwrap();
+            let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+
+            let proxy = Proxy::builder()
+                .scheduler_endpoint(scheduler_endpoint)
+                .max_retries(2)
+                .build()
+                .await
+                .unwrap();
+
+            let preheat_request = PreheatRequest {
+                url: url.to_string(),
+                replicas,
+                ..Default::default()
+            };
+            proxy.preheat(&preheat_request).await.unwrap();
+
+            let request = GetRequest {
+                url: url.to_string(),
+                replicas,
+                ..Default::default()
+            };
+
+            let mut buf = BytesMut::new();
+            let result = proxy.get_into(&request, &mut buf).await;
+            assert!(result.is_err());
+
+            for (name, server) in proxy_servers.iter() {
+                let hits: usize = server.mocks().iter().map(|mock| mock.match_count()).sum();
+                if expected.contains(name) {
+                    assert!(hits >= 1, "{url}: expected seed peer {name} to be hit");
+                } else {
+                    assert_eq!(hits, 0, "{url}: unexpected seed peer {name} was hit");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn lookup_endpoints_returns_the_selected_seed_peers() {
+        let mut servers = Vec::new();
+        let mut endpoints = std::collections::HashMap::new();
+        let mut hosts = Vec::new();
+        for (i, name) in ["seed-peer-1", "seed-peer-2", "seed-peer-3"]
+            .into_iter()
+            .enumerate()
+        {
+            let server = setup_mock_seed_peer(MockSet::new()).await.unwrap();
+            let proxy_port = 4001 + i as u16;
+            endpoints.insert(name, format!("http://127.0.0.1:{proxy_port}"));
+            hosts.push(create_seed_peer_host(
+                name,
+                server.port().unwrap(),
+                proxy_port,
+            ));
+            servers.push(server);
+        }
+
+        let mock_scheduler = setup_mock_scheduler(hosts).await.unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let blob_url = "http://registry.example.com/v2/library/ubuntu/blobs/sha256:b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e";
+        let cases = [
+            (
+                GetRequest {
+                    url: "https://example.com/file.txt?Expires=e1&Signature=s1&foo=bar".to_string(),
+                    piece_length: Some(4194304),
+                    tag: Some("tag-a".to_string()),
+                    application: Some("app-a".to_string()),
+                    filtered_query_params: vec!["Expires".to_string(), "Signature".to_string()],
+                    replicas: 3,
+                    ..Default::default()
+                },
+                vec!["seed-peer-3", "seed-peer-2", "seed-peer-1"],
+            ),
+            (
+                GetRequest {
+                    url: "https://example.com/file.txt?Expires=e2&Signature=s2&foo=bar".to_string(),
+                    piece_length: Some(4194304),
+                    tag: Some("tag-a".to_string()),
+                    application: Some("app-a".to_string()),
+                    filtered_query_params: vec!["Expires".to_string(), "Signature".to_string()],
+                    replicas: 3,
+                    ..Default::default()
+                },
+                vec!["seed-peer-3", "seed-peer-2", "seed-peer-1"],
+            ),
+            (
+                GetRequest {
+                    url: "https://example.com/file.txt".to_string(),
+                    ..Default::default()
+                },
+                vec!["seed-peer-1", "seed-peer-2"],
+            ),
+            (
+                GetRequest {
+                    url: "https://example.com/file.txt".to_string(),
+                    replicas: 1,
+                    ..Default::default()
+                },
+                vec!["seed-peer-1"],
+            ),
+            (
+                GetRequest {
+                    url: "https://example.com/file.txt".to_string(),
+                    tag: Some("tag-a".to_string()),
+                    ..Default::default()
+                },
+                vec!["seed-peer-3", "seed-peer-2"],
+            ),
+            (
+                GetRequest {
+                    url: "https://example.com/file.txt".to_string(),
+                    tag: Some("tag-b".to_string()),
+                    ..Default::default()
+                },
+                vec!["seed-peer-2", "seed-peer-1"],
+            ),
+            (
+                GetRequest {
+                    url: "https://example.com/file.txt".to_string(),
+                    application: Some("app-a".to_string()),
+                    ..Default::default()
+                },
+                vec!["seed-peer-1", "seed-peer-3"],
+            ),
+            (
+                GetRequest {
+                    url: "https://example.com/file.txt".to_string(),
+                    content_for_calculating_task_id: Some("This is a test file".to_string()),
+                    replicas: 3,
+                    ..Default::default()
+                },
+                vec!["seed-peer-2", "seed-peer-3", "seed-peer-1"],
+            ),
+            (
+                GetRequest {
+                    url: blob_url.to_string(),
+                    replicas: 3,
+                    ..Default::default()
+                },
+                vec!["seed-peer-3", "seed-peer-2", "seed-peer-1"],
+            ),
+            (
+                GetRequest {
+                    url: blob_url.to_string(),
+                    enable_task_id_based_blob_digest: false,
+                    ..Default::default()
+                },
+                vec!["seed-peer-3", "seed-peer-1"],
+            ),
+        ];
+
+        for (request, expected_names) in cases {
+            let expected: Vec<String> = expected_names
+                .iter()
+                .map(|name| endpoints[name].clone())
+                .collect();
+            assert_eq!(proxy.lookup_endpoints(&request).await.unwrap(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn lookup_endpoints_no_available_seed_peers() {
+        let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let request = GetRequest {
+            url: "http://example.com/payload.txt".to_string(),
+            ..Default::default()
+        };
+
+        let result = proxy.lookup_endpoints(&request).await;
+        assert!(
+            matches!(result, Err(Error::Internal(message)) if message.contains("failed to select seed peers"))
+        );
+    }
+
+    #[tokio::test]
+    async fn preheat_retries_on_the_same_seed_peer() {
+        let mut failing_mocks = MockSet::new();
+        failing_mocks.mock(|when, then| {
+            when.path("/dfdaemon.v2.DfdaemonUpload/DownloadTask");
+            then.error(StatusCode::SERVICE_UNAVAILABLE, "seed peer is busy");
+        });
+        let failing_seed_peer = setup_mock_seed_peer(failing_mocks).await.unwrap();
+
+        let mut healthy_mocks = MockSet::new();
+        healthy_mocks.mock(|when, then| {
+            when.path("/dfdaemon.v2.DfdaemonUpload/DownloadTask");
+            then.pb_stream(vec![DownloadTaskResponse {
+                host_id: "seed-peer-2".to_string(),
+                task_id: "task-1".to_string(),
+                peer_id: "peer-1".to_string(),
+                ..Default::default()
+            }]);
+        });
+        let healthy_seed_peer = setup_mock_seed_peer(healthy_mocks).await.unwrap();
+
+        let mock_scheduler = setup_mock_scheduler(vec![
+            create_seed_peer_host("seed-peer-1", failing_seed_peer.port().unwrap(), 0),
+            create_seed_peer_host("seed-peer-2", healthy_seed_peer.port().unwrap(), 0),
+        ])
+        .await
+        .unwrap();
+
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .max_retries(2)
+            .build()
+            .await
+            .unwrap();
+
+        let request = PreheatRequest {
+            url: "http://example.com/payload.txt".to_string(),
+            replicas: 2,
+            ..Default::default()
+        };
+
+        let result = proxy.preheat(&request).await;
+        assert!(
+            matches!(&result, Err(Error::TonicStatus(status)) if status.code() == tonic::Code::Unavailable),
+            "unexpected: {result:?}"
+        );
+        assert_eq!(seed_peer_calls(&failing_seed_peer), 3);
+        assert_eq!(seed_peer_calls(&healthy_seed_peer), 1);
+    }
+
+    #[tokio::test]
+    async fn preheat_retries_only_transient_download_failures() {
+        let test_cases = vec![
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                None,
+                2,
+                tonic::Code::Internal,
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some(2),
+                3,
+                tonic::Code::Unavailable,
+            ),
+            (StatusCode::NOT_FOUND, Some(3), 1, tonic::Code::NotFound),
+            (
+                StatusCode::FORBIDDEN,
+                Some(3),
+                1,
+                tonic::Code::PermissionDenied,
+            ),
+        ];
+
+        for (status, max_retries, expected_calls, expected_code) in test_cases {
+            let mut mocks = MockSet::new();
+            mocks.mock(|when, then| {
+                when.path("/dfdaemon.v2.DfdaemonUpload/DownloadTask");
+                then.error(status.clone(), "download failed");
+            });
+
+            let mock_seed_peer = setup_mock_seed_peer(mocks).await.unwrap();
+            let mock_scheduler = setup_mock_scheduler(vec![create_seed_peer_host(
+                "seed-peer-1",
+                mock_seed_peer.port().unwrap(),
+                0,
+            )])
+            .await
+            .unwrap();
+
+            let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+            let mut builder = Proxy::builder()
+                .scheduler_endpoint(scheduler_endpoint)
+                .backoff(
+                    ExponentialBuilder::new()
+                        .with_min_delay(Duration::from_millis(1))
+                        .with_max_delay(Duration::from_millis(2)),
+                );
+            if let Some(max_retries) = max_retries {
+                builder = builder.max_retries(max_retries);
+            }
+            let proxy = builder.build().await.unwrap();
+
+            let request = PreheatRequest {
+                url: "http://example.com/payload.txt".to_string(),
+                replicas: 1,
+                ..Default::default()
+            };
+
+            let result = proxy.preheat(&request).await;
+            assert!(
+                matches!(&result, Err(Error::TonicStatus(got)) if got.code() == expected_code),
+                "status: {status:?}, unexpected: {result:?}"
+            );
+            assert_eq!(
+                seed_peer_calls(&mock_seed_peer),
+                expected_calls,
+                "status: {status:?}"
+            );
+        }
+    }
+
+    fn seed_peer_calls(seed_peer: &mocktail::server::MockServer) -> usize {
+        seed_peer
+            .mocks()
+            .iter()
+            .next()
+            .map(|mock| mock.match_count() / 2)
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn delete_no_available_seed_peers() {
+        let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let request = DeleteRequest {
+            url: "http://example.com/payload.txt".to_string(),
+            ..Default::default()
+        };
+
+        let result = proxy.delete(&request).await;
+        assert!(
+            matches!(result, Err(Error::Internal(message)) if message.contains("failed to select seed peers"))
+        );
+    }
+
+    #[tokio::test]
+    async fn preheat_and_delete_hit_same_seed_peers() {
+        let cases = [
+            ("http://example.com/replicas-1.txt", 1, vec!["seed-peer-1"]),
+            (
+                "http://example.com/replicas-2.txt",
+                2,
+                vec!["seed-peer-1", "seed-peer-2"],
+            ),
+            (
+                "http://example.com/replicas-3.txt",
+                3,
+                vec!["seed-peer-1", "seed-peer-2", "seed-peer-3"],
+            ),
+        ];
+
+        for (url, replicas, expected) in cases {
+            let mut hosts = Vec::new();
+            let mut servers = Vec::new();
+            for name in ["seed-peer-1", "seed-peer-2", "seed-peer-3"] {
+                let mut mocks = MockSet::new();
+                mocks.mock(|when, then| {
+                    when.path("/dfdaemon.v2.DfdaemonUpload/DeleteTask");
+                    then.pb(());
+                });
+                if expected.contains(&name) {
+                    mocks.mock(|when, then| {
+                        when.path("/dfdaemon.v2.DfdaemonUpload/DownloadTask");
+                        then.pb_stream(vec![DownloadTaskResponse {
+                            host_id: name.to_string(),
+                            task_id: "task-1".to_string(),
+                            peer_id: "peer-1".to_string(),
+                            ..Default::default()
+                        }]);
+                    });
+                }
+                let seed_peer = setup_mock_seed_peer(mocks).await.unwrap();
+
+                hosts.push(create_seed_peer_host(name, seed_peer.port().unwrap(), 0));
+                servers.push((name, seed_peer));
+            }
+
+            let mock_scheduler = setup_mock_scheduler(hosts).await.unwrap();
+            let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+            let proxy = Proxy::builder()
+                .scheduler_endpoint(scheduler_endpoint)
+                .build()
+                .await
+                .unwrap();
+
+            let preheat_request = PreheatRequest {
+                url: url.to_string(),
+                replicas,
+                ..Default::default()
+            };
+            proxy.preheat(&preheat_request).await.unwrap();
+
+            let delete_request = DeleteRequest {
+                url: url.to_string(),
+                replicas,
+                ..Default::default()
+            };
+            proxy.delete(&delete_request).await.unwrap();
+
+            for (name, server) in servers.iter() {
+                let expected_calls = usize::from(expected.contains(name));
+                assert_eq!(
+                    seed_peer_calls(server),
+                    expected_calls,
+                    "{url}: seed peer {name}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn preheat_and_delete_all_seed_peers() {
+        let mut hosts = Vec::new();
+        let mut servers = Vec::new();
+        for name in ["seed-peer-1", "seed-peer-2", "seed-peer-3"] {
+            let mut mocks = MockSet::new();
+            mocks.mock(|when, then| {
+                when.path("/dfdaemon.v2.DfdaemonUpload/DownloadTask");
+                then.pb_stream(vec![DownloadTaskResponse {
+                    host_id: name.to_string(),
+                    task_id: "task-1".to_string(),
+                    peer_id: "peer-1".to_string(),
+                    ..Default::default()
+                }]);
+            });
+            mocks.mock(|when, then| {
+                when.path("/dfdaemon.v2.DfdaemonUpload/DeleteTask");
+                then.pb(());
+            });
+            let seed_peer = setup_mock_seed_peer(mocks).await.unwrap();
+
+            hosts.push(create_seed_peer_host(name, seed_peer.port().unwrap(), 0));
+            servers.push((name, seed_peer));
+        }
+
+        let mock_scheduler = setup_mock_scheduler(hosts).await.unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let url = "https://example.com/v2/foo/bar/blobs/sha256:b5f4dfca35398b36f61baa60e2bf2c242401c9d7db3de9168dcf780a2feedd2d";
+        let preheat_request = PreheatRequest {
+            url: url.to_string(),
+            replicas: 1,
+            scope: Scope::AllSeedPeers,
+            ..Default::default()
+        };
+        proxy.preheat(&preheat_request).await.unwrap();
+
+        let delete_request = DeleteRequest {
+            url: url.to_string(),
+            replicas: 1,
+            scope: Scope::AllSeedPeers,
+            ..Default::default()
+        };
+        proxy.delete(&delete_request).await.unwrap();
+
+        for (name, server) in servers.iter() {
+            for mock in server.mocks().iter().take(2) {
+                assert_eq!(mock.match_count() / 2, 1, "seed peer {name}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_retries_only_transient_delete_failures() {
+        let test_cases = vec![
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                None,
+                2,
+                Some(tonic::Code::Internal),
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some(2),
+                3,
+                Some(tonic::Code::Unavailable),
+            ),
+            (StatusCode::NOT_FOUND, Some(3), 1, None),
+            (
+                StatusCode::FORBIDDEN,
+                Some(3),
+                1,
+                Some(tonic::Code::PermissionDenied),
+            ),
+        ];
+
+        for (status, max_retries, expected_calls, expected_code) in test_cases {
+            let mut mocks = MockSet::new();
+            mocks.mock(|when, then| {
+                when.path("/dfdaemon.v2.DfdaemonUpload/DeleteTask");
+                then.error(status.clone(), "delete failed");
+            });
+
+            let mock_seed_peer = setup_mock_seed_peer(mocks).await.unwrap();
+            let mock_scheduler = setup_mock_scheduler(vec![create_seed_peer_host(
+                "seed-peer-1",
+                mock_seed_peer.port().unwrap(),
+                0,
+            )])
+            .await
+            .unwrap();
+
+            let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+            let mut builder = Proxy::builder()
+                .scheduler_endpoint(scheduler_endpoint)
+                .backoff(
+                    ExponentialBuilder::new()
+                        .with_min_delay(Duration::from_millis(1))
+                        .with_max_delay(Duration::from_millis(2)),
+                );
+            if let Some(max_retries) = max_retries {
+                builder = builder.max_retries(max_retries);
+            }
+            let proxy = builder.build().await.unwrap();
+
+            let request = DeleteRequest {
+                url: "http://example.com/payload.txt".to_string(),
+                replicas: 1,
+                ..Default::default()
+            };
+
+            let result = proxy.delete(&request).await;
+            match expected_code {
+                Some(expected_code) => assert!(
+                    matches!(&result, Err(Error::TonicStatus(got)) if got.code() == expected_code),
+                    "status: {status:?}, unexpected: {result:?}"
+                ),
+                None => assert!(result.is_ok(), "status: {status:?}, unexpected: {result:?}"),
+            }
+            assert_eq!(
+                seed_peer_calls(&mock_seed_peer),
+                expected_calls,
+                "status: {status:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "preheat")]
+    #[tokio::test]
+    async fn preheat_image_invalid_reference() {
+        let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let request = PreheatImageRequest {
+            image: "invalid image reference!!".to_string(),
+            ..Default::default()
+        };
+
+        let result = proxy.preheat_image(&request).await;
+        assert!(
+            matches!(result, Err(Error::InvalidArgument(message)) if message.contains("invalid image reference"))
+        );
+    }
+
+    #[cfg(feature = "preheat")]
+    #[tokio::test]
+    async fn preheat_image_invalid_platform() {
+        let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let request = PreheatImageRequest {
+            image: "docker.io/library/nginx:latest".to_string(),
+            platform: Some("linux-amd64".to_string()),
+            ..Default::default()
+        };
+
+        let result = proxy.preheat_image(&request).await;
+        assert!(
+            matches!(result, Err(Error::InvalidArgument(message)) if message.contains("invalid platform format"))
+        );
+    }
+
+    #[cfg(feature = "preheat")]
+    #[tokio::test]
+    async fn preheat_image_unreachable_registry() {
+        let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let request = PreheatImageRequest {
+            image: "127.0.0.1:1/library/nginx:latest".to_string(),
+            ..Default::default()
+        };
+
+        let result = proxy.preheat_image(&request).await;
+        assert!(
+            matches!(result, Err(Error::Internal(message)) if message.contains("failed to pull image manifest"))
+        );
+    }
+
+    #[cfg(feature = "preheat")]
+    #[tokio::test]
+    async fn stat_image_queries_seed_peers() {
+        use dragonfly_api::scheduler::v2::{
+            Image as ApiImage, Layer as ApiLayer, PeerImage as ApiPeerImage,
+            StatImageResponse as ApiStatImageResponse,
+        };
+
+        let mut mocks = MockSet::new();
+        mocks.mock(|when, then| {
+            when.path("/scheduler.v2.Scheduler/StatImage")
+                .pb(SchedulerStatImageRequest {
+                    url: "https://example.com/v2/foo/bar/manifests/1.0".to_string(),
+                    piece_length: Some(4194304),
+                    tag: Some("stat".to_string()),
+                    application: Some("dfctl".to_string()),
+                    filtered_query_params: default_proxy_rule_filtered_query_params(),
+                    username: Some("user".to_string()),
+                    password: Some("pass".to_string()),
+                    platform: Some("linux/amd64".to_string()),
+                    timeout: Some(
+                        prost_wkt_types::Duration::try_from(DEFAULT_REQUEST_TIMEOUT).unwrap(),
+                    ),
+                    scope: STAT_IMAGE_SCOPE_ALL_SEED_PEERS.to_string(),
+                    enable_task_id_based_blob_digest: true,
+                    ..Default::default()
+                });
+            then.pb(ApiStatImageResponse {
+                image: Some(ApiImage {
+                    layers: vec![
+                        ApiLayer {
+                            url: "https://example.com/v2/foo/bar/blobs/sha256:b5f4dfca35398b36f61baa60e2bf2c242401c9d7db3de9168dcf780a2feedd2d".to_string(),
+                            ..Default::default()
+                        },
+                        ApiLayer {
+                            url: "https://example.com/v2/foo/bar/blobs/sha256:150b7321c0794448817b19fab51e415ff406ac8663c4f53d64c3590454dee201".to_string(),
+                            ..Default::default()
+                        },
+                    ],
+                }),
+                peers: vec![ApiPeerImage {
+                    ip: "127.0.0.1".to_string(),
+                    hostname: "seed-peer-1".to_string(),
+                    cached_layers: vec![
+                        ApiLayer {
+                            url: "https://example.com/v2/foo/bar/blobs/sha256:b5f4dfca35398b36f61baa60e2bf2c242401c9d7db3de9168dcf780a2feedd2d".to_string(),
+                            is_finished: Some(true),
+                        },
+                        ApiLayer {
+                            url: "https://example.com/v2/foo/bar/blobs/sha256:150b7321c0794448817b19fab51e415ff406ac8663c4f53d64c3590454dee201".to_string(),
+                            ..Default::default()
+                        },
+                    ],
+                }],
+            });
+        });
+
+        let mock_scheduler = setup_mock_scheduler_with_mocks(vec![], mocks)
+            .await
+            .unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let request = StatImageRequest {
+            image: "example.com/foo/bar:1.0".to_string(),
+            username: Some("user".to_string()),
+            password: Some("pass".to_string()),
+            platform: Some("linux/amd64".to_string()),
+            piece_length: Some(4194304),
+            tag: Some("stat".to_string()),
+            application: Some("dfctl".to_string()),
+            ..Default::default()
+        };
+
+        let response = proxy.stat_image(&request).await.unwrap();
+        assert_eq!(response.layers.len(), 2);
+        assert_eq!(response.peers.len(), 1);
+        assert_eq!(response.peers[0].ip, "127.0.0.1");
+        assert_eq!(response.peers[0].hostname, "seed-peer-1");
+        assert_eq!(response.peers[0].cached_layers.len(), 2);
+        assert!(response.peers[0].cached_layers[0].is_finished);
+        assert!(!response.peers[0].cached_layers[1].is_finished);
+    }
+
+    #[cfg(feature = "preheat")]
+    #[tokio::test]
+    async fn stat_image_omits_empty_optional_fields() {
+        use dragonfly_api::scheduler::v2::StatImageResponse as ApiStatImageResponse;
+        let mut mocks = MockSet::new();
+        mocks.mock(|when, then| {
+            when.path("/scheduler.v2.Scheduler/StatImage")
+                .pb(SchedulerStatImageRequest {
+                    url: "https://example.com/v2/foo/bar/manifests/1.0".to_string(),
+                    filtered_query_params: default_proxy_rule_filtered_query_params(),
+                    timeout: Some(
+                        prost_wkt_types::Duration::try_from(DEFAULT_REQUEST_TIMEOUT).unwrap(),
+                    ),
+                    scope: STAT_IMAGE_SCOPE_ALL_SEED_PEERS.to_string(),
+                    enable_task_id_based_blob_digest: true,
+                    ..Default::default()
+                });
+            then.pb(ApiStatImageResponse::default());
+        });
+
+        let mock_scheduler = setup_mock_scheduler_with_mocks(vec![], mocks)
+            .await
+            .unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let request = StatImageRequest {
+            image: "example.com/foo/bar:1.0".to_string(),
+            ..Default::default()
+        };
+
+        let response = proxy.stat_image(&request).await.unwrap();
+        assert!(response.layers.is_empty());
+        assert!(response.peers.is_empty());
+    }
+
+    #[cfg(feature = "preheat")]
+    #[tokio::test]
+    async fn stat_image_with_digest_reference() {
+        use dragonfly_api::scheduler::v2::StatImageResponse as ApiStatImageResponse;
+
+        let mut mocks = MockSet::new();
+        mocks.mock(|when, then| {
+            when.path("/scheduler.v2.Scheduler/StatImage")
+                .pb(SchedulerStatImageRequest {
+                    url: "https://example.com/v2/foo/bar/manifests/sha256:b5f4dfca35398b36f61baa60e2bf2c242401c9d7db3de9168dcf780a2feedd2d".to_string(),
+                    filtered_query_params: default_proxy_rule_filtered_query_params(),
+                    timeout: Some(
+                        prost_wkt_types::Duration::try_from(DEFAULT_REQUEST_TIMEOUT).unwrap(),
+                    ),
+                    scope: STAT_IMAGE_SCOPE_ALL_SEED_PEERS.to_string(),
+                    enable_task_id_based_blob_digest: true,
+                    ..Default::default()
+                });
+            then.pb(ApiStatImageResponse::default());
+        });
+
+        let mock_scheduler = setup_mock_scheduler_with_mocks(vec![], mocks)
+            .await
+            .unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let request = StatImageRequest {
+            image: "example.com/foo/bar@sha256:b5f4dfca35398b36f61baa60e2bf2c242401c9d7db3de9168dcf780a2feedd2d"
+                .to_string(),
+            ..Default::default()
+        };
+
+        let response = proxy.stat_image(&request).await.unwrap();
+        assert!(response.layers.is_empty());
+        assert!(response.peers.is_empty());
+    }
+
+    #[cfg(feature = "preheat")]
+    #[tokio::test]
+    async fn stat_image_normalizes_docker_hub_reference() {
+        use dragonfly_api::scheduler::v2::StatImageResponse as ApiStatImageResponse;
+
+        // The manifest url must be identical to the one generated by the Go
+        // implementation for the same image reference.
+        let mut mocks = MockSet::new();
+        mocks.mock(|when, then| {
+            when.path("/scheduler.v2.Scheduler/StatImage")
+                .pb(SchedulerStatImageRequest {
+                    url: "https://registry-1.docker.io/v2/library/nginx/manifests/latest"
+                        .to_string(),
+                    filtered_query_params: default_proxy_rule_filtered_query_params(),
+                    timeout: Some(
+                        prost_wkt_types::Duration::try_from(DEFAULT_REQUEST_TIMEOUT).unwrap(),
+                    ),
+                    scope: STAT_IMAGE_SCOPE_ALL_SEED_PEERS.to_string(),
+                    enable_task_id_based_blob_digest: true,
+                    ..Default::default()
+                });
+            then.pb(ApiStatImageResponse::default());
+        });
+
+        let mock_scheduler = setup_mock_scheduler_with_mocks(vec![], mocks)
+            .await
+            .unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let request = StatImageRequest {
+            image: "nginx".to_string(),
+            ..Default::default()
+        };
+
+        let response = proxy.stat_image(&request).await.unwrap();
+        assert!(response.layers.is_empty());
+        assert!(response.peers.is_empty());
+    }
+
+    #[cfg(feature = "preheat")]
+    #[tokio::test]
+    async fn stat_image_invalid_reference() {
+        let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let request = StatImageRequest {
+            image: "INVALID IMAGE".to_string(),
+            ..Default::default()
+        };
+
+        let result = proxy.stat_image(&request).await;
+        assert!(matches!(result, Err(Error::InvalidArgument(_))));
+    }
+
+    #[cfg(feature = "preheat")]
+    #[tokio::test]
+    async fn stat_image_scheduler_error() {
+        let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let request = StatImageRequest {
+            image: "example.com/foo/bar:1.0".to_string(),
+            timeout: Duration::from_secs(5),
+            ..Default::default()
+        };
+
+        let result = proxy.stat_image(&request).await;
+        assert!(
+            matches!(result, Err(Error::Internal(message)) if message.contains("failed to stat image"))
+        );
+    }
+
+    #[cfg(feature = "preheat")]
+    #[tokio::test]
+    async fn stat_image_scheduler_invalid_argument() {
+        let mut mocks = MockSet::new();
+        mocks.mock(|when, then| {
+            when.path("/scheduler.v2.Scheduler/StatImage");
+            then.unprocessable_content();
+        });
+
+        let mock_scheduler = setup_mock_scheduler_with_mocks(vec![], mocks)
+            .await
+            .unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let request = StatImageRequest {
+            image: "example.com/foo/bar:1.0".to_string(),
+            ..Default::default()
+        };
+
+        let result = proxy.stat_image(&request).await;
+        assert!(
+            matches!(result, Err(Error::InvalidArgument(message)) if message.contains("failed to stat image"))
+        );
+    }
+
+    #[cfg(feature = "preheat")]
+    #[tokio::test]
+    async fn delete_image_invalid_reference() {
+        let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let result = proxy
+            .delete_image(&DeleteImageRequest {
+                image: "invalid image reference!!".to_string(),
+                ..Default::default()
+            })
+            .await;
+        assert!(
+            matches!(result, Err(Error::InvalidArgument(message)) if message.contains("invalid image reference"))
+        );
+    }
+
+    #[cfg(feature = "preheat")]
+    #[tokio::test]
+    async fn delete_image_invalid_arguments() {
+        let test_cases = vec![
+            DeleteImageRequest {
+                image: "docker.io/library/nginx:latest".to_string(),
+                replicas: 0,
+                ..Default::default()
+            },
+            DeleteImageRequest {
+                image: "docker.io/library/nginx:latest".to_string(),
+                concurrent_task_count: 0,
+                ..Default::default()
+            },
+        ];
+
+        let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        for request in test_cases {
+            let result = proxy.delete_image(&request).await;
+            assert!(matches!(result, Err(Error::InvalidArgument(_))));
+        }
+    }
+
+    #[cfg(feature = "preheat")]
+    #[tokio::test]
+    async fn delete_image_invalid_platform() {
+        let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let result = proxy
+            .delete_image(&DeleteImageRequest {
+                image: "docker.io/library/nginx:latest".to_string(),
+                platform: Some("linux-amd64".to_string()),
+                ..Default::default()
+            })
+            .await;
+        assert!(
+            matches!(result, Err(Error::InvalidArgument(message)) if message.contains("invalid platform format"))
+        );
+    }
+
+    #[cfg(feature = "preheat")]
+    #[tokio::test]
+    async fn delete_image_unreachable_registry() {
+        let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let result = proxy
+            .delete_image(&DeleteImageRequest {
+                image: "127.0.0.1:1/library/nginx:latest".to_string(),
+                ..Default::default()
+            })
+            .await;
+        assert!(
+            matches!(result, Err(Error::Internal(message)) if message.contains("failed to pull image manifest"))
+        );
+    }
+
+    #[tokio::test]
+    async fn client_pool_get_or_create() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let pool = PoolBuilder::new(HTTPClientFactory {})
+            .capacity(10)
+            .idle_timeout(Duration::from_secs(600))
+            .build();
+
+        assert_eq!(pool.size().await, 0);
+
+        let addr = "http://proxy1.com".to_string();
+        let _ = pool.entry(&addr, &addr).await.unwrap();
+        assert_eq!(pool.size().await, 1);
+
+        let _ = pool.entry(&addr, &addr).await.unwrap();
+        assert_eq!(pool.size().await, 1);
+
+        let addr = "http://proxy2.com".to_string();
+        let _ = pool.entry(&addr, &addr).await.unwrap();
+        assert_eq!(pool.size().await, 2);
+    }
+
+    #[tokio::test]
+    async fn client_pool_cleanup() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let pool = PoolBuilder::new(HTTPClientFactory {})
+            .capacity(10)
+            .idle_timeout(Duration::from_millis(10))
+            .build();
+
+        let addr = "http://proxy1.com".to_string();
+        let _ = pool.entry(&addr, &addr).await.unwrap();
+        assert_eq!(pool.size().await, 1);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let addr = "http://proxy2.com".to_string();
+        let _ = pool.entry(&addr, &addr).await.unwrap();
+        assert_eq!(pool.size().await, 1);
+    }
+}

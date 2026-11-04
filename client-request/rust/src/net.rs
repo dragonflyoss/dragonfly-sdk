@@ -1,0 +1,88 @@
+/*
+ *     Copyright 2026 The Dragonfly Authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+use local_ip_address::{local_ip, local_ipv6};
+use std::net::IpAddr;
+
+/// Formats an IP address and port into a socket address string.
+///
+/// IPv4 addresses are formatted as `ip:port` (e.g., "192.168.1.1:8080")
+/// IPv6 addresses are formatted as `[ip]:port` (e.g., "[::1]:8080")
+pub(crate) fn format_socket_addr(ip: IpAddr, port: u16) -> String {
+    match ip {
+        IpAddr::V4(v4) => format!("{v4}:{port}"),
+        IpAddr::V6(v6) => format!("[{v6}]:{port}"),
+    }
+}
+
+/// Formats a complete URL with scheme, IP address, and port.
+pub(crate) fn format_url(scheme: &str, ip: IpAddr, port: u16) -> String {
+    format!("{}://{}", scheme, format_socket_addr(ip, port))
+}
+
+/// Get the local IP address of the machine.
+///
+/// Attempts to retrieve the local IPv4 address first. If unavailable or if the
+/// operation fails, falls back to attempting IPv6 address retrieval.
+pub(crate) fn preferred_local_ip() -> Option<IpAddr> {
+    local_ip().ok().or_else(|| local_ipv6().ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn format_socket_addr_brackets_ipv6() {
+        let test_cases = vec![
+            ("127.0.0.1", 80, "127.0.0.1:80"),
+            ("192.168.1.1", 8080, "192.168.1.1:8080"),
+            ("::1", 80, "[::1]:80"),
+            ("2001:db8::1", 8080, "[2001:db8::1]:8080"),
+        ];
+
+        for (ip, port, expected) in test_cases {
+            assert_eq!(
+                format_socket_addr(IpAddr::from_str(ip).unwrap(), port),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn format_url_brackets_ipv6() {
+        let test_cases = vec![
+            ("http", "127.0.0.1", 80, "http://127.0.0.1:80"),
+            ("https", "192.168.1.1", 443, "https://192.168.1.1:443"),
+            ("http", "::1", 80, "http://[::1]:80"),
+            ("https", "2001:db8::1", 443, "https://[2001:db8::1]:443"),
+        ];
+
+        for (scheme, ip, port, expected) in test_cases {
+            assert_eq!(
+                format_url(scheme, IpAddr::from_str(ip).unwrap(), port),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn preferred_local_ip_is_found() {
+        let ip = preferred_local_ip();
+        assert!(ip.is_some());
+    }
+}

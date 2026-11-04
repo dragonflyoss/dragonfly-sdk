@@ -1,0 +1,1072 @@
+/*
+ *     Copyright 2026 The Dragonfly Authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// Package request sends requests to remote servers via the Dragonfly
+// P2P network. It is the Go implementation of the Rust crate
+// dragonfly-client-request and generates identical task ids and seed peer
+// selections.
+package request
+
+import (
+	"context"
+	"crypto/x509"
+	"fmt"
+	"io"
+	"net/http"
+	"time"
+
+	managertypes "d7y.io/dragonfly/v2/manager/types"
+	"d7y.io/dragonfly/v2/pkg/idgen"
+)
+
+// defaultRequestTimeout is the default timeout for requests.
+const defaultRequestTimeout = 10 * 60 * time.Second
+
+// defaultConcurrentTaskCount is the default number of blobs to preheat or
+// delete concurrently.
+const defaultConcurrentTaskCount = 4
+
+// defaultReplicas is the default number of seed peers serving a task.
+const defaultReplicas = 2
+
+// Scope is the seed peers a preheat or delete addresses.
+type Scope string
+
+const (
+	// ScopeDefault addresses the replicas of the task: the seed peers picked in
+	// the consistent hash ring order for its task id.
+	ScopeDefault Scope = "default"
+
+	// ScopeAllSeedPeers addresses all seed peers regardless of the replicas,
+	// aligned with the AllSeedPeersScope in the dragonfly manager types.
+	ScopeAllSeedPeers Scope = managertypes.AllSeedPeersScope
+)
+
+// validate validates the scope.
+func (s Scope) validate() error {
+	switch s {
+	case ScopeDefault, ScopeAllSeedPeers:
+		return nil
+	default:
+		return fmt.Errorf("%w: invalid scope %q", ErrInvalidArgument, s)
+	}
+}
+
+// Request is the interface for sending requests via the Dragonfly.
+//
+// A request is served by the seed peers the scheduler picks for its task, and a
+// seed peer's dfdaemon fetches from the origin only what the P2P network does
+// not hold yet:
+//
+//	client ──lookup──▶ scheduler ──▶ seed peers [B, A]
+//	  │
+//	  └──GET──▶ B (seed peer proxy) ──miss──▶ origin
+//	                │
+//	                └──5xx / timeout──▶ retry on A
+//
+// Proxy implements it.
+type Request interface {
+	// Get sends a GET request via the Dragonfly and returns a response with a
+	// streaming body the caller must close. A transient failure before the
+	// body starts is retried on the next seed peer, a failure while streaming
+	// it is not.
+	Get(ctx context.Context, req *GetRequest) (*GetResponse, error)
+
+	// GetInto sends a GET request via the Dragonfly and writes the response
+	// body into w. A transient failure before the body starts is retried on
+	// the next seed peer, a failed body write is not since w cannot be rewound.
+	GetInto(ctx context.Context, req *GetRequest, w io.Writer) (*GetResponse, error)
+
+	// Preheat preheats a file: has every replica seed peer, or every seed peer
+	// with ScopeAllSeedPeers, download it through the dfdaemon download task API
+	// without streaming it back. A transient failure is retried on the same seed
+	// peer, so the file lands on every replica. It fails when fewer seed peers
+	// than replicas are available.
+	Preheat(ctx context.Context, req *PreheatRequest) error
+
+	// PreheatImage preheats an OCI image: resolves its manifest, multi-platform
+	// indexes included, and has the seed peers download every config and layer
+	// blob without streaming them back.
+	PreheatImage(ctx context.Context, req *PreheatImageRequest) error
+
+	// StatImage reports which seed peers hold which layers of an OCI image, as
+	// resolved by the scheduler. Useful to verify a preheat.
+	StatImage(ctx context.Context, req *StatImageRequest) (*StatImageResponse, error)
+
+	// Delete deletes a preheated file: has every replica seed peer, or every
+	// seed peer with ScopeAllSeedPeers, delete its task through the dfdaemon
+	// delete task API. A transient failure is retried on the same seed peer, so
+	// the task leaves every replica. A seed peer answering NotFound counts as
+	// deleted.
+	Delete(ctx context.Context, req *DeleteRequest) error
+
+	// DeleteImage deletes a preheated OCI image: resolves its manifest,
+	// multi-platform indexes included, and has the replica seed peers delete
+	// every manifest, config and layer blob task. A seed peer answering NotFound
+	// counts as deleted.
+	DeleteImage(ctx context.Context, req *DeleteImageRequest) error
+
+	// LookupEndpoints returns the proxy endpoints of the seed peers that would
+	// serve the request, in consistent hash ring order for its task id, up to
+	// the replicas of the request and clamped to the available seed peers.
+	LookupEndpoints(ctx context.Context, req *GetRequest) ([]string, error)
+}
+
+// RequestWithEndpoints is the interface for sending requests via fixed seed
+// peer endpoints.
+//
+// The endpoints are given at construction, typically from
+// Request.LookupEndpoints, so no scheduler is consulted:
+//
+//	client ──GET──▶ endpoint B ──5xx / timeout──▶ retry on endpoint A
+//
+// ProxyWithEndpoints implements it.
+type RequestWithEndpoints interface {
+	// Get sends a GET request to the endpoints and returns a response with a
+	// streaming body the caller must close. A transient failure before the
+	// body starts is retried on the next endpoint, a failure while streaming
+	// it is not.
+	Get(ctx context.Context, req *GetRequest) (*GetResponse, error)
+
+	// GetInto sends a GET request to the endpoints and writes the response
+	// body into w. A transient failure before the body starts is retried on
+	// the next endpoint, a failed body write is not since w cannot be rewound.
+	GetInto(ctx context.Context, req *GetRequest, w io.Writer) (*GetResponse, error)
+}
+
+// GetRequest represents a GET request to be sent via the Dragonfly. Construct
+// it with NewGetRequest and set the optional parameters with GetRequestOption.
+type GetRequest struct {
+	// url is the url of the request.
+	url string
+
+	// header is the headers of the request.
+	header http.Header
+
+	// pieceLength is the task piece length.
+	pieceLength *uint64
+
+	// tag identifies different tasks for the same url.
+	tag string
+
+	// application identifies different tasks for the same url.
+	application string
+
+	// filteredQueryParams is the filtered query params to generate the task id.
+	filteredQueryParams []string
+
+	// contentForCalculatingTaskID is the content for calculating the task id.
+	contentForCalculatingTaskID string
+
+	// enableTaskIDBasedBlobDigest indicates whether to use the blob digest for
+	// task id calculation when downloading from OCI registries.
+	enableTaskIDBasedBlobDigest bool
+
+	// priority is the task priority.
+	priority *int32
+
+	// replicas is the number of seed peers serving the task.
+	replicas int
+
+	// timeout is the timeout of each attempt of the request.
+	timeout time.Duration
+
+	// certificates is the client certificates for the request.
+	// TODO(chlins): Support client certificates.
+	certificates []*x509.Certificate
+}
+
+// GetRequestOption configures the GetRequest.
+type GetRequestOption func(r *GetRequest)
+
+// WithGetRequestHeader sets the headers of the request.
+func WithGetRequestHeader(header http.Header) GetRequestOption {
+	return func(r *GetRequest) { r.header = header }
+}
+
+// WithGetRequestPieceLength sets the task piece length.
+func WithGetRequestPieceLength(pieceLength uint64) GetRequestOption {
+	return func(r *GetRequest) { r.pieceLength = &pieceLength }
+}
+
+// WithGetRequestTag sets the tag that identifies different tasks for the same url.
+func WithGetRequestTag(tag string) GetRequestOption {
+	return func(r *GetRequest) { r.tag = tag }
+}
+
+// WithGetRequestApplication sets the application that identifies different tasks for
+// the same url.
+func WithGetRequestApplication(application string) GetRequestOption {
+	return func(r *GetRequest) { r.application = application }
+}
+
+// WithGetRequestFilteredQueryParams sets the filtered query params to generate the
+// task id. When the filter is ["Signature", "Expires", "ns"], for example:
+// http://example.com/xyz?Expires=e1&Signature=s1&ns=docker.io and
+// http://example.com/xyz?Expires=e2&Signature=s2&ns=docker.io
+// will generate the same task id.
+func WithGetRequestFilteredQueryParams(params []string) GetRequestOption {
+	return func(r *GetRequest) { r.filteredQueryParams = params }
+}
+
+// WithGetRequestContentForCalculatingTaskID sets the content for calculating the task
+// id. This is used when the task id cannot be calculated based on the url and
+// other parameters, such as when the url contains dynamic query parameters
+// that cannot be filtered out.
+func WithGetRequestContentForCalculatingTaskID(content string) GetRequestOption {
+	return func(r *GetRequest) { r.contentForCalculatingTaskID = content }
+}
+
+// WithGetRequestEnableTaskIDBasedBlobDigest sets whether to use the blob digest for
+// task id calculation when downloading from OCI registries. When enabled for
+// OCI blob urls (e.g., /v2/<name>/blobs/sha256:<digest>), the task id is
+// derived from the blob digest rather than the full url. This enables
+// deduplication across registries.
+func WithGetRequestEnableTaskIDBasedBlobDigest(enable bool) GetRequestOption {
+	return func(r *GetRequest) { r.enableTaskIDBasedBlobDigest = enable }
+}
+
+// WithGetRequestPriority sets the task priority, refer to
+// https://github.com/dragonflyoss/api/blob/main/proto/common.proto#L67.
+func WithGetRequestPriority(priority int32) GetRequestOption {
+	return func(r *GetRequest) { r.priority = &priority }
+}
+
+// WithGetRequestReplicas sets the number of seed peers serving the task,
+// default is 2. The request is scattered across the replicas.
+func WithGetRequestReplicas(replicas int) GetRequestOption {
+	return func(r *GetRequest) { r.replicas = replicas }
+}
+
+// WithGetRequestTimeout sets the timeout of each attempt of the request.
+func WithGetRequestTimeout(timeout time.Duration) GetRequestOption {
+	return func(r *GetRequest) { r.timeout = timeout }
+}
+
+// WithGetRequestCertificates sets the client certificates for the request.
+// TODO(chlins): Support client certificates.
+func WithGetRequestCertificates(certs []*x509.Certificate) GetRequestOption {
+	return func(r *GetRequest) { r.certificates = certs }
+}
+
+// NewGetRequest returns a GetRequest for the url with default values: the
+// default filtered query params, blob digest based task id enabled and a 10
+// minutes timeout.
+func NewGetRequest(url string, opts ...GetRequestOption) *GetRequest {
+	r := &GetRequest{
+		url:                         url,
+		header:                      make(http.Header),
+		filteredQueryParams:         idgen.DefaultFilteredQueryParams,
+		enableTaskIDBasedBlobDigest: true,
+		replicas:                    defaultReplicas,
+		timeout:                     defaultRequestTimeout,
+	}
+	for _, opt := range opts {
+		opt(r)
+	}
+
+	return r
+}
+
+// validate validates the request parameters.
+func (r *GetRequest) validate() error {
+	if r.replicas <= 0 {
+		return fmt.Errorf("%w: replicas must be positive", ErrInvalidArgument)
+	}
+
+	return nil
+}
+
+// GetResponse represents a GET response received via the Dragonfly.
+type GetResponse struct {
+	// Success indicates whether the response is successful.
+	Success bool
+
+	// Header is the headers of the response.
+	Header http.Header
+
+	// StatusCode is the status code of the response.
+	StatusCode int
+
+	// Body is the content of the response. It is nil for GetInto and must be
+	// closed by the caller for Get.
+	Body io.ReadCloser
+}
+
+// PreheatRequest represents a request to preheat a file through the Dragonfly
+// seed client. The preheat downloads the specified file via the Dragonfly
+// proxy, effectively caching it in the P2P network for faster downloading.
+// Construct it with NewPreheatRequest and set the optional parameters with
+// PreheatRequestOption.
+type PreheatRequest struct {
+	// url is the url of the request.
+	url string
+
+	// header is the headers of the request.
+	header http.Header
+
+	// pieceLength is the task piece length.
+	pieceLength *uint64
+
+	// tag identifies different tasks for the same url.
+	tag string
+
+	// application identifies different tasks for the same url.
+	application string
+
+	// filteredQueryParams is the filtered query params to generate the task id.
+	filteredQueryParams []string
+
+	// contentForCalculatingTaskID is the content for calculating the task id.
+	contentForCalculatingTaskID string
+
+	// enableTaskIDBasedBlobDigest indicates whether to use the blob digest for
+	// task id calculation when downloading from OCI registries.
+	enableTaskIDBasedBlobDigest bool
+
+	// priority is the task priority.
+	priority *int32
+
+	// replicas is the number of seed peers serving the task.
+	replicas int
+
+	// scope is the seed peers to preheat the task to.
+	scope Scope
+
+	// timeout is the timeout of each attempt of the request.
+	timeout time.Duration
+
+	// certificates is the client certificates for the request.
+	// TODO(chlins): Support client certificates.
+	certificates []*x509.Certificate
+}
+
+// PreheatRequestOption configures the PreheatRequest.
+type PreheatRequestOption func(r *PreheatRequest)
+
+// WithPreheatRequestHeader sets the headers of the request.
+func WithPreheatRequestHeader(header http.Header) PreheatRequestOption {
+	return func(r *PreheatRequest) { r.header = header }
+}
+
+// WithPreheatRequestPieceLength sets the task piece length.
+func WithPreheatRequestPieceLength(pieceLength uint64) PreheatRequestOption {
+	return func(r *PreheatRequest) { r.pieceLength = &pieceLength }
+}
+
+// WithPreheatRequestTag sets the tag that identifies different tasks for the same
+// url.
+func WithPreheatRequestTag(tag string) PreheatRequestOption {
+	return func(r *PreheatRequest) { r.tag = tag }
+}
+
+// WithPreheatRequestApplication sets the application that identifies different tasks
+// for the same url.
+func WithPreheatRequestApplication(application string) PreheatRequestOption {
+	return func(r *PreheatRequest) { r.application = application }
+}
+
+// WithPreheatRequestFilteredQueryParams sets the filtered query params to generate
+// the task id.
+func WithPreheatRequestFilteredQueryParams(params []string) PreheatRequestOption {
+	return func(r *PreheatRequest) { r.filteredQueryParams = params }
+}
+
+// WithPreheatRequestContentForCalculatingTaskID sets the content for calculating the
+// task id.
+func WithPreheatRequestContentForCalculatingTaskID(content string) PreheatRequestOption {
+	return func(r *PreheatRequest) { r.contentForCalculatingTaskID = content }
+}
+
+// WithPreheatRequestEnableTaskIDBasedBlobDigest sets whether to use the blob digest
+// for task id calculation when downloading from OCI registries.
+func WithPreheatRequestEnableTaskIDBasedBlobDigest(enable bool) PreheatRequestOption {
+	return func(r *PreheatRequest) { r.enableTaskIDBasedBlobDigest = enable }
+}
+
+// WithPreheatRequestPriority sets the task priority.
+func WithPreheatRequestPriority(priority int32) PreheatRequestOption {
+	return func(r *PreheatRequest) { r.priority = &priority }
+}
+
+// WithPreheatRequestReplicas sets the number of seed peers to preheat the task
+// to, default is 2.
+func WithPreheatRequestReplicas(replicas int) PreheatRequestOption {
+	return func(r *PreheatRequest) { r.replicas = replicas }
+}
+
+// WithPreheatRequestScope sets the seed peers to preheat the task to, default
+// is ScopeDefault: the replicas of the task. ScopeAllSeedPeers preheats to all
+// seed peers regardless of the replicas.
+func WithPreheatRequestScope(scope Scope) PreheatRequestOption {
+	return func(r *PreheatRequest) { r.scope = scope }
+}
+
+// WithPreheatRequestTimeout sets the timeout of each attempt of the request.
+func WithPreheatRequestTimeout(timeout time.Duration) PreheatRequestOption {
+	return func(r *PreheatRequest) { r.timeout = timeout }
+}
+
+// WithPreheatRequestCertificates sets the client certificates for the request.
+// TODO(chlins): Support client certificates.
+func WithPreheatRequestCertificates(certs []*x509.Certificate) PreheatRequestOption {
+	return func(r *PreheatRequest) { r.certificates = certs }
+}
+
+// NewPreheatRequest returns a PreheatRequest for the url with default values.
+func NewPreheatRequest(url string, opts ...PreheatRequestOption) *PreheatRequest {
+	r := &PreheatRequest{
+		url:                         url,
+		header:                      make(http.Header),
+		filteredQueryParams:         idgen.DefaultFilteredQueryParams,
+		enableTaskIDBasedBlobDigest: true,
+		replicas:                    defaultReplicas,
+		scope:                       ScopeDefault,
+		timeout:                     defaultRequestTimeout,
+	}
+	for _, opt := range opts {
+		opt(r)
+	}
+
+	return r
+}
+
+// validate validates the request parameters.
+func (r *PreheatRequest) validate() error {
+	if r.replicas <= 0 {
+		return fmt.Errorf("%w: replicas must be positive", ErrInvalidArgument)
+	}
+
+	if err := r.scope.validate(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// PreheatImageRequest represents a request to preheat an OCI image through
+// the Dragonfly seed client. The preheat downloads all blobs (config and
+// layers) of the specified image via the Dragonfly proxy. Construct it with
+// NewPreheatImageRequest and set the optional parameters with
+// PreheatImageRequestOption.
+type PreheatImageRequest struct {
+	// image is the OCI image reference (e.g., "docker.io/library/nginx:latest").
+	image string
+
+	// username is the username for registry authentication.
+	username string
+
+	// password is the password for registry authentication.
+	password string
+
+	// platform specifies the target platform in the format "os/arch".
+	platform string
+
+	// pieceLength is the task piece length.
+	pieceLength *uint64
+
+	// tag identifies different tasks for the same url.
+	tag string
+
+	// application identifies different tasks for the same url.
+	application string
+
+	// filteredQueryParams is the filtered query params to generate the task id.
+	filteredQueryParams []string
+
+	// contentForCalculatingTaskID is the content for calculating the task id.
+	contentForCalculatingTaskID string
+
+	// enableTaskIDBasedBlobDigest indicates whether to use the blob digest for
+	// task id calculation when downloading from OCI registries.
+	enableTaskIDBasedBlobDigest bool
+
+	// priority is the task priority.
+	priority *int32
+
+	// replicas is the number of seed peers serving each blob task.
+	replicas int
+
+	// scope is the seed peers to preheat each blob task to.
+	scope Scope
+
+	// timeout is the timeout for each blob download request.
+	timeout time.Duration
+
+	// concurrentTaskCount is the number of blobs to preheat concurrently.
+	concurrentTaskCount int
+
+	// certificates is the client certificates for the request.
+	// TODO(chlins): Support client certificates.
+	certificates []*x509.Certificate
+}
+
+// PreheatImageRequestOption configures the PreheatImageRequest.
+type PreheatImageRequestOption func(r *PreheatImageRequest)
+
+// WithPreheatImageRequestAuth sets the username and password for registry
+// authentication. If not provided, anonymous access is used.
+func WithPreheatImageRequestAuth(username, password string) PreheatImageRequestOption {
+	return func(r *PreheatImageRequest) {
+		r.username = username
+		r.password = password
+	}
+}
+
+// WithPreheatImageRequestPlatform sets the target platform in the format "os/arch"
+// (e.g., "linux/amd64", "linux/arm64"). This is used to select the correct
+// manifest from a multi-platform image index, default is current platform.
+func WithPreheatImageRequestPlatform(platform string) PreheatImageRequestOption {
+	return func(r *PreheatImageRequest) { r.platform = platform }
+}
+
+// WithPreheatImageRequestPieceLength sets the task piece length.
+func WithPreheatImageRequestPieceLength(pieceLength uint64) PreheatImageRequestOption {
+	return func(r *PreheatImageRequest) { r.pieceLength = &pieceLength }
+}
+
+// WithPreheatImageRequestTag sets the tag that identifies different tasks for the
+// same url.
+func WithPreheatImageRequestTag(tag string) PreheatImageRequestOption {
+	return func(r *PreheatImageRequest) { r.tag = tag }
+}
+
+// WithPreheatImageRequestApplication sets the application that identifies different
+// tasks for the same url.
+func WithPreheatImageRequestApplication(application string) PreheatImageRequestOption {
+	return func(r *PreheatImageRequest) { r.application = application }
+}
+
+// WithPreheatImageRequestFilteredQueryParams sets the filtered query params to
+// generate the task id.
+func WithPreheatImageRequestFilteredQueryParams(params []string) PreheatImageRequestOption {
+	return func(r *PreheatImageRequest) { r.filteredQueryParams = params }
+}
+
+// WithPreheatImageRequestContentForCalculatingTaskID sets the content for calculating
+// the task id.
+func WithPreheatImageRequestContentForCalculatingTaskID(content string) PreheatImageRequestOption {
+	return func(r *PreheatImageRequest) { r.contentForCalculatingTaskID = content }
+}
+
+// WithPreheatImageRequestEnableTaskIDBasedBlobDigest sets whether to use the blob
+// digest for task id calculation when downloading from OCI registries.
+func WithPreheatImageRequestEnableTaskIDBasedBlobDigest(enable bool) PreheatImageRequestOption {
+	return func(r *PreheatImageRequest) { r.enableTaskIDBasedBlobDigest = enable }
+}
+
+// WithPreheatImageRequestPriority sets the task priority.
+func WithPreheatImageRequestPriority(priority int32) PreheatImageRequestOption {
+	return func(r *PreheatImageRequest) { r.priority = &priority }
+}
+
+// WithPreheatImageRequestReplicas sets the number of seed peers to preheat
+// each blob task to, default is 2.
+func WithPreheatImageRequestReplicas(replicas int) PreheatImageRequestOption {
+	return func(r *PreheatImageRequest) { r.replicas = replicas }
+}
+
+// WithPreheatImageRequestScope sets the seed peers to preheat each blob task
+// to, default is ScopeDefault: the replicas of the task. ScopeAllSeedPeers
+// preheats to all seed peers regardless of the replicas.
+func WithPreheatImageRequestScope(scope Scope) PreheatImageRequestOption {
+	return func(r *PreheatImageRequest) { r.scope = scope }
+}
+
+// WithPreheatImageRequestTimeout sets the timeout for each blob download request.
+func WithPreheatImageRequestTimeout(timeout time.Duration) PreheatImageRequestOption {
+	return func(r *PreheatImageRequest) { r.timeout = timeout }
+}
+
+// WithPreheatImageRequestConcurrentTaskCount sets the number of blobs to
+// preheat concurrently, default is 4.
+func WithPreheatImageRequestConcurrentTaskCount(count int) PreheatImageRequestOption {
+	return func(r *PreheatImageRequest) { r.concurrentTaskCount = count }
+}
+
+// WithPreheatImageRequestCertificates sets the client certificates for the request.
+// TODO(chlins): Support client certificates.
+func WithPreheatImageRequestCertificates(certs []*x509.Certificate) PreheatImageRequestOption {
+	return func(r *PreheatImageRequest) { r.certificates = certs }
+}
+
+// NewPreheatImageRequest returns a PreheatImageRequest for the image with
+// default values.
+func NewPreheatImageRequest(image string, opts ...PreheatImageRequestOption) *PreheatImageRequest {
+	r := &PreheatImageRequest{
+		image:                       image,
+		filteredQueryParams:         idgen.DefaultFilteredQueryParams,
+		enableTaskIDBasedBlobDigest: true,
+		replicas:                    defaultReplicas,
+		scope:                       ScopeDefault,
+		timeout:                     defaultRequestTimeout,
+		concurrentTaskCount:         defaultConcurrentTaskCount,
+	}
+	for _, opt := range opts {
+		opt(r)
+	}
+
+	return r
+}
+
+// validate validates the request parameters.
+func (r *PreheatImageRequest) validate() error {
+	if r.replicas <= 0 {
+		return fmt.Errorf("%w: replicas must be positive", ErrInvalidArgument)
+	}
+
+	if err := r.scope.validate(); err != nil {
+		return err
+	}
+
+	if r.concurrentTaskCount <= 0 {
+		return fmt.Errorf("%w: concurrent task count must be positive", ErrInvalidArgument)
+	}
+
+	return nil
+}
+
+// StatImageRequest represents a request to query the distribution of an OCI
+// image in the Dragonfly. Construct it with NewStatImageRequest and set the
+// optional parameters with StatImageRequestOption.
+type StatImageRequest struct {
+	// image is the OCI image reference (e.g., "docker.io/library/nginx:latest").
+	image string
+
+	// username is the username for registry authentication.
+	username string
+
+	// password is the password for registry authentication.
+	password string
+
+	// platform specifies the target platform in the format "os/arch".
+	platform string
+
+	// pieceLength is the task piece length.
+	pieceLength *uint64
+
+	// tag identifies different tasks for the same url.
+	tag string
+
+	// application identifies different tasks for the same url.
+	application string
+
+	// filteredQueryParams is the filtered query params to generate the task id.
+	filteredQueryParams []string
+
+	// enableTaskIDBasedBlobDigest indicates whether to use the blob digest for
+	// task id calculation when the layer url is an OCI blob url. It should be
+	// consistent with the value used when the image was preheated, otherwise
+	// the tasks can not be found on the peers.
+	enableTaskIDBasedBlobDigest bool
+
+	// timeout is the timeout of the request.
+	timeout time.Duration
+}
+
+// StatImageRequestOption configures the StatImageRequest.
+type StatImageRequestOption func(r *StatImageRequest)
+
+// WithStatImageRequestAuth sets the username and password for registry
+// authentication. If not provided, anonymous access is used.
+func WithStatImageRequestAuth(username, password string) StatImageRequestOption {
+	return func(r *StatImageRequest) {
+		r.username = username
+		r.password = password
+	}
+}
+
+// WithStatImageRequestPlatform sets the target platform in the format "os/arch"
+// (e.g., "linux/amd64", "linux/arm64"). This is used by the scheduler to select the
+// correct manifest from a multi-platform image index, default is the scheduler's
+// platform. It should be consistent with the platform used when the image was
+// preheated, otherwise the layers can not be found on the peers.
+func WithStatImageRequestPlatform(platform string) StatImageRequestOption {
+	return func(r *StatImageRequest) { r.platform = platform }
+}
+
+// WithStatImageRequestPieceLength sets the task piece length.
+func WithStatImageRequestPieceLength(pieceLength uint64) StatImageRequestOption {
+	return func(r *StatImageRequest) { r.pieceLength = &pieceLength }
+}
+
+// WithStatImageRequestTag sets the tag that identifies different tasks for the
+// same url.
+func WithStatImageRequestTag(tag string) StatImageRequestOption {
+	return func(r *StatImageRequest) { r.tag = tag }
+}
+
+// WithStatImageRequestApplication sets the application that identifies different
+// tasks for the same url.
+func WithStatImageRequestApplication(application string) StatImageRequestOption {
+	return func(r *StatImageRequest) { r.application = application }
+}
+
+// WithStatImageRequestFilteredQueryParams sets the filtered query params to
+// generate the task id.
+func WithStatImageRequestFilteredQueryParams(params []string) StatImageRequestOption {
+	return func(r *StatImageRequest) { r.filteredQueryParams = params }
+}
+
+// WithStatImageRequestEnableTaskIDBasedBlobDigest sets whether to use the blob
+// digest for task id calculation when the layer url is an OCI blob url. It should
+// be consistent with the value used when the image was preheated, default is true.
+func WithStatImageRequestEnableTaskIDBasedBlobDigest(enable bool) StatImageRequestOption {
+	return func(r *StatImageRequest) { r.enableTaskIDBasedBlobDigest = enable }
+}
+
+// WithStatImageRequestTimeout sets the timeout of the request.
+func WithStatImageRequestTimeout(timeout time.Duration) StatImageRequestOption {
+	return func(r *StatImageRequest) { r.timeout = timeout }
+}
+
+// NewStatImageRequest returns a StatImageRequest for the image with default
+// values.
+func NewStatImageRequest(image string, opts ...StatImageRequestOption) *StatImageRequest {
+	r := &StatImageRequest{
+		image:                       image,
+		filteredQueryParams:         idgen.DefaultFilteredQueryParams,
+		enableTaskIDBasedBlobDigest: true,
+		timeout:                     defaultRequestTimeout,
+	}
+	for _, opt := range opts {
+		opt(r)
+	}
+
+	return r
+}
+
+// StatImageResponse represents the distribution of an OCI image in the
+// Dragonfly.
+type StatImageResponse struct {
+	// Layers is the blob urls of the image.
+	Layers []string
+
+	// Peers is the peers that have cached layers of the image.
+	Peers []*PeerImage
+}
+
+// PeerImage represents a peer and the image layers it has cached.
+type PeerImage struct {
+	// IP is the IP address of the peer.
+	IP string
+
+	// Hostname is the hostname of the peer.
+	Hostname string
+
+	// CachedLayers is the layers that the peer has downloaded.
+	CachedLayers []*Layer
+}
+
+// Layer represents the download state of an image layer on a peer.
+type Layer struct {
+	// URL is the blob url of the layer.
+	URL string
+
+	// IsFinished indicates whether the peer has finished downloading the layer.
+	IsFinished bool
+}
+
+// DeleteRequest represents a request to delete a preheated file from the
+// Dragonfly seed peers. The delete removes the task of the specified url from
+// the seed peers serving it. Construct it with NewDeleteRequest and set the
+// optional parameters with DeleteRequestOption.
+type DeleteRequest struct {
+	// url is the url of the request.
+	url string
+
+	// pieceLength is the task piece length.
+	pieceLength *uint64
+
+	// tag identifies different tasks for the same url.
+	tag string
+
+	// application identifies different tasks for the same url.
+	application string
+
+	// filteredQueryParams is the filtered query params to generate the task id.
+	filteredQueryParams []string
+
+	// contentForCalculatingTaskID is the content for calculating the task id.
+	contentForCalculatingTaskID string
+
+	// enableTaskIDBasedBlobDigest indicates whether to use the blob digest for
+	// task id calculation when the url is an OCI blob url.
+	enableTaskIDBasedBlobDigest bool
+
+	// replicas is the number of seed peers serving the task.
+	replicas int
+
+	// scope is the seed peers to delete the task from.
+	scope Scope
+
+	// timeout is the timeout of each attempt of the request.
+	timeout time.Duration
+}
+
+// DeleteRequestOption configures the DeleteRequest.
+type DeleteRequestOption func(r *DeleteRequest)
+
+// WithDeleteRequestPieceLength sets the task piece length.
+func WithDeleteRequestPieceLength(pieceLength uint64) DeleteRequestOption {
+	return func(r *DeleteRequest) { r.pieceLength = &pieceLength }
+}
+
+// WithDeleteRequestTag sets the tag that identifies different tasks for the same
+// url.
+func WithDeleteRequestTag(tag string) DeleteRequestOption {
+	return func(r *DeleteRequest) { r.tag = tag }
+}
+
+// WithDeleteRequestApplication sets the application that identifies different tasks
+// for the same url.
+func WithDeleteRequestApplication(application string) DeleteRequestOption {
+	return func(r *DeleteRequest) { r.application = application }
+}
+
+// WithDeleteRequestFilteredQueryParams sets the filtered query params to generate
+// the task id.
+func WithDeleteRequestFilteredQueryParams(params []string) DeleteRequestOption {
+	return func(r *DeleteRequest) { r.filteredQueryParams = params }
+}
+
+// WithDeleteRequestContentForCalculatingTaskID sets the content for calculating the
+// task id.
+func WithDeleteRequestContentForCalculatingTaskID(content string) DeleteRequestOption {
+	return func(r *DeleteRequest) { r.contentForCalculatingTaskID = content }
+}
+
+// WithDeleteRequestEnableTaskIDBasedBlobDigest sets whether to use the blob digest
+// for task id calculation when the url is an OCI blob url. It should be consistent
+// with the value used when the file was preheated, default is true.
+func WithDeleteRequestEnableTaskIDBasedBlobDigest(enable bool) DeleteRequestOption {
+	return func(r *DeleteRequest) { r.enableTaskIDBasedBlobDigest = enable }
+}
+
+// WithDeleteRequestReplicas sets the number of seed peers serving the task,
+// consistent with the replicas used when the file was preheated, default is 2.
+func WithDeleteRequestReplicas(replicas int) DeleteRequestOption {
+	return func(r *DeleteRequest) { r.replicas = replicas }
+}
+
+// WithDeleteRequestScope sets the seed peers to delete the task from,
+// consistent with the scope used when the file was preheated, default is
+// ScopeDefault.
+func WithDeleteRequestScope(scope Scope) DeleteRequestOption {
+	return func(r *DeleteRequest) { r.scope = scope }
+}
+
+// WithDeleteRequestTimeout sets the timeout of each attempt of the request.
+func WithDeleteRequestTimeout(timeout time.Duration) DeleteRequestOption {
+	return func(r *DeleteRequest) { r.timeout = timeout }
+}
+
+// NewDeleteRequest returns a DeleteRequest for the url with default values.
+func NewDeleteRequest(url string, opts ...DeleteRequestOption) *DeleteRequest {
+	r := &DeleteRequest{
+		url:                         url,
+		filteredQueryParams:         idgen.DefaultFilteredQueryParams,
+		enableTaskIDBasedBlobDigest: true,
+		replicas:                    defaultReplicas,
+		scope:                       ScopeDefault,
+		timeout:                     defaultRequestTimeout,
+	}
+	for _, opt := range opts {
+		opt(r)
+	}
+
+	return r
+}
+
+// validate validates the request parameters.
+func (r *DeleteRequest) validate() error {
+	if r.replicas <= 0 {
+		return fmt.Errorf("%w: replicas must be positive", ErrInvalidArgument)
+	}
+
+	if err := r.scope.validate(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// DeleteImageRequest represents a request to delete a preheated OCI image from
+// the Dragonfly seed peers. The delete removes the manifests and blobs (config
+// and layers) of the specified image from the seed peers serving them.
+// Construct it with NewDeleteImageRequest and set the optional parameters with
+// DeleteImageRequestOption.
+type DeleteImageRequest struct {
+	// image is the OCI image reference (e.g., "docker.io/library/nginx:latest").
+	image string
+
+	// username is the username for registry authentication.
+	username string
+
+	// password is the password for registry authentication.
+	password string
+
+	// platform specifies the target platform in the format "os/arch".
+	platform string
+
+	// pieceLength is the task piece length.
+	pieceLength *uint64
+
+	// tag identifies different tasks for the same url.
+	tag string
+
+	// application identifies different tasks for the same url.
+	application string
+
+	// filteredQueryParams is the filtered query params to generate the task id.
+	filteredQueryParams []string
+
+	// contentForCalculatingTaskID is the content for calculating the task id.
+	contentForCalculatingTaskID string
+
+	// enableTaskIDBasedBlobDigest indicates whether to use the blob digest for
+	// task id calculation when the url is an OCI blob url.
+	enableTaskIDBasedBlobDigest bool
+
+	// replicas is the number of seed peers serving each task.
+	replicas int
+
+	// scope is the seed peers to delete each task from.
+	scope Scope
+
+	// timeout is the timeout of each attempt of a task delete.
+	timeout time.Duration
+
+	// concurrentTaskCount is the number of blobs to delete concurrently.
+	concurrentTaskCount int
+}
+
+// DeleteImageRequestOption configures the DeleteImageRequest.
+type DeleteImageRequestOption func(r *DeleteImageRequest)
+
+// WithDeleteImageRequestAuth sets the username and password for registry
+// authentication. If not provided, anonymous access is used.
+func WithDeleteImageRequestAuth(username, password string) DeleteImageRequestOption {
+	return func(r *DeleteImageRequest) {
+		r.username = username
+		r.password = password
+	}
+}
+
+// WithDeleteImageRequestPlatform sets the target platform in the format "os/arch"
+// (e.g., "linux/amd64", "linux/arm64"). It should be consistent with the platform
+// used when the image was preheated, default is current platform.
+func WithDeleteImageRequestPlatform(platform string) DeleteImageRequestOption {
+	return func(r *DeleteImageRequest) { r.platform = platform }
+}
+
+// WithDeleteImageRequestPieceLength sets the task piece length.
+func WithDeleteImageRequestPieceLength(pieceLength uint64) DeleteImageRequestOption {
+	return func(r *DeleteImageRequest) { r.pieceLength = &pieceLength }
+}
+
+// WithDeleteImageRequestTag sets the tag that identifies different tasks for the
+// same url.
+func WithDeleteImageRequestTag(tag string) DeleteImageRequestOption {
+	return func(r *DeleteImageRequest) { r.tag = tag }
+}
+
+// WithDeleteImageRequestApplication sets the application that identifies different
+// tasks for the same url.
+func WithDeleteImageRequestApplication(application string) DeleteImageRequestOption {
+	return func(r *DeleteImageRequest) { r.application = application }
+}
+
+// WithDeleteImageRequestFilteredQueryParams sets the filtered query params to
+// generate the task id.
+func WithDeleteImageRequestFilteredQueryParams(params []string) DeleteImageRequestOption {
+	return func(r *DeleteImageRequest) { r.filteredQueryParams = params }
+}
+
+// WithDeleteImageRequestContentForCalculatingTaskID sets the content for calculating
+// the task id.
+func WithDeleteImageRequestContentForCalculatingTaskID(content string) DeleteImageRequestOption {
+	return func(r *DeleteImageRequest) { r.contentForCalculatingTaskID = content }
+}
+
+// WithDeleteImageRequestEnableTaskIDBasedBlobDigest sets whether to use the blob
+// digest for task id calculation when the url is an OCI blob url. It should be
+// consistent with the value used when the image was preheated, default is true.
+func WithDeleteImageRequestEnableTaskIDBasedBlobDigest(enable bool) DeleteImageRequestOption {
+	return func(r *DeleteImageRequest) { r.enableTaskIDBasedBlobDigest = enable }
+}
+
+// WithDeleteImageRequestReplicas sets the number of seed peers serving each
+// task, consistent with the replicas used when the image was preheated, default
+// is 2.
+func WithDeleteImageRequestReplicas(replicas int) DeleteImageRequestOption {
+	return func(r *DeleteImageRequest) { r.replicas = replicas }
+}
+
+// WithDeleteImageRequestScope sets the seed peers to delete each task from,
+// consistent with the scope used when the image was preheated, default is
+// ScopeDefault.
+func WithDeleteImageRequestScope(scope Scope) DeleteImageRequestOption {
+	return func(r *DeleteImageRequest) { r.scope = scope }
+}
+
+// WithDeleteImageRequestTimeout sets the timeout of each attempt of a task
+// delete.
+func WithDeleteImageRequestTimeout(timeout time.Duration) DeleteImageRequestOption {
+	return func(r *DeleteImageRequest) { r.timeout = timeout }
+}
+
+// WithDeleteImageRequestConcurrentTaskCount sets the number of blobs to delete
+// concurrently, default is 4.
+func WithDeleteImageRequestConcurrentTaskCount(count int) DeleteImageRequestOption {
+	return func(r *DeleteImageRequest) { r.concurrentTaskCount = count }
+}
+
+// NewDeleteImageRequest returns a DeleteImageRequest for the image with default
+// values.
+func NewDeleteImageRequest(image string, opts ...DeleteImageRequestOption) *DeleteImageRequest {
+	r := &DeleteImageRequest{
+		image:                       image,
+		filteredQueryParams:         idgen.DefaultFilteredQueryParams,
+		enableTaskIDBasedBlobDigest: true,
+		replicas:                    defaultReplicas,
+		scope:                       ScopeDefault,
+		timeout:                     defaultRequestTimeout,
+		concurrentTaskCount:         defaultConcurrentTaskCount,
+	}
+	for _, opt := range opts {
+		opt(r)
+	}
+
+	return r
+}
+
+// validate validates the request parameters.
+func (r *DeleteImageRequest) validate() error {
+	if r.replicas <= 0 {
+		return fmt.Errorf("%w: replicas must be positive", ErrInvalidArgument)
+	}
+
+	if err := r.scope.validate(); err != nil {
+		return err
+	}
+
+	if r.concurrentTaskCount <= 0 {
+		return fmt.Errorf("%w: concurrent task count must be positive", ErrInvalidArgument)
+	}
+
+	return nil
+}
