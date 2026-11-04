@@ -86,7 +86,3 @@ class DfgetConfig:
             default_timeout=str(source.get(DFGET_TIMEOUT_ENV) or DEFAULT_TIMEOUT),
             log_level=source.get(DFGET_LOG_LEVEL_ENV),
         )
-
-    def replace(self, **changes: object) -> "DfgetConfig":
-        """Return a new configuration with ``changes`` applied (dataclasses.replace-friendly)."""
-        return _dataclass_replace(self, **changes)
