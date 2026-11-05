@@ -5,7 +5,7 @@ go 1.25.0
 require (
 	d7y.io/api/v2 v2.3.7
 	d7y.io/dragonfly/v2 v2.5.2-rc.3
-	d7y.io/hashring v0.2.0
+	d7y.io/hashring v0.3.0
 	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/docker/distribution v2.8.3+incompatible
 	github.com/stretchr/testify v1.12.1

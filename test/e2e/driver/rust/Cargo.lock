@@ -562,7 +562,7 @@ dependencies = [
 
 [[package]]
 name = "dragonfly-client-request"
-version = "1.10.0"
+version = "1.10.1"
 dependencies = [
  "async-trait",
  "backon",
@@ -611,9 +611,9 @@ dependencies = [
 
 [[package]]
 name = "dragonfly-hashring"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "50b412c4c2fd0a3d98a8af1a6bc6fcf9268a4c015144b368ae9d82fd0ad3b427"
+checksum = "89092b70bed83cd2216c26f7cdfbf990a195a37b2ec59562cdb812d35fcd61a0"
 dependencies = [
  "siphasher",
 ]
@@ -2776,9 +2776,9 @@ dependencies = [
 
 [[package]]
 name = "tonic"
-version = "0.14.6"
+version = "0.14.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac2a5518c70fa84342385732db33fb3f44bc4cc748936eb5833d2df34d6445ef"
+checksum = "e2cdfc673aabd30fe8fee92e65837b644c37c5d47f0f97ae6d5e0f1237d15e1b"
 dependencies = [
  "async-trait",
  "axum",
@@ -2798,6 +2798,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-stream",
+ "tokio-util",
  "tower",
  "tower-layer",
  "tower-service",

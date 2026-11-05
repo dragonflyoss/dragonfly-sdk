@@ -11,7 +11,7 @@ require (
 
 require (
 	d7y.io/api/v2 v2.3.8 // indirect
-	d7y.io/hashring v0.2.0 // indirect
+	d7y.io/hashring v0.3.0 // indirect
 	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/Masterminds/semver/v3 v3.4.0 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
