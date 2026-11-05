@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"sync/atomic"
 	"testing"
@@ -123,6 +124,116 @@ func TestGetInto(t *testing.T) {
 	assert.Equal(http.StatusOK, resp.StatusCode)
 	assert.Nil(resp.Body)
 	assert.Equal("hello dragonfly", buf.String())
+}
+
+func TestGetIntoWithSeedPeers(t *testing.T) {
+	assert := assert.New(t)
+
+	proxyPort := setupMockSeedPeerProxy(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "hello dragonfly")
+	})
+
+	proxy, err := New(context.Background(), "", WithProxySeedPeers([]SeedPeer{
+		{Host: createSeedPeerHost("seed-peer-1", 0, proxyPort), Healthy: true},
+	}))
+	assert.NoError(err)
+	defer proxy.Close()
+
+	var buf bytes.Buffer
+	resp, err := proxy.GetInto(context.Background(), NewGetRequest("http://example.com/file.txt", WithGetRequestReplicas(1)), &buf)
+	assert.NoError(err)
+
+	assert.True(resp.Success)
+	assert.Equal("hello dragonfly", buf.String())
+}
+
+func TestSendToEjectsAProxyOnlyForFailuresOfLiveRequests(t *testing.T) {
+	tests := []struct {
+		name      string
+		cancelled bool
+		expect    func(t *testing.T, err error)
+	}{
+		{
+			name:      "failures of live requests eject the proxy",
+			cancelled: false,
+			expect: func(t *testing.T, err error) {
+				assert := assert.New(t)
+				assert.Error(err)
+			},
+		},
+		{
+			name:      "cancelled requests leave the proxy in place",
+			cancelled: true,
+			expect: func(t *testing.T, err error) {
+				assert := assert.New(t)
+				assert.NoError(err)
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			assert.NoError(err)
+			proxyPort := int32(listener.Addr().(*net.TCPAddr).Port)
+			listener.Close()
+
+			host := createSeedPeerHost("seed-peer-1", 0, proxyPort)
+			proxy, err := New(context.Background(), "", WithProxySeedPeers([]SeedPeer{{Host: host, Healthy: true}}))
+			assert.NoError(err)
+			defer proxy.Close()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if tc.cancelled {
+				cancel()
+			}
+
+			req := NewGetRequest("http://example.com/file.txt", WithGetRequestReplicas(1))
+			endpoint := proxy.seedPeerSelector.ProxyEndpoint(host)
+			for range 5 {
+				_, err := proxy.sendTo(ctx, endpoint, req)
+				assert.Error(err)
+			}
+
+			_, err = proxy.seedPeerSelector.Select("task", 1)
+			tc.expect(t, err)
+		})
+	}
+}
+
+func TestNewEmptySeedPeers(t *testing.T) {
+	assert := assert.New(t)
+	_, err := New(context.Background(), "", WithProxySeedPeers([]SeedPeer{}))
+	assert.ErrorIs(err, ErrInvalidArgument)
+}
+
+func TestSchedulerListSeedPeers(t *testing.T) {
+	assert := assert.New(t)
+
+	port := setupMockSeedPeer(t, nil)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	assert.NoError(err)
+	unreachablePort := int32(listener.Addr().(*net.TCPAddr).Port)
+	listener.Close()
+	endpoint := setupMockScheduler(t, []*commonv2.Host{
+		createSeedPeerHost("seed-peer-1", port, 0),
+		createSeedPeerHost("seed-peer-2", unreachablePort, 0),
+	})
+
+	scheduler, err := NewScheduler(endpoint, 5*time.Second)
+	assert.NoError(err)
+	defer scheduler.Close()
+
+	seedPeers, err := scheduler.ListSeedPeers(context.Background())
+	assert.NoError(err)
+
+	health := make(map[string]bool, len(seedPeers))
+	for _, seedPeer := range seedPeers {
+		health[seedPeer.Host.Name] = seedPeer.Healthy
+	}
+	assert.Equal(map[string]bool{"seed-peer-1": true, "seed-peer-2": false}, health)
 }
 
 func TestGetErrorTypes(t *testing.T) {

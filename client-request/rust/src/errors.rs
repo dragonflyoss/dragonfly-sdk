@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+use crate::http::headermap_to_hashmap;
 use dragonfly_api::errordetails::v2::Backend;
 use reqwest;
 use std::collections::HashMap;
@@ -123,6 +124,54 @@ impl Error {
         match status.code() {
             Code::DeadlineExceeded => Error::RequestTimeout(status.message().to_string()),
             _ => Error::TonicStatus(status),
+        }
+    }
+
+    /// Converts the non-`2xx` answer of a seed peer proxy into an [`Error`], by
+    /// the `X-Dragonfly-Error-Type` header naming who failed.
+    ///
+    /// ```text
+    /// X-Dragonfly-Error-Type ──backend────────▶ BackendError
+    ///                        ├─proxy──────────▶ ProxyError
+    ///                        ├─dfdaemon───────▶ DfdaemonError
+    ///                        └─other or none──▶ ProxyError naming it
+    /// ```
+    pub(crate) async fn from_response(response: reqwest::Response) -> Error {
+        let status = response.status();
+        let header = response.headers().clone();
+        let error_type = header
+            .get("X-Dragonfly-Error-Type")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let header = headermap_to_hashmap(&header);
+        let message = response.text().await.ok();
+
+        match error_type.as_deref() {
+            Some("backend") => Error::BackendError(BackendError {
+                message,
+                header,
+                status_code: Some(status),
+            }),
+            Some("proxy") => Error::ProxyError(ProxyError {
+                message,
+                header,
+                status_code: Some(status),
+            }),
+            Some("dfdaemon") => Error::DfdaemonError(DfdaemonError {
+                message,
+                header,
+                status_code: Some(status),
+            }),
+            Some(other) => Error::ProxyError(ProxyError {
+                message: Some(format!("unknown error type from proxy: {other}")),
+                header,
+                status_code: Some(status),
+            }),
+            None => Error::ProxyError(ProxyError {
+                message: Some(format!("unexpected status code from proxy: {status}")),
+                header,
+                status_code: Some(status),
+            }),
         }
     }
 }

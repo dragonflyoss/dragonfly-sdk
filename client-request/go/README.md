@@ -184,6 +184,42 @@ defer resp.Body.Close()
 // resp, err := proxyWithEndpoints.GetInto(ctx, req, w)
 ```
 
+Share the seed peers across processes, such as several clients on a host, so
+only one of them lists the seed peers from the scheduler and checks their
+health. `Scheduler.ListSeedPeers` returns every seed peer with its health, and a
+proxy created with `WithProxySeedPeers` neither connects to the scheduler nor
+refreshes them, which `UpdateSeedPeers` does instead. The consistent hash ring
+is built from every seed peer, healthy or not, so a task stays on its replicas:
+an unhealthy replica is skipped, the request failing when every replica is, and
+serves the task again once it recovers. A seed peer proxy failing 5 requests in
+a row is skipped for 30 seconds:
+
+```go
+scheduler, err := request.NewScheduler("http://127.0.0.1:8002", 5*time.Second)
+if err != nil {
+    panic(err)
+}
+defer scheduler.Close()
+
+seedPeers, err := scheduler.ListSeedPeers(ctx)
+if err != nil {
+    panic(err)
+}
+
+proxy, err := request.New(ctx, "", request.WithProxySeedPeers(seedPeers))
+if err != nil {
+    panic(err)
+}
+defer proxy.Close()
+
+// Later, replace them with the ones listed again, such as by another process.
+seedPeers, err = scheduler.ListSeedPeers(ctx)
+if err != nil {
+    panic(err)
+}
+proxy.UpdateSeedPeers(seedPeers)
+```
+
 See [examples](./examples) for runnable examples.
 
 ## Documentation

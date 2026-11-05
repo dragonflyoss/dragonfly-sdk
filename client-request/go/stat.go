@@ -72,7 +72,11 @@ func (p *Proxy) StatImage(ctx context.Context, req *StatImageRequest) (*StatImag
 		statImageRequest.Platform = &req.platform
 	}
 
-	resp, err := schedulerv2.NewSchedulerClient(p.schedulerConn).StatImage(ctx, statImageRequest,
+	if p.scheduler == nil {
+		return nil, fmt.Errorf("%w: stat image needs a scheduler endpoint", ErrInvalidArgument)
+	}
+
+	resp, err := p.scheduler.Client().StatImage(ctx, statImageRequest,
 		grpc.MaxCallRecvMsgSize(math.MaxInt32),
 		grpc.MaxCallSendMsgSize(math.MaxInt32),
 	)

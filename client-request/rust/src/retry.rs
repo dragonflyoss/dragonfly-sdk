@@ -29,8 +29,8 @@
 //! ```
 //!
 //! [`Error::is_retryable`] decides what is transient, [`RetryPolicy::delays`] how
-//! long each retry waits. [`retry`] runs the same loop against one fixed target
-//! and serves the preheat of a single seed peer.
+//! long each retry waits. [`RetryPolicy::run`] runs the same loop against one
+//! fixed target and serves the preheat of a single seed peer.
 
 use crate::errors::Error;
 use crate::Result;
@@ -82,80 +82,81 @@ impl RetryPolicy {
             )),
         }
     }
-}
 
-/// Sleeps for the delay, returning at once for a zero delay so retries without a
-/// backoff never yield to the timer.
-async fn sleep(delay: Duration) {
-    if !delay.is_zero() {
-        tokio::time::sleep(delay).await;
+    /// Sleeps for the delay, returning at once for a zero delay so retries
+    /// without a backoff never yield to the timer.
+    async fn sleep(delay: Duration) {
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
     }
-}
 
-/// Runs `attempt` until it succeeds, fails definitively, or has been retried
-/// `max_retries` times, that is at most `1 + max_retries` attempts in total.
-///
-/// ```text
-/// attempt ──Ok(v)─────────────────────────────────────────▶ Ok(v)
-///    │
-///    └─Err(e)──▶ is_retryable(e)? ──no────────────────────▶ Err(e)
-///                      │ yes
-///                      └─▶ retried < max_retries? ──no────▶ Err(e)
-///                               │ yes
-///                               └─▶ retried += 1, sleep(delay) ──▶ attempt
-/// ```
-pub(crate) async fn retry<T, F, Fut>(policy: RetryPolicy, attempt: F) -> Result<T>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T>>,
-{
-    attempt
-        .retry(policy.delays())
-        .sleep(sleep)
+    /// Runs `attempt` until it succeeds, fails definitively, or has been
+    /// retried `max_retries` times, that is at most `1 + max_retries` attempts
+    /// in total.
+    ///
+    /// ```text
+    /// attempt ──Ok(v)─────────────────────────────────────────▶ Ok(v)
+    ///    │
+    ///    └─Err(e)──▶ is_retryable(e)? ──no────────────────────▶ Err(e)
+    ///                      │ yes
+    ///                      └─▶ retried < max_retries? ──no────▶ Err(e)
+    ///                               │ yes
+    ///                               └─▶ retried += 1, sleep(delay) ──▶ attempt
+    /// ```
+    pub(crate) async fn run<T, F, Fut>(&self, attempt: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        attempt
+            .retry(self.delays())
+            .sleep(Self::sleep)
+            .when(Error::is_retryable)
+            .await
+    }
+
+    /// Runs `attempt` like [`run`](Self::run), every attempt aimed at the next
+    /// endpoint of a shuffled order, wrapping around when the endpoints run out
+    /// before the retries do.
+    ///
+    /// `ctx` is threaded through each attempt and handed back with the result,
+    /// so state such as a partially filled buffer survives across attempts.
+    /// Fails with [`Error::InvalidArgument`] when `endpoints` is empty.
+    pub(crate) async fn run_with_endpoints<Ctx, T, F, Fut>(
+        &self,
+        endpoints: &[String],
+        ctx: Ctx,
+        mut attempt: F,
+    ) -> (Ctx, Result<T>)
+    where
+        F: FnMut(Ctx, String) -> Fut,
+        Fut: Future<Output = (Ctx, Result<T>)>,
+    {
+        if endpoints.is_empty() {
+            return (
+                ctx,
+                Err(Error::InvalidArgument(
+                    "no endpoints to send request".to_string(),
+                )),
+            );
+        }
+
+        let mut shuffled: Vec<&String> = endpoints.iter().collect();
+        shuffled.shuffle(&mut rand::rng());
+
+        let mut attempts = 0usize;
+        (|ctx: Ctx| {
+            let endpoint = shuffled[attempts % shuffled.len()].clone();
+            attempts += 1;
+            attempt(ctx, endpoint)
+        })
+        .retry(self.delays())
+        .sleep(Self::sleep)
+        .context(ctx)
         .when(Error::is_retryable)
         .await
-}
-
-/// Runs `attempt` like [`retry`], every attempt aimed at the next endpoint of a
-/// shuffled order, wrapping around when the endpoints run out before the
-/// retries do.
-///
-/// `ctx` is threaded through each attempt and handed back with the result, so
-/// state such as a partially filled buffer survives across attempts. Fails with
-/// [`Error::InvalidArgument`] when `endpoints` is empty.
-pub(crate) async fn retry_with_endpoints<Ctx, T, F, Fut>(
-    policy: RetryPolicy,
-    endpoints: &[String],
-    ctx: Ctx,
-    mut attempt: F,
-) -> (Ctx, Result<T>)
-where
-    F: FnMut(Ctx, String) -> Fut,
-    Fut: Future<Output = (Ctx, Result<T>)>,
-{
-    if endpoints.is_empty() {
-        return (
-            ctx,
-            Err(Error::InvalidArgument(
-                "no endpoints to send request".to_string(),
-            )),
-        );
     }
-
-    let mut shuffled: Vec<&String> = endpoints.iter().collect();
-    shuffled.shuffle(&mut rand::rng());
-
-    let mut attempts = 0usize;
-    (|ctx: Ctx| {
-        let endpoint = shuffled[attempts % shuffled.len()].clone();
-        attempts += 1;
-        attempt(ctx, endpoint)
-    })
-    .retry(policy.delays())
-    .sleep(sleep)
-    .context(ctx)
-    .when(Error::is_retryable)
-    .await
 }
 
 #[cfg(test)]
@@ -251,13 +252,13 @@ mod tests {
             let endpoints = vec!["a".to_string()];
 
             let start = tokio::time::Instant::now();
-            let result: Result<()> = retry(policy, || async { Err(internal()) }).await;
+            let result: Result<()> = policy.run(|| async { Err(internal()) }).await;
             assert!(result.is_err(), "policy: {policy:?}");
             expect(start.elapsed());
 
             let start = tokio::time::Instant::now();
-            let ((), result) =
-                retry_with_endpoints(policy, &endpoints, (), |(), _endpoint| async {
+            let ((), result) = policy
+                .run_with_endpoints(&endpoints, (), |(), _endpoint| async {
                     ((), Err::<(), _>(internal()))
                 })
                 .await;
@@ -267,7 +268,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_stops_on_success_definitive_failure_or_exhausted_retries() {
+    async fn run_stops_on_success_definitive_failure_or_exhausted_retries() {
         let test_cases: Vec<(u8, Vec<Error>, ExpectAttempts)> = vec![
             (3, vec![], |attempts, result| {
                 assert!(result.is_ok(), "result: {result:?}");
@@ -298,18 +299,19 @@ mod tests {
         for (max_retries, failures, expect) in test_cases {
             let mut failures = VecDeque::from(failures);
             let mut attempts = 0usize;
-            let result = retry(policy(max_retries), || {
-                attempts += 1;
-                let failure = failures.pop_front();
-                async move { failure.map_or(Ok(()), Err) }
-            })
-            .await;
+            let result = policy(max_retries)
+                .run(|| {
+                    attempts += 1;
+                    let failure = failures.pop_front();
+                    async move { failure.map_or(Ok(()), Err) }
+                })
+                .await;
             expect(attempts, result);
         }
     }
 
     #[tokio::test]
-    async fn retry_with_endpoints_rotates_the_endpoints_and_stops_like_retry() {
+    async fn run_with_endpoints_rotates_the_endpoints_and_stops_like_run() {
         let test_cases: Vec<(Vec<&str>, u8, Vec<Error>, ExpectEndpoints)> = vec![
             (vec![], 3, vec![], |attempts, result| {
                 assert!(matches!(result, Err(Error::InvalidArgument(_))));
@@ -371,17 +373,17 @@ mod tests {
                 .map(|endpoint| endpoint.to_string())
                 .collect();
             let mut failures = VecDeque::from(failures);
-            let (attempts, result) = retry_with_endpoints(
-                policy(max_retries),
-                &endpoints,
-                Vec::new(),
-                |mut attempts: Vec<String>, endpoint| {
-                    attempts.push(endpoint);
-                    let failure = failures.pop_front();
-                    async move { (attempts, failure.map_or(Ok(()), Err)) }
-                },
-            )
-            .await;
+            let (attempts, result) = policy(max_retries)
+                .run_with_endpoints(
+                    &endpoints,
+                    Vec::new(),
+                    |mut attempts: Vec<String>, endpoint| {
+                        attempts.push(endpoint);
+                        let failure = failures.pop_front();
+                        async move { (attempts, failure.map_or(Ok(()), Err)) }
+                    },
+                )
+                .await;
             expect(&attempts, result);
         }
     }

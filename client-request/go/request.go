@@ -23,9 +23,12 @@ package request
 import (
 	"context"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	managertypes "d7y.io/dragonfly/v2/manager/types"
@@ -288,6 +291,97 @@ func (r *GetRequest) validate() error {
 	}
 
 	return nil
+}
+
+// send sends the request once through the client of a seed peer proxy,
+// returning the response of a 2xx answer and the error of any other, named by
+// the X-Dragonfly-Error-Type header.
+func (r *GetRequest) send(ctx context.Context, client *http.Client) (*http.Response, error) {
+	headers, err := r.headers()
+	if err != nil {
+		return nil, err
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, r.url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+	}
+	httpReq.Header = headers
+
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, fmt.Errorf("%w: %v", ErrRequestTimeout, err)
+		}
+
+		return nil, fmt.Errorf("%w: %v", ErrInternal, err)
+	}
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return resp, nil
+	}
+	defer resp.Body.Close()
+
+	message, _ := io.ReadAll(resp.Body)
+	header := resp.Header.Clone()
+	switch errorType := resp.Header.Get("X-Dragonfly-Error-Type"); errorType {
+	case "backend":
+		return nil, &BackendError{Message: string(message), Header: header, StatusCode: resp.StatusCode}
+	case "proxy":
+		return nil, &ProxyError{Message: string(message), Header: header, StatusCode: resp.StatusCode}
+	case "dfdaemon":
+		return nil, &DfdaemonError{Message: string(message), Header: header, StatusCode: resp.StatusCode}
+	case "":
+		return nil, &ProxyError{
+			Message:    fmt.Sprintf("unexpected status code from proxy: %d", resp.StatusCode),
+			Header:     header,
+			StatusCode: resp.StatusCode,
+		}
+	default:
+		return nil, &ProxyError{
+			Message:    fmt.Sprintf("unknown error type from proxy: %s", errorType),
+			Header:     header,
+			StatusCode: resp.StatusCode,
+		}
+	}
+}
+
+// headers returns the headers of the request with the P2P related ones
+// applied.
+func (r *GetRequest) headers() (http.Header, error) {
+	headers := r.header.Clone()
+	if headers == nil {
+		headers = make(http.Header)
+	}
+
+	if r.pieceLength != nil {
+		headers.Set("X-Dragonfly-Piece-Length", strconv.FormatUint(*r.pieceLength, 10))
+	}
+
+	if r.tag != "" {
+		headers.Set("X-Dragonfly-Tag", r.tag)
+	}
+
+	if r.application != "" {
+		headers.Set("X-Dragonfly-Application", r.application)
+	}
+
+	if r.contentForCalculatingTaskID != "" {
+		headers.Set("X-Dragonfly-Content-For-Calculating-Task-ID", r.contentForCalculatingTaskID)
+	}
+
+	headers.Set("X-Dragonfly-Enable-Task-ID-Based-Blob-Digest", strconv.FormatBool(r.enableTaskIDBasedBlobDigest))
+
+	if r.priority != nil {
+		headers.Set("X-Dragonfly-Priority", strconv.FormatInt(int64(*r.priority), 10))
+	}
+
+	if len(r.filteredQueryParams) > 0 {
+		headers.Set("X-Dragonfly-Filtered-Query-Params", strings.Join(r.filteredQueryParams, ","))
+	}
+
+	headers.Set("X-Dragonfly-Use-P2P", "true")
+	return headers, nil
 }
 
 // GetResponse represents a GET response received via the Dragonfly.

@@ -25,15 +25,10 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"strconv"
-	"strings"
 	"time"
 
-	schedulerv2 "d7y.io/api/v2/pkg/apis/scheduler/v2"
 	"d7y.io/dragonfly/v2/pkg/idgen"
 	"github.com/cenkalti/backoff/v5"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 
 	"d7y.io/dragonfly-sdk/client-request/go/internal/pool"
 	"d7y.io/dragonfly-sdk/client-request/go/internal/selector"
@@ -111,6 +106,50 @@ func WithProxyHealthCheckInterval(interval time.Duration) ProxyOption {
 	return func(p *Proxy) { p.healthCheckInterval = interval }
 }
 
+// WithProxySeedPeers sets the seed peers of the cluster to select from, such
+// as the ones Scheduler.ListSeedPeers returns, instead of the scheduler
+// endpoint, which New then ignores: the proxy neither connects to the scheduler
+// nor refreshes them, which UpdateSeedPeers replaces, but still selects the
+// replicas of every request by the consistent hash ring. Unlike the endpoints
+// of NewWithEndpoints, which are the replicas already selected for one
+// request, such as by LookupEndpoints.
+func WithProxySeedPeers(seedPeers []SeedPeer) ProxyOption {
+	return func(p *Proxy) {
+		if seedPeers == nil {
+			seedPeers = []SeedPeer{}
+		}
+
+		p.seedPeers = seedPeers
+	}
+}
+
+// SeedPeer is a seed peer listed by the scheduler, with the result of its
+// health check.
+type SeedPeer = selector.SeedPeer
+
+// Scheduler is the scheduler the seed peers are listed from. The seed peers
+// its ListSeedPeers lists can be shared, such as by several processes on a
+// host, and served through WithProxySeedPeers without each process connecting
+// to the scheduler.
+type Scheduler = selector.Scheduler
+
+// NewScheduler creates a scheduler at the given endpoint, e.g.
+// "http://scheduler-service:8002", its requests bounded by requestTimeout.
+// The caller must close it.
+func NewScheduler(endpoint string, requestTimeout time.Duration) (*Scheduler, error) {
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Host == "" {
+		return nil, fmt.Errorf("%w: invalid scheduler endpoint: %s", ErrInvalidArgument, endpoint)
+	}
+
+	scheduler, err := selector.NewScheduler(u.Host, requestTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to connect to scheduler %s: %v", ErrInternal, endpoint, err)
+	}
+
+	return scheduler, nil
+}
+
 // Ensure Proxy implements the Request interface at compile time.
 var _ Request = (*Proxy)(nil)
 
@@ -126,14 +165,18 @@ type Proxy struct {
 	// healthCheckInterval is the interval of health check for seed peers.
 	healthCheckInterval time.Duration
 
+	// seedPeers is the seed peers serving the requests instead of the ones
+	// the scheduler lists.
+	seedPeers []SeedPeer
+
 	// seedPeerSelector is the selector service for selecting seed peers.
 	seedPeerSelector *selector.SeedPeerSelector
 
 	// clientPool is the pool of clients.
 	clientPool *pool.Pool
 
-	// schedulerConn is the connection to the scheduler service.
-	schedulerConn *grpc.ClientConn
+	// scheduler is the scheduler service the seed peers are listed from.
+	scheduler *selector.Scheduler
 }
 
 // New creates a Proxy that connects to the given scheduler endpoint,
@@ -149,28 +192,33 @@ func New(ctx context.Context, schedulerEndpoint string, opts ...ProxyOption) (*P
 		opt(p)
 	}
 
-	target, err := p.validate(schedulerEndpoint)
+	if err := p.validate(); err != nil {
+		return nil, err
+	}
+
+	// Create seed peer selector, from the given seed peers or the ones the
+	// scheduler lists.
+	p.seedPeerSelector = selector.New()
+	if p.seedPeers != nil {
+		p.seedPeerSelector.Update(p.seedPeers)
+		return p, nil
+	}
+
+	scheduler, err := NewScheduler(schedulerEndpoint, p.schedulerRequestTimeout)
 	if err != nil {
 		return nil, err
 	}
 
-	schedulerConn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return nil, fmt.Errorf("%w: failed to connect to scheduler %s: %v", ErrInternal, schedulerEndpoint, err)
-	}
-
-	seedPeerSelector, err := selector.New(ctx, schedulerv2.NewSchedulerClient(schedulerConn), p.healthCheckInterval, p.schedulerRequestTimeout)
-	if err != nil {
-		schedulerConn.Close()
+	if err := p.seedPeerSelector.Refresh(ctx, scheduler); err != nil {
+		scheduler.Close()
 		return nil, fmt.Errorf("%w: failed to create seed peer selector: %v", ErrInternal, err)
 	}
 
 	// Run the selector service in the background to refresh the seed peers
 	// periodically.
-	go seedPeerSelector.Run()
+	go p.seedPeerSelector.Run(scheduler, p.healthCheckInterval)
 
-	p.seedPeerSelector = seedPeerSelector
-	p.schedulerConn = schedulerConn
+	p.scheduler = scheduler
 	return p, nil
 }
 
@@ -178,29 +226,42 @@ func New(ctx context.Context, schedulerEndpoint string, opts ...ProxyOption) (*P
 // connection.
 func (p *Proxy) Close() error {
 	p.seedPeerSelector.Close()
-	return p.schedulerConn.Close()
+	if p.scheduler == nil {
+		return nil
+	}
+
+	return p.scheduler.Close()
 }
 
-// validate validates the input parameters and returns the scheduler grpc target.
-func (p *Proxy) validate(schedulerEndpoint string) (string, error) {
-	u, err := url.Parse(schedulerEndpoint)
-	if err != nil || u.Host == "" {
-		return "", fmt.Errorf("%w: invalid scheduler endpoint: %s", ErrInvalidArgument, schedulerEndpoint)
+// UpdateSeedPeers replaces the seed peers serving the requests, such as the
+// ones Scheduler.ListSeedPeers returns, for a proxy created with
+// WithProxySeedPeers. The consistent hash ring is rebuilt only when the seed
+// peers change, not when their health does, so a task stays on its replicas:
+// an unhealthy replica is skipped, the task failing when every replica is, and
+// serves it again once it recovers.
+func (p *Proxy) UpdateSeedPeers(seedPeers []SeedPeer) {
+	p.seedPeerSelector.Update(seedPeers)
+}
+
+// validate validates the input parameters.
+func (p *Proxy) validate() error {
+	if p.seedPeers != nil && len(p.seedPeers) == 0 {
+		return fmt.Errorf("%w: seed peers must not be empty", ErrInvalidArgument)
 	}
 
 	if p.schedulerRequestTimeout < 100*time.Millisecond {
-		return "", fmt.Errorf("%w: scheduler request timeout must be at least 100 milliseconds", ErrInvalidArgument)
+		return fmt.Errorf("%w: scheduler request timeout must be at least 100 milliseconds", ErrInvalidArgument)
 	}
 
 	if p.healthCheckInterval < time.Second || p.healthCheckInterval > 600*time.Second {
-		return "", fmt.Errorf("%w: health check interval must be between 1 and 600 seconds", ErrInvalidArgument)
+		return fmt.Errorf("%w: health check interval must be between 1 and 600 seconds", ErrInvalidArgument)
 	}
 
 	if p.retry.maxRetries > 10 {
-		return "", fmt.Errorf("%w: max retries must be between 0 and 10", ErrInvalidArgument)
+		return fmt.Errorf("%w: max retries must be between 0 and 10", ErrInvalidArgument)
 	}
 
-	return u.Host, nil
+	return nil
 }
 
 // httpClientFactory creates a new HTTP client configured to use the specified
@@ -241,7 +302,14 @@ func (p *Proxy) Get(ctx context.Context, req *GetRequest) (*GetResponse, error) 
 		return nil, err
 	}
 
-	resp, cancel, err := p.trySend(ctx, req)
+	endpoints, err := p.lookupProxyEndpoints(req)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, cancel, err := p.retry.runWithEndpoints(ctx, endpoints, req.timeout, func(ctx context.Context, endpoint string) (*http.Response, error) {
+		return p.sendTo(ctx, endpoint, req)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -256,7 +324,14 @@ func (p *Proxy) GetInto(ctx context.Context, req *GetRequest, w io.Writer) (*Get
 		return nil, err
 	}
 
-	resp, cancel, err := p.trySend(ctx, req)
+	endpoints, err := p.lookupProxyEndpoints(req)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, cancel, err := p.retry.runWithEndpoints(ctx, endpoints, req.timeout, func(ctx context.Context, endpoint string) (*http.Response, error) {
+		return p.sendTo(ctx, endpoint, req)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -323,120 +398,35 @@ func (p *Proxy) lookupProxyEndpoints(req *GetRequest) ([]string, error) {
 
 	endpoints := make([]string, 0, len(seedPeers))
 	for _, peer := range seedPeers {
-		// TODO(chlins): Support client https scheme.
-		endpoints = append(endpoints, fmt.Sprintf("http://%s", net.JoinHostPort(peer.Ip, strconv.Itoa(int(peer.ProxyPort)))))
+		endpoints = append(endpoints, p.seedPeerSelector.ProxyEndpoint(peer))
 	}
 
 	return endpoints, nil
 }
 
-// trySend sends the request to the seed peers serving it, retrying a transient
-// failure on the next one, see retryWithEndpoints.
-func (p *Proxy) trySend(ctx context.Context, req *GetRequest) (*http.Response, context.CancelFunc, error) {
-	endpoints, err := p.lookupProxyEndpoints(req)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return retryWithEndpoints(ctx, p.retry, endpoints, req.timeout, func(ctx context.Context, endpoint string) (*http.Response, error) {
-		entry, err := p.clientPool.Entry(endpoint, endpoint)
-		if err != nil {
-			return nil, err
-		}
-
-		guard := entry.RequestGuard()
-		defer guard.Done()
-		return p.send(ctx, entry.Client, req)
-	})
-}
-
-// send sends a request to the specified URL via the client with the given
-// headers.
-func (p *Proxy) send(ctx context.Context, client *http.Client, req *GetRequest) (*http.Response, error) {
-	headers, err := makeRequestHeaders(req)
+// sendTo sends the request once to the seed peer proxy at endpoint through its
+// pooled client, recording whether the proxy answered, so a proxy that keeps
+// failing is ejected.
+func (p *Proxy) sendTo(ctx context.Context, endpoint string, req *GetRequest) (*http.Response, error) {
+	entry, err := p.clientPool.Entry(endpoint, endpoint)
 	if err != nil {
 		return nil, err
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, req.url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
-	}
-	httpReq.Header = headers
+	guard := entry.RequestGuard()
+	defer guard.Done()
 
-	resp, err := client.Do(httpReq)
-	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			return nil, fmt.Errorf("%w: %v", ErrRequestTimeout, err)
-		}
-
-		return nil, fmt.Errorf("%w: %v", ErrInternal, err)
+	// A request the caller cancelled says nothing about the proxy, so only a
+	// failure while its context is alive counts.
+	resp, err := req.send(ctx, entry.Client)
+	switch {
+	case err == nil:
+		p.seedPeerSelector.OnSuccess(endpoint)
+	case errors.Is(err, ErrInternal) && ctx.Err() == nil:
+		p.seedPeerSelector.OnFailure(endpoint)
 	}
 
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		return resp, nil
-	}
-	defer resp.Body.Close()
-
-	message, _ := io.ReadAll(resp.Body)
-	header := resp.Header.Clone()
-	switch errorType := resp.Header.Get("X-Dragonfly-Error-Type"); errorType {
-	case "backend":
-		return nil, &BackendError{Message: string(message), Header: header, StatusCode: resp.StatusCode}
-	case "proxy":
-		return nil, &ProxyError{Message: string(message), Header: header, StatusCode: resp.StatusCode}
-	case "dfdaemon":
-		return nil, &DfdaemonError{Message: string(message), Header: header, StatusCode: resp.StatusCode}
-	case "":
-		return nil, &ProxyError{
-			Message:    fmt.Sprintf("unexpected status code from proxy: %d", resp.StatusCode),
-			Header:     header,
-			StatusCode: resp.StatusCode,
-		}
-	default:
-		return nil, &ProxyError{
-			Message:    fmt.Sprintf("unknown error type from proxy: %s", errorType),
-			Header:     header,
-			StatusCode: resp.StatusCode,
-		}
-	}
-}
-
-// makeRequestHeaders applies p2p related headers to the request headers.
-func makeRequestHeaders(req *GetRequest) (http.Header, error) {
-	headers := req.header.Clone()
-	if headers == nil {
-		headers = make(http.Header)
-	}
-
-	if req.pieceLength != nil {
-		headers.Set("X-Dragonfly-Piece-Length", strconv.FormatUint(*req.pieceLength, 10))
-	}
-
-	if req.tag != "" {
-		headers.Set("X-Dragonfly-Tag", req.tag)
-	}
-
-	if req.application != "" {
-		headers.Set("X-Dragonfly-Application", req.application)
-	}
-
-	if req.contentForCalculatingTaskID != "" {
-		headers.Set("X-Dragonfly-Content-For-Calculating-Task-ID", req.contentForCalculatingTaskID)
-	}
-
-	headers.Set("X-Dragonfly-Enable-Task-ID-Based-Blob-Digest", strconv.FormatBool(req.enableTaskIDBasedBlobDigest))
-
-	if req.priority != nil {
-		headers.Set("X-Dragonfly-Priority", strconv.FormatInt(int64(*req.priority), 10))
-	}
-
-	if len(req.filteredQueryParams) > 0 {
-		headers.Set("X-Dragonfly-Filtered-Query-Params", strings.Join(req.filteredQueryParams, ","))
-	}
-
-	headers.Set("X-Dragonfly-Use-P2P", "true")
-	return headers, nil
+	return resp, err
 }
 
 // cancelReadCloser cancels the request timeout context when the body is fully

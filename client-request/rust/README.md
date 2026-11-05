@@ -134,6 +134,31 @@ let response = proxy_with_endpoints.get(&request).await?;
 // let response = proxy_with_endpoints.get_into(&request, &mut buf).await?;
 ```
 
+Share the seed peers across processes, such as several clients on a host, so
+only one of them lists the seed peers from the scheduler and checks their
+health. `Scheduler::list_seed_peers` returns every seed peer with its health,
+and a proxy built from them neither connects to the scheduler nor refreshes
+them, which `update_seed_peers` does instead. The consistent hash ring is built
+from every seed peer, healthy or not, so a task stays on its replicas: an
+unhealthy replica is skipped, the request failing when every replica is, and
+serves the task again once it recovers. A seed peer proxy failing 5 requests in
+a row is skipped for 30 seconds:
+
+```rust
+use dragonfly_client_request::Scheduler;
+
+let scheduler = Scheduler::connect("http://127.0.0.1:8002", Duration::from_secs(5)).await?;
+let seed_peers = scheduler.list_seed_peers().await?;
+let proxy = Proxy::builder()
+    .seed_peers(seed_peers)
+    .build()
+    .await?;
+
+// Later, replace them with the ones listed again, such as by another process.
+let seed_peers = scheduler.list_seed_peers().await?;
+proxy.update_seed_peers(seed_peers).await;
+```
+
 The `preheat` feature enables preheating OCI images by resolving manifests from
 the registry and triggering seed peers to download each blob, querying the
 distribution of an OCI image with the layers cached by each seed peer, and

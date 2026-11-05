@@ -145,16 +145,14 @@ func (p *Proxy) delete(ctx context.Context, peer *commonv2.Host, deleteTaskReque
 	defer conn.Close()
 
 	client := dfdaemonv2.NewDfdaemonUploadClient(conn)
-	_, err = retry(ctx, p.retry, func() (struct{}, error) {
+	return p.retry.run(ctx, func() error {
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 
 		if _, err := client.DeleteTask(ctx, deleteTaskRequest); err != nil && status.Code(err) != codes.NotFound {
-			return struct{}{}, fmt.Errorf("%w: failed to delete task %s: %w", ErrInternal, deleteTaskRequest.GetTaskId(), err)
+			return fmt.Errorf("%w: failed to delete task %s: %w", ErrInternal, deleteTaskRequest.GetTaskId(), err)
 		}
 
-		return struct{}{}, nil
+		return nil
 	})
-
-	return err
 }
