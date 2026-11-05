@@ -429,31 +429,22 @@ mod tests {
         }
     }
 
-    async fn create_test_selector(hosts: Vec<(Host, bool)>) -> SeedPeerSelector {
+    async fn create_test_selector() -> SeedPeerSelector {
         let selector = SeedPeerSelector::new();
-        selector
-            .update(
-                hosts
-                    .into_iter()
-                    .map(|(host, healthy)| SeedPeer { host, healthy })
-                    .collect(),
-            )
-            .await;
+        selector.seed_peers.write().await.hashring = VNodeHashRing::with_vnodes_per_node(1);
         selector
     }
 
-    async fn create_healthy_test_selector(count: usize) -> SeedPeerSelector {
-        create_test_selector(
-            (1..=count)
-                .map(|i| {
-                    (
-                        create_test_host(&i.to_string(), &format!("192.168.1.{i}"), 8080, 1),
-                        true,
-                    )
-                })
-                .collect(),
-        )
-        .await
+    fn create_test_seed_peers(count: usize, unhealthy_id: &str) -> Vec<SeedPeer> {
+        (1..=count)
+            .map(|i| {
+                let host = create_test_host(&i.to_string(), &format!("192.168.1.{i}"), 8080, 1);
+                SeedPeer {
+                    healthy: host.id != unhealthy_id,
+                    host,
+                }
+            })
+            .collect()
     }
 
     async fn select_ids(selector: &SeedPeerSelector, task_id: &str, replicas: u32) -> Vec<String> {
@@ -466,9 +457,21 @@ mod tests {
             .collect()
     }
 
+    async fn add_test_host(selector: &SeedPeerSelector, host: Host) {
+        let mut seed_peers = selector.seed_peers.write().await;
+        seed_peers.hashring.add(host.name.clone());
+        seed_peers.hosts.insert(
+            host.name.clone(),
+            SeedPeer {
+                host,
+                healthy: true,
+            },
+        );
+    }
+
     #[tokio::test]
     async fn select_with_no_hosts() {
-        let selector = create_test_selector(vec![]).await;
+        let selector = create_test_selector().await;
 
         let result = selector.select("test-task".to_string(), 2).await;
         assert!(result.is_err());
@@ -477,7 +480,10 @@ mod tests {
 
     #[tokio::test]
     async fn select_with_single_host() {
-        let selector = create_healthy_test_selector(1).await;
+        let selector = create_test_selector().await;
+
+        let host = create_test_host("1", "192.168.1.1", 8080, 1);
+        add_test_host(&selector, host).await;
 
         let result = selector.select("test-task".to_string(), 1).await;
         assert!(result.is_ok());
@@ -493,7 +499,11 @@ mod tests {
         let test_cases = vec![(5, 3, 3), (2, 5, 2), (20, 10, 10)];
 
         for (host_count, replicas, expected_len) in test_cases {
-            let selector = create_healthy_test_selector(host_count).await;
+            let selector = create_test_selector().await;
+            for i in 1..=host_count {
+                let host = create_test_host(&i.to_string(), &format!("192.168.1.{i}"), 8080, 1);
+                add_test_host(&selector, host).await;
+            }
 
             let hosts = selector
                 .select("test-task".to_string(), replicas)
@@ -516,12 +526,16 @@ mod tests {
 
     #[tokio::test]
     async fn select_all() {
-        let selector = create_test_selector(vec![]).await;
+        let selector = create_test_selector().await;
 
         let result = selector.select_all().await;
         assert!(matches!(result, Err(Error::HostNotFound(_))));
 
-        let selector = create_healthy_test_selector(5).await;
+        for i in 1..=5 {
+            let host = create_test_host(&i.to_string(), &format!("192.168.1.{i}"), 8080, 1);
+            add_test_host(&selector, host).await;
+        }
+
         let hosts = selector.select_all().await.unwrap();
         assert_eq!(hosts.len(), 5);
 
@@ -531,19 +545,14 @@ mod tests {
 
     #[tokio::test]
     async fn select_all_skips_unhealthy_seed_peers() {
-        let selector = create_test_selector(vec![
-            (create_test_host("1", "192.168.1.1", 8080, 1), true),
-            (create_test_host("2", "192.168.1.2", 8080, 1), false),
-        ])
-        .await;
+        let selector = SeedPeerSelector::new();
+        selector.update(create_test_seed_peers(2, "2")).await;
 
         let hosts = selector.select_all().await.unwrap();
         assert_eq!(hosts.len(), 1);
         assert_eq!(hosts[0].id, "1");
 
-        let selector =
-            create_test_selector(vec![(create_test_host("1", "192.168.1.1", 8080, 1), false)])
-                .await;
+        selector.update(create_test_seed_peers(1, "1")).await;
         assert!(matches!(
             selector.select_all().await,
             Err(Error::HostNotFound(_))
@@ -552,7 +561,12 @@ mod tests {
 
     #[tokio::test]
     async fn select_consistency() {
-        let selector = create_healthy_test_selector(5).await;
+        let selector = create_test_selector().await;
+
+        for i in 1..=5 {
+            let host = create_test_host(&i.to_string(), &format!("192.168.1.{i}"), 8080, 1);
+            add_test_host(&selector, host).await;
+        }
 
         let task_id = "consistent-task".to_string();
 
@@ -573,7 +587,12 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_select() {
-        let selector = Arc::new(create_healthy_test_selector(5).await);
+        let selector = Arc::new(create_test_selector().await);
+
+        for i in 1..=5 {
+            let host = create_test_host(&i.to_string(), &format!("192.168.1.{i}"), 8080, 1);
+            add_test_host(&selector, host).await;
+        }
 
         let mut handles = vec![];
         for i in 0..10 {
@@ -596,28 +615,15 @@ mod tests {
 
     #[tokio::test]
     async fn select_serves_a_task_only_from_its_available_replicas() {
-        let hosts: Vec<Host> = (1..=5)
-            .map(|i| create_test_host(&i.to_string(), &format!("192.168.1.{i}"), 8080, 1))
-            .collect();
-        let selector =
-            create_test_selector(hosts.iter().map(|host| (host.clone(), true)).collect()).await;
+        let selector = SeedPeerSelector::new();
+        selector.update(create_test_seed_peers(5, "")).await;
         let task_ids: Vec<String> = (0..64).map(|i| format!("task-{i}")).collect();
         let mut healthy_selections = Vec::with_capacity(task_ids.len());
         for task_id in task_ids.iter() {
             healthy_selections.push(select_ids(&selector, task_id, 2).await);
         }
 
-        selector
-            .update(
-                hosts
-                    .iter()
-                    .map(|host| SeedPeer {
-                        host: host.clone(),
-                        healthy: host.id != "3",
-                    })
-                    .collect(),
-            )
-            .await;
+        selector.update(create_test_seed_peers(5, "3")).await;
         for (task_id, healthy_selection) in task_ids.iter().zip(healthy_selections.iter()) {
             let expected: Vec<String> = healthy_selection
                 .iter()
@@ -631,17 +637,7 @@ mod tests {
             );
         }
 
-        selector
-            .update(
-                hosts
-                    .iter()
-                    .map(|host| SeedPeer {
-                        host: host.clone(),
-                        healthy: true,
-                    })
-                    .collect(),
-            )
-            .await;
+        selector.update(create_test_seed_peers(5, "")).await;
         for (task_id, healthy_selection) in task_ids.iter().zip(healthy_selections.iter()) {
             assert_eq!(
                 &select_ids(&selector, task_id, 2).await,
@@ -653,12 +649,23 @@ mod tests {
 
     #[tokio::test]
     async fn select_fails_when_every_replica_is_unavailable() {
-        let selector = create_test_selector(vec![
-            (create_test_host("1", "192.168.1.1", 8080, 1), false),
-            (create_test_host("2", "192.168.1.2", 8080, 1), false),
-            (create_test_host("3", "192.168.1.3", 8080, 1), true),
-        ])
-        .await;
+        let selector = SeedPeerSelector::new();
+        selector
+            .update(vec![
+                SeedPeer {
+                    host: create_test_host("1", "192.168.1.1", 8080, 1),
+                    healthy: false,
+                },
+                SeedPeer {
+                    host: create_test_host("2", "192.168.1.2", 8080, 1),
+                    healthy: false,
+                },
+                SeedPeer {
+                    host: create_test_host("3", "192.168.1.3", 8080, 1),
+                    healthy: true,
+                },
+            ])
+            .await;
         let task_id = (0..64)
             .map(|i| format!("task-{i}"))
             .find(|task_id| {
@@ -674,7 +681,8 @@ mod tests {
 
     #[tokio::test]
     async fn on_failure_ejects_a_proxy_after_consecutive_failures_until_a_success() {
-        let selector = create_healthy_test_selector(2).await;
+        let selector = SeedPeerSelector::new();
+        selector.update(create_test_seed_peers(2, "")).await;
         let task_id = "test-task";
         let replica = selector.select(task_id.to_string(), 1).await.unwrap()[0].clone();
         let endpoint = SeedPeerSelector::proxy_endpoint(&replica).unwrap();
