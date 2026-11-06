@@ -72,7 +72,7 @@ func (p *Proxy) StatImage(ctx context.Context, req *StatImageRequest) (*StatImag
 		statImageRequest.Platform = &req.platform
 	}
 
-	resp, err := schedulerv2.NewSchedulerClient(p.schedulerConn).StatImage(ctx, statImageRequest,
+	resp, err := p.scheduler.Client().StatImage(ctx, statImageRequest,
 		grpc.MaxCallRecvMsgSize(math.MaxInt32),
 		grpc.MaxCallSendMsgSize(math.MaxInt32),
 	)

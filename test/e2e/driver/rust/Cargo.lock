@@ -562,7 +562,7 @@ dependencies = [
 
 [[package]]
 name = "dragonfly-client-request"
-version = "1.10.1"
+version = "1.11.0"
 dependencies = [
  "async-trait",
  "backon",
@@ -573,6 +573,7 @@ dependencies = [
  "futures",
  "hex",
  "hostname",
+ "http",
  "local-ip-address",
  "oci-client",
  "oci-spec",

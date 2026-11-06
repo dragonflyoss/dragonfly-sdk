@@ -26,8 +26,7 @@ use dragonfly_api::dfdaemon::v2::{
     dfdaemon_upload_client::DfdaemonUploadClient as DfdaemonUploadGRPCClient, DeleteTaskRequest,
     DownloadTaskRequest,
 };
-use dragonfly_api::scheduler::v2::scheduler_client::SchedulerClient;
-use errors::{BackendError, DfdaemonError, Error, ProxyError};
+use errors::Error;
 use futures::{Stream, TryStreamExt};
 use http::{default_proxy_rule_filtered_query_params, headermap_to_hashmap};
 use id_generator::{IDGenerator, TaskIDParameter};
@@ -37,19 +36,21 @@ use reqwest::{
     header::{HeaderMap, HeaderValue},
     Client,
 };
-use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
+use reqwest_middleware::{ClientBuilder, ClientWithMiddleware, Middleware, Next};
 use reqwest_tracing::TracingMiddleware;
-use retry::{retry, retry_with_endpoints, RetryPolicy};
+use retry::RetryPolicy;
 use rustls_pki_types::CertificateDer;
 use selector::{SeedPeerSelector, Selector};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tonic::transport::{Channel, Endpoint};
-use tracing::debug;
+use tonic::transport::Channel;
+use tracing::{debug, warn};
 
+#[cfg(feature = "preheat")]
+use dragonfly_api::scheduler::v2::scheduler_client::SchedulerClient as SchedulerGRPCClient;
 #[cfg(feature = "preheat")]
 use dragonfly_api::scheduler::v2::StatImageRequest as SchedulerStatImageRequest;
 #[cfg(feature = "preheat")]
@@ -77,6 +78,7 @@ pub mod id_generator;
 pub use dragonfly_hashring as hashring;
 
 pub use backon::ExponentialBuilder;
+pub use selector::{SchedulerClient, SeedPeer};
 
 mod http;
 mod net;
@@ -154,12 +156,12 @@ pub type Body = Box<dyn Stream<Item = Result<Bytes>> + Send + Unpin>;
 
 /// The interface for sending requests via the Dragonfly.
 ///
-/// A request is served by the seed peers the scheduler picks for its task, and a
-/// seed peer's dfdaemon fetches from the origin only what the P2P network does
-/// not hold yet:
+/// A request is served by the seed peers the consistent hash ring picks for its
+/// task, and a seed peer's dfdaemon fetches from the origin only what the P2P
+/// network does not hold yet:
 ///
 /// ```text
-/// client ──lookup──▶ scheduler ──▶ seed peers [B, A]
+/// client ──lookup──▶ hash ring ──▶ seed peers [B, A]
 ///   │
 ///   └──GET──▶ B (seed peer proxy) ──miss──▶ origin
 ///                 │
@@ -200,8 +202,8 @@ pub trait Request {
     /// Preheats a file: has every replica seed peer, or every seed peer with
     /// `Scope::AllSeedPeers`, download it through the dfdaemon download task API
     /// without streaming it back. A transient failure is retried on the same seed
-    /// peer, so the file lands on every replica. Fails when fewer seed peers than
-    /// replicas are available.
+    /// peer, so the file lands on every replica. Fails when fewer of the task's
+    /// replicas are healthy than `replicas`.
     async fn preheat(&self, request: &PreheatRequest) -> Result<()>;
 
     /// Deletes a preheated file: has every replica seed peer, or every seed peer
@@ -213,7 +215,7 @@ pub trait Request {
 
     /// Returns the proxy endpoints of the seed peers that would serve the request,
     /// in consistent hash ring order for its task id, up to `replicas` of them and
-    /// clamped to the available seed peers.
+    /// skipping the unhealthy or ejected ones.
     async fn lookup_endpoints(&self, request: &GetRequest) -> Result<Vec<String>>;
 }
 
@@ -238,6 +240,26 @@ pub trait RequestWithEndpoints {
     /// `buf`. A transient failure, a failed body read included, is retried on the
     /// next endpoint after `buf` is truncated back to its previous length.
     async fn get_into(&self, request: &GetRequest, buf: &mut BytesMut) -> Result<GetResponse>;
+}
+
+/// The interface for sending requests via the seed peers given at
+/// construction, selected by the consistent hash ring like [`Request`] without
+/// connecting to the scheduler.
+///
+/// Implemented by [`ProxyWithSeedPeers`].
+#[async_trait]
+pub trait RequestWithSeedPeers {
+    /// Sends a GET request via the seed peers and returns a response with a
+    /// streaming body, see [`Request::get`].
+    async fn get(&self, request: &GetRequest) -> Result<GetResponse<Body>>;
+
+    /// Sends a GET request via the seed peers and appends the response body to
+    /// `buf`, see [`Request::get_into`].
+    async fn get_into(&self, request: &GetRequest, buf: &mut BytesMut) -> Result<GetResponse>;
+
+    /// Returns the proxy endpoints of the seed peers that would serve the
+    /// request, see [`Request::lookup_endpoints`].
+    async fn lookup_endpoints(&self, request: &GetRequest) -> Result<Vec<String>>;
 }
 
 /// Represents a GET request to be sent via the Dragonfly.
@@ -310,7 +332,7 @@ impl Default for GetRequest {
     }
 }
 
-/// Implements methods for validating the request.
+/// Implements methods for validating and sending the request.
 impl GetRequest {
     /// Validates the request parameters.
     fn validate(&self) -> Result<()> {
@@ -320,7 +342,116 @@ impl GetRequest {
             ));
         }
 
+        // Only http and https urls go through the seed peer proxies.
+        let url = ::url::Url::parse(&self.url)
+            .map_err(|err| Error::InvalidArgument(format!("invalid url {}: {}", self.url, err)))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(Error::InvalidArgument(format!(
+                "url {} must be http or https",
+                self.url
+            )));
+        }
+
         Ok(())
+    }
+
+    /// Sends the request once through the client of a seed peer proxy, converting
+    /// a non-`2xx` response into an error.
+    async fn send(&self, client: &ClientWithMiddleware) -> Result<reqwest::Response> {
+        let response = client
+            .get(&self.url)
+            .headers(self.proxy_headers()?)
+            .timeout(self.timeout)
+            .send()
+            .await
+            .map_err(|err| match err {
+                reqwest_middleware::Error::Reqwest(err) if err.is_timeout() => {
+                    Error::RequestTimeout(err.to_string())
+                }
+                err => Error::Internal(err.to_string()),
+            })?;
+
+        if !response.status().is_success() {
+            return Err(Error::from_response(response).await);
+        }
+
+        Ok(response)
+    }
+
+    /// Returns the headers of the request with the P2P related ones applied.
+    fn proxy_headers(&self) -> Result<HeaderMap> {
+        let mut headers = self.header.clone();
+        if let Some(piece_length) = self.piece_length {
+            headers.insert(
+                "X-Dragonfly-Piece-Length",
+                piece_length.to_string().parse().map_err(|err| {
+                    Error::InvalidArgument(format!("invalid piece length: {err}"))
+                })?,
+            );
+        }
+
+        if let Some(tag) = &self.tag {
+            headers.insert(
+                "X-Dragonfly-Tag",
+                tag.parse()
+                    .map_err(|err| Error::InvalidArgument(format!("invalid tag: {err}")))?,
+            );
+        }
+
+        if let Some(application) = &self.application {
+            headers.insert(
+                "X-Dragonfly-Application",
+                application
+                    .parse()
+                    .map_err(|err| Error::InvalidArgument(format!("invalid application: {err}")))?,
+            );
+        }
+
+        if let Some(content_for_calculating_task_id) = &self.content_for_calculating_task_id {
+            headers.insert(
+                "X-Dragonfly-Content-For-Calculating-Task-ID",
+                content_for_calculating_task_id.parse().map_err(|err| {
+                    Error::InvalidArgument(format!(
+                        "invalid content for calculating task id: {err}"
+                    ))
+                })?,
+            );
+        }
+
+        headers.insert(
+            "X-Dragonfly-Enable-Task-ID-Based-Blob-Digest",
+            self.enable_task_id_based_blob_digest
+                .to_string()
+                .parse()
+                .map_err(|err| {
+                    Error::InvalidArgument(format!(
+                        "invalid enable task id based blob digest: {err}"
+                    ))
+                })?,
+        );
+
+        if let Some(priority) = self.priority {
+            headers.insert(
+                "X-Dragonfly-Priority",
+                priority
+                    .to_string()
+                    .parse()
+                    .map_err(|err| Error::InvalidArgument(format!("invalid priority: {err}")))?,
+            );
+        }
+
+        if !self.filtered_query_params.is_empty() {
+            let value = self.filtered_query_params.join(",");
+            headers.insert(
+                "X-Dragonfly-Filtered-Query-Params",
+                value.parse().map_err(|err| {
+                    Error::InvalidArgument(format!("invalid filtered query params: {err}"))
+                })?,
+            );
+        }
+
+        headers.insert("X-Dragonfly-Use-P2P", HeaderValue::from_static("true"));
+        Ok(headers)
     }
 }
 
@@ -835,7 +966,11 @@ impl DeleteImageRequest {
 
 /// Factory for creating HTTPClient instances.
 #[derive(Debug, Clone, Default)]
-struct HTTPClientFactory {}
+struct HTTPClientFactory {
+    /// The seed peer selector recording the answers of the proxies, if they can
+    /// be ejected.
+    seed_peer_selector: Option<Arc<SeedPeerSelector>>,
+}
 
 /// Implements Factory for creating reqwest::Client instances with proxy support.
 #[async_trait]
@@ -859,9 +994,67 @@ impl Factory<String, ClientWithMiddleware> for HTTPClientFactory {
             .build()
             .map_err(|err| Error::Internal(format!("failed to build reqwest client: {err}")))?;
 
-        Ok(ClientBuilder::new(client)
-            .with(TracingMiddleware::default())
-            .build())
+        let mut builder = ClientBuilder::new(client).with(TracingMiddleware::default());
+        if let Some(seed_peer_selector) = &self.seed_peer_selector {
+            builder = builder.with(EjectionMiddleware {
+                seed_peer_selector: seed_peer_selector.clone(),
+                endpoint: proxy_addr.clone(),
+            });
+        }
+
+        Ok(builder.build())
+    }
+}
+
+/// The middleware recording whether a seed peer proxy answered, to eject the
+/// proxy that keeps failing to connect.
+#[derive(Debug)]
+struct EjectionMiddleware {
+    /// The seed peer selector recording the answers.
+    seed_peer_selector: Arc<SeedPeerSelector>,
+
+    /// The endpoint of the seed peer proxy.
+    endpoint: String,
+}
+
+/// Implements Middleware for recording the answers of a seed peer proxy.
+#[async_trait]
+impl Middleware for EjectionMiddleware {
+    /// Sends the request, recording any response as a success and a refused or
+    /// unreachable proxy as a failure.
+    async fn handle(
+        &self,
+        request: reqwest::Request,
+        extensions: &mut ::http::Extensions,
+        next: Next<'_>,
+    ) -> reqwest_middleware::Result<reqwest::Response> {
+        let result = next.run(request, extensions).await;
+        match &result {
+            Ok(_) => self.seed_peer_selector.on_success(&self.endpoint),
+
+            // A refused or reset tunnel is a connect error too, so match the kind
+            // of the I/O error.
+            Err(reqwest_middleware::Error::Reqwest(err))
+                if err.is_connect()
+                    && std::iter::successors(std::error::Error::source(err), |source| {
+                        source.source()
+                    })
+                    .filter_map(|source| source.downcast_ref::<std::io::Error>())
+                    .any(|err| {
+                        matches!(
+                            err.kind(),
+                            std::io::ErrorKind::ConnectionRefused
+                                | std::io::ErrorKind::HostUnreachable
+                                | std::io::ErrorKind::NetworkUnreachable
+                        )
+                    }) =>
+            {
+                self.seed_peer_selector.on_failure(&self.endpoint)
+            }
+            Err(_) => {}
+        }
+
+        result
     }
 }
 
@@ -936,38 +1129,31 @@ impl ProxyBuilder {
         // Validate input parameters.
         self.validate()?;
 
-        // Create the scheduler channel.
-        let scheduler_channel = Endpoint::from_shared(self.scheduler_endpoint.to_string())
-            .map_err(|err| Error::InvalidArgument(err.to_string()))?
-            .connect_timeout(self.scheduler_request_timeout)
-            .timeout(self.scheduler_request_timeout)
-            .connect()
+        // Create seed peer selector from the seed peers the scheduler lists.
+        let scheduler_client =
+            SchedulerClient::new(&self.scheduler_endpoint, self.scheduler_request_timeout).await?;
+        let seed_peer_selector = Arc::new(SeedPeerSelector::new());
+        seed_peer_selector
+            .refresh(&scheduler_client)
             .await
             .map_err(|err| {
-                Error::Internal(format!(
-                    "failed to connect to scheduler {}: {}",
-                    self.scheduler_endpoint, err
-                ))
+                Error::Internal(format!("failed to create seed peer selector: {err}"))
             })?;
 
-        // Create scheduler client.
-        let scheduler_client = SchedulerClient::new(scheduler_channel);
-
-        // Create seed peer selector.
-        let seed_peer_selector = Arc::new(
-            SeedPeerSelector::new(scheduler_client, self.health_check_interval)
-                .await
-                .map_err(|err| {
-                    Error::Internal(format!("failed to create seed peer selector: {err}"))
-                })?,
-        );
-
         let seed_peer_selector_clone = seed_peer_selector.clone();
+        let health_check_interval = self.health_check_interval;
         tokio::spawn(async move {
             // Run the selector service in the background to refresh the seed peers periodically.
-            seed_peer_selector_clone.run().await;
+            seed_peer_selector_clone
+                .run(scheduler_client, health_check_interval)
+                .await;
         });
 
+        self.build_proxy(seed_peer_selector)
+    }
+
+    /// Builds the proxy selecting seed peers by the seed peer selector.
+    fn build_proxy(self, seed_peer_selector: Arc<SeedPeerSelector>) -> Result<Proxy> {
         // Get local IP address and hostname.
         // In IPv6-only environments, IPv4 detection may fail, so we use a best-effort IPv4->IPv6 fallback.
         let local_ip = preferred_local_ip()
@@ -980,17 +1166,23 @@ impl ProxyBuilder {
             .to_string_lossy()
             .to_string();
         let id_generator = IDGenerator::new(local_ip, hostname, true);
+
+        // Create the pool of clients to the seed peer proxies.
+        let client_pool = Arc::new(
+            PoolBuilder::new(HTTPClientFactory {
+                seed_peer_selector: Some(seed_peer_selector.clone()),
+            })
+            .capacity(DEFAULT_CLIENT_POOL_CAPACITY)
+            .idle_timeout(DEFAULT_CLIENT_POOL_IDLE_TIMEOUT)
+            .build(),
+        );
+
         let proxy = Proxy {
             #[cfg(feature = "preheat")]
             scheduler_endpoint: self.scheduler_endpoint,
             seed_peer_selector,
             retry: self.retry,
-            client_pool: Arc::new(
-                PoolBuilder::new(HTTPClientFactory::default())
-                    .capacity(DEFAULT_CLIENT_POOL_CAPACITY)
-                    .idle_timeout(DEFAULT_CLIENT_POOL_IDLE_TIMEOUT)
-                    .build(),
-            ),
+            client_pool,
             id_generator: Arc::new(id_generator),
         };
 
@@ -1001,7 +1193,7 @@ impl ProxyBuilder {
     fn validate(&self) -> Result<()> {
         if let Err(err) = ::url::Url::parse(&self.scheduler_endpoint) {
             return Err(Error::InvalidArgument(err.to_string()));
-        };
+        }
 
         if self.scheduler_request_timeout.as_millis() < 100 {
             return Err(Error::InvalidArgument(
@@ -1067,7 +1259,14 @@ impl Request for Proxy {
     /// streaming body, see [`Request::get`].
     async fn get(&self, request: &GetRequest) -> Result<GetResponse> {
         request.validate()?;
-        let response = self.try_send(request).await?;
+        let endpoints = self.lookup_proxy_endpoints(request).await?;
+        let ((), result) = self
+            .retry
+            .run_with_endpoints(&endpoints, (), |(), endpoint| async move {
+                ((), self.send_to(endpoint, request).await)
+            })
+            .await;
+        let response = result?;
         let header = response.headers().clone();
         let status_code = response.status();
         let body: Body = Box::new(
@@ -1089,50 +1288,51 @@ impl Request for Proxy {
     async fn get_into(&self, request: &GetRequest, buf: &mut BytesMut) -> Result<GetResponse> {
         request.validate()?;
         let endpoints = self.lookup_proxy_endpoints(request).await?;
-        let (body, result) = retry_with_endpoints(
-            self.retry,
-            &endpoints,
-            std::mem::take(buf),
-            |mut body, endpoint| async move {
-                let result = match self.send_to(endpoint, request).await {
-                    Ok(mut response) => {
-                        let status = response.status();
-                        let header = response.headers().clone();
-                        let len = body.len();
-                        if let Some(content_length) = response.content_length() {
-                            body.reserve(content_length as usize);
-                        }
+        let (body, result) = self
+            .retry
+            .run_with_endpoints(
+                &endpoints,
+                std::mem::take(buf),
+                |mut body, endpoint| async move {
+                    let result = match self.send_to(endpoint, request).await {
+                        Ok(mut response) => {
+                            let status = response.status();
+                            let header = response.headers().clone();
+                            let len = body.len();
+                            if let Some(content_length) = response.content_length() {
+                                body.reserve(content_length as usize);
+                            }
 
-                        loop {
-                            match response.chunk().await {
-                                Ok(Some(chunk)) => body.extend_from_slice(&chunk),
-                                Ok(None) => {
-                                    break Ok(GetResponse {
-                                        success: status.is_success(),
-                                        header,
-                                        status_code: Some(status),
-                                        body: None,
-                                    })
-                                }
-                                Err(err) => {
-                                    body.truncate(len);
-                                    if err.is_timeout() {
-                                        break Err(Error::RequestTimeout(err.to_string()));
+                            loop {
+                                match response.chunk().await {
+                                    Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+                                    Ok(None) => {
+                                        break Ok(GetResponse {
+                                            success: status.is_success(),
+                                            header,
+                                            status_code: Some(status),
+                                            body: None,
+                                        })
                                     }
+                                    Err(err) => {
+                                        body.truncate(len);
+                                        if err.is_timeout() {
+                                            break Err(Error::RequestTimeout(err.to_string()));
+                                        }
 
-                                    break Err(Error::Internal(format!(
-                                        "failed to read response body: {err}"
-                                    )));
+                                        break Err(Error::Internal(format!(
+                                            "failed to read response body: {err}"
+                                        )));
+                                    }
                                 }
                             }
                         }
-                    }
-                    Err(err) => Err(err),
-                };
-                (body, result)
-            },
-        )
-        .await;
+                        Err(err) => Err(err),
+                    };
+                    (body, result)
+                },
+            )
+            .await;
 
         *buf = body;
         result
@@ -1321,7 +1521,7 @@ impl Request for Proxy {
                 ))
             })?;
 
-        let response = SchedulerClient::new(channel)
+        let response = SchedulerGRPCClient::new(channel)
             .max_decoding_message_size(i32::MAX as usize)
             .max_encoding_message_size(i32::MAX as usize)
             .stat_image(stat_image_request)
@@ -1477,9 +1677,7 @@ impl Request for Proxy {
         let seed_peers = self
             .select_seed_peers(task_id.clone(), request.scope, request.replicas)
             .await
-            .map_err(|err| {
-                Error::Internal(format!("failed to select seed peers from scheduler: {err}"))
-            })?;
+            .map_err(|err| Error::Internal(format!("failed to select seed peers: {err}")))?;
         debug!("task {} selected seed peers: {:?}", task_id, seed_peers);
 
         if request.scope == Scope::Default && seed_peers.len() < request.replicas {
@@ -1531,38 +1729,39 @@ impl Request for Proxy {
             let retry_policy = self.retry;
             join_set.spawn(
                 async move {
-                    retry(retry_policy, || async {
-                        let channel = Channel::from_shared(addr.clone())
-                            .map_err(|err| Error::InvalidArgument(err.to_string()))?
-                            .connect_timeout(timeout)
-                            .timeout(timeout)
-                            .connect()
-                            .await
-                            .map_err(|err| {
-                                Error::Internal(format!(
-                                    "failed to connect to seed peer {addr}: {err}"
-                                ))
-                            })?;
+                    retry_policy
+                        .run(|| async {
+                            let channel = Channel::from_shared(addr.clone())
+                                .map_err(|err| Error::InvalidArgument(err.to_string()))?
+                                .connect_timeout(timeout)
+                                .timeout(timeout)
+                                .connect()
+                                .await
+                                .map_err(|err| {
+                                    Error::Internal(format!(
+                                        "failed to connect to seed peer {addr}: {err}"
+                                    ))
+                                })?;
 
-                        let mut client = DfdaemonUploadGRPCClient::new(channel)
-                            .max_decoding_message_size(usize::MAX)
-                            .max_encoding_message_size(usize::MAX);
+                            let mut client = DfdaemonUploadGRPCClient::new(channel)
+                                .max_decoding_message_size(usize::MAX)
+                                .max_encoding_message_size(usize::MAX);
 
-                        let mut response = client
-                            .download_task(download_task_request.clone())
-                            .await
-                            .map_err(Error::from_status)?
-                            .into_inner();
-                        while response
-                            .message()
-                            .await
-                            .map_err(Error::from_status)?
-                            .is_some()
-                        {}
+                            let mut response = client
+                                .download_task(download_task_request.clone())
+                                .await
+                                .map_err(Error::from_status)?
+                                .into_inner();
+                            while response
+                                .message()
+                                .await
+                                .map_err(Error::from_status)?
+                                .is_some()
+                            {}
 
-                        Ok(())
-                    })
-                    .await
+                            Ok(())
+                        })
+                        .await
                 }
                 .in_current_span(),
             );
@@ -1602,9 +1801,7 @@ impl Request for Proxy {
         let seed_peers = self
             .select_seed_peers(task_id.clone(), request.scope, request.replicas)
             .await
-            .map_err(|err| {
-                Error::Internal(format!("failed to select seed peers from scheduler: {err}"))
-            })?;
+            .map_err(|err| Error::Internal(format!("failed to select seed peers: {err}")))?;
         debug!("task {} selected seed peers: {:?}", task_id, seed_peers);
 
         // Construct the delete task request.
@@ -1629,30 +1826,31 @@ impl Request for Proxy {
             let retry_policy = self.retry;
             join_set.spawn(
                 async move {
-                    retry(retry_policy, || async {
-                        let channel = Channel::from_shared(addr.clone())
-                            .map_err(|err| Error::InvalidArgument(err.to_string()))?
-                            .connect_timeout(timeout)
-                            .timeout(timeout)
-                            .connect()
-                            .await
-                            .map_err(|err| {
-                                Error::Internal(format!(
-                                    "failed to connect to seed peer {addr}: {err}"
-                                ))
-                            })?;
+                    retry_policy
+                        .run(|| async {
+                            let channel = Channel::from_shared(addr.clone())
+                                .map_err(|err| Error::InvalidArgument(err.to_string()))?
+                                .connect_timeout(timeout)
+                                .timeout(timeout)
+                                .connect()
+                                .await
+                                .map_err(|err| {
+                                    Error::Internal(format!(
+                                        "failed to connect to seed peer {addr}: {err}"
+                                    ))
+                                })?;
 
-                        let mut client = DfdaemonUploadGRPCClient::new(channel)
-                            .max_decoding_message_size(usize::MAX)
-                            .max_encoding_message_size(usize::MAX);
+                            let mut client = DfdaemonUploadGRPCClient::new(channel)
+                                .max_decoding_message_size(usize::MAX)
+                                .max_encoding_message_size(usize::MAX);
 
-                        match client.delete_task(delete_task_request.clone()).await {
-                            Ok(_) => Ok(()),
-                            Err(status) if status.code() == tonic::Code::NotFound => Ok(()),
-                            Err(status) => Err(Error::from_status(status)),
-                        }
-                    })
-                    .await
+                            match client.delete_task(delete_task_request.clone()).await {
+                                Ok(_) => Ok(()),
+                                Err(status) if status.code() == tonic::Code::NotFound => Ok(()),
+                                Err(status) => Err(Error::from_status(status)),
+                            }
+                        })
+                        .await
                 }
                 .in_current_span(),
             );
@@ -1667,9 +1865,8 @@ impl Request for Proxy {
     }
 
     /// Looks up the proxy endpoints of the seed peers serving the request, in the
-    /// consistent hash ring selection order for the request's task id. It returns up
-    /// to the replicas of the request distinct endpoints, clamped to the number of
-    /// available seed peers.
+    /// consistent hash ring selection order for the request's task id. It returns
+    /// up to the replicas of the request, skipping the unhealthy or ejected ones.
     async fn lookup_endpoints(&self, request: &GetRequest) -> Result<Vec<String>> {
         request.validate()?;
         self.lookup_proxy_endpoints(request).await
@@ -1731,7 +1928,7 @@ impl Proxy {
     }
 
     /// Looks up the proxy endpoints of the seed peers serving the request, in the
-    /// consistent hash ring selection order.
+    /// consistent hash ring selection order, skipping the ejected ones.
     async fn lookup_proxy_endpoints(&self, request: &GetRequest) -> Result<Vec<String>> {
         // Generate task id for selecting seed peer.
         let task_id = self.task_id(
@@ -1749,186 +1946,186 @@ impl Proxy {
             .seed_peer_selector
             .select(task_id.clone(), request.replicas as u32)
             .await
-            .map_err(|err| {
-                Error::Internal(format!("failed to select seed peers from scheduler: {err}"))
-            })?;
+            .map_err(|err| Error::Internal(format!("failed to select seed peers: {err}")))?;
 
         debug!("task {} selected seed peers: {:?}", task_id, seed_peers);
 
-        let mut endpoints = Vec::with_capacity(seed_peers.len());
-        for peer in seed_peers.iter() {
-            // TODO(chlins): Support client https scheme.
-            endpoints.push(format_url(
-                "http",
-                IpAddr::from_str(&peer.ip).map_err(|err| Error::Internal(err.to_string()))?,
-                peer.proxy_port as u16,
-            ));
+        // Skip the ejected proxies, failing when all are ejected.
+        let mut endpoints = seed_peers
+            .iter()
+            .map(SeedPeerSelector::proxy_endpoint)
+            .collect::<Result<Vec<_>>>()?;
+        endpoints.retain(|endpoint| !self.seed_peer_selector.is_ejected(endpoint));
+        if endpoints.is_empty() {
+            return Err(Error::Internal(format!(
+                "seed peers of task {task_id} are all ejected"
+            )));
         }
 
         Ok(endpoints)
     }
 
-    /// Sends the request to the seed peers serving it, retrying a transient failure
-    /// on the next one, see [`retry_with_endpoints`].
-    async fn try_send(&self, request: &GetRequest) -> Result<reqwest::Response> {
-        let endpoints = self.lookup_proxy_endpoints(request).await?;
-        let ((), result) =
-            retry_with_endpoints(self.retry, &endpoints, (), |(), endpoint| async move {
-                ((), self.send_to(endpoint, request).await)
-            })
-            .await;
-        result
-    }
-
-    /// Sends the request through the pooled client of the seed peer proxy endpoint.
+    /// Sends the request once to the seed peer proxy at `endpoint` through its
+    /// pooled client.
     async fn send_to(&self, endpoint: String, request: &GetRequest) -> Result<reqwest::Response> {
         let entry = self.client_pool.entry(&endpoint, &endpoint).await?;
-        self.send(&entry.client, request).await
+        request.send(&entry.client).await
     }
+}
 
-    /// Send a request to the specified URL via the client with the given headers.
-    async fn send(
-        &self,
-        client: &ClientWithMiddleware,
-        request: &GetRequest,
-    ) -> Result<reqwest::Response> {
-        let headers = self.make_request_headers(request)?;
-        let response = client
-            .get(&request.url)
-            .headers(headers)
-            .timeout(request.timeout)
-            .send()
-            .await
-            .map_err(|err| match err {
-                reqwest_middleware::Error::Reqwest(err) if err.is_timeout() => {
-                    Error::RequestTimeout(err.to_string())
-                }
-                err => Error::Internal(err.to_string()),
-            })?;
+/// The builder for ProxyWithSeedPeers.
+pub struct ProxyWithSeedPeersBuilder {
+    /// The seed peers serving the requests.
+    seed_peers: Vec<SeedPeer>,
 
-        let status = response.status();
-        if status.is_success() {
-            return Ok(response);
-        }
+    /// The retry policy of the requests.
+    retry: RetryPolicy,
+}
 
-        let response_headers = response.headers().clone();
-        let header_map = headermap_to_hashmap(&response_headers);
-        let message = response.text().await.ok();
-        let error_type = response_headers
-            .get("X-Dragonfly-Error-Type")
-            .and_then(|v| v.to_str().ok());
-
-        match error_type {
-            Some("backend") => Err(Error::BackendError(BackendError {
-                message,
-                header: header_map,
-                status_code: Some(status),
-            })),
-            Some("proxy") => Err(Error::ProxyError(ProxyError {
-                message,
-                header: header_map,
-                status_code: Some(status),
-            })),
-            Some("dfdaemon") => Err(Error::DfdaemonError(DfdaemonError {
-                message,
-                header: header_map,
-                status_code: Some(status),
-            })),
-            Some(other) => Err(Error::ProxyError(ProxyError {
-                message: Some(format!("unknown error type from proxy: {other}")),
-                header: header_map,
-                status_code: Some(status),
-            })),
-            None => Err(Error::ProxyError(ProxyError {
-                message: Some(format!("unexpected status code from proxy: {status}")),
-                header: header_map,
-                status_code: Some(status),
-            })),
+/// Implements Default trait.
+impl Default for ProxyWithSeedPeersBuilder {
+    /// Returns a default ProxyWithSeedPeersBuilder.
+    fn default() -> Self {
+        Self {
+            seed_peers: Vec::new(),
+            retry: RetryPolicy::default(),
         }
     }
+}
 
-    /// Make request headers applies p2p related headers to the request headers.
-    fn make_request_headers(&self, request: &GetRequest) -> Result<HeaderMap> {
-        let mut headers = request.header.clone();
-        if let Some(piece_length) = request.piece_length {
-            headers.insert(
-                "X-Dragonfly-Piece-Length",
-                piece_length.to_string().parse().map_err(|err| {
-                    Error::InvalidArgument(format!("invalid piece length: {err}"))
-                })?,
-            );
+/// Implements the builder pattern for ProxyWithSeedPeers.
+impl ProxyWithSeedPeersBuilder {
+    /// Sets the seed peers serving the requests, such as the ones
+    /// [`SchedulerClient::list_seed_peers`] returns.
+    pub fn seed_peers(mut self, seed_peers: Vec<SeedPeer>) -> Self {
+        self.seed_peers = seed_peers;
+        self
+    }
+
+    /// Sets how many times a request is retried after a transient failure, each
+    /// retry on the next seed peer. Default `1`, at most `10`.
+    ///
+    /// A transient failure is a timeout, a connection error, or a `5xx`, `408` or
+    /// `429` answer. Any other answer returns at once.
+    pub fn max_retries(mut self, retries: u8) -> Self {
+        self.retry.max_retries = retries;
+        self
+    }
+
+    /// Sets the exponential backoff between retries, none retrying at once. The
+    /// builder's own `max_times` is ignored in favor of
+    /// [`max_retries`](Self::max_retries).
+    pub fn backoff(mut self, backoff: ExponentialBuilder) -> Self {
+        self.retry.backoff = Some(backoff);
+        self
+    }
+
+    /// Builds and returns a ProxyWithSeedPeers instance.
+    pub async fn build(self) -> Result<ProxyWithSeedPeers> {
+        // Validate input parameters.
+        self.validate()?;
+
+        // Create seed peer selector from the given seed peers.
+        let seed_peer_selector = Arc::new(SeedPeerSelector::new());
+        seed_peer_selector.update(self.seed_peers).await;
+
+        let proxy = ProxyBuilder {
+            retry: self.retry,
+            ..Default::default()
+        }
+        .build_proxy(seed_peer_selector)?;
+        Ok(ProxyWithSeedPeers { proxy })
+    }
+
+    /// Validates the input parameters.
+    fn validate(&self) -> Result<()> {
+        ProxyWithSeedPeers::validate_seed_peers(&self.seed_peers)?;
+
+        if self.retry.max_retries > 10 {
+            return Err(Error::InvalidArgument(
+                "max retries must be between 0 and 10".to_string(),
+            ));
         }
 
-        if let Some(tag) = request.tag.clone() {
-            headers.insert(
-                "X-Dragonfly-Tag",
-                tag.to_string()
-                    .parse()
-                    .map_err(|err| Error::InvalidArgument(format!("invalid tag: {err}")))?,
-            );
+        Ok(())
+    }
+}
+
+/// The HTTP proxy client that sends requests via the seed peers given at
+/// construction, selected by the consistent hash ring without connecting to
+/// the scheduler.
+#[derive(Clone)]
+pub struct ProxyWithSeedPeers {
+    /// The proxy sending the requests via the seed peers.
+    proxy: Proxy,
+}
+
+/// Implements the proxy client that sends requests via the given seed peers.
+impl ProxyWithSeedPeers {
+    /// Returns a new ProxyWithSeedPeersBuilder for ProxyWithSeedPeers.
+    pub fn builder() -> ProxyWithSeedPeersBuilder {
+        ProxyWithSeedPeersBuilder::default()
+    }
+
+    /// Replaces the seed peers, such as with the ones listed again.
+    ///
+    /// The hash ring is rebuilt only when the seed peers change, so a task stays
+    /// on its replicas. Invalid seed peers, such as none, are ignored.
+    pub async fn update_seed_peers(&self, seed_peers: Vec<SeedPeer>) {
+        if let Err(err) = Self::validate_seed_peers(&seed_peers) {
+            warn!("keep the current seed peers: {}", err);
+            return;
         }
 
-        if let Some(application) = request.application.clone() {
-            headers.insert(
-                "X-Dragonfly-Application",
-                application
-                    .to_string()
-                    .parse()
-                    .map_err(|err| Error::InvalidArgument(format!("invalid application: {err}")))?,
-            );
+        self.proxy.seed_peer_selector.update(seed_peers).await;
+    }
+
+    /// Validates the seed peers, which the hash ring keys by host name.
+    fn validate_seed_peers(seed_peers: &[SeedPeer]) -> Result<()> {
+        if seed_peers.is_empty() {
+            return Err(Error::InvalidArgument(
+                "seed peers must not be empty".to_string(),
+            ));
         }
 
-        if let Some(content_for_calculating_task_id) =
-            request.content_for_calculating_task_id.clone()
-        {
-            headers.insert(
-                "X-Dragonfly-Content-For-Calculating-Task-ID",
-                content_for_calculating_task_id
-                    .to_string()
-                    .parse()
-                    .map_err(|err| {
-                        Error::InvalidArgument(format!(
-                            "invalid content for calculating task id: {err}"
-                        ))
-                    })?,
-            );
+        let mut names = HashSet::with_capacity(seed_peers.len());
+        for seed_peer in seed_peers {
+            if seed_peer.host.name.is_empty() {
+                return Err(Error::InvalidArgument(
+                    "seed peer name must not be empty".to_string(),
+                ));
+            }
+
+            if !names.insert(seed_peer.host.name.as_str()) {
+                return Err(Error::InvalidArgument(format!(
+                    "seed peer name {} is duplicated",
+                    seed_peer.host.name
+                )));
+            }
         }
 
-        headers.insert(
-            "X-Dragonfly-Enable-Task-ID-Based-Blob-Digest",
-            request
-                .enable_task_id_based_blob_digest
-                .to_string()
-                .parse()
-                .map_err(|err| {
-                    Error::InvalidArgument(format!(
-                        "invalid enable task id based blob digest: {err}"
-                    ))
-                })?,
-        );
+        Ok(())
+    }
+}
 
-        if let Some(priority) = request.priority {
-            headers.insert(
-                "X-Dragonfly-Priority",
-                priority
-                    .to_string()
-                    .parse()
-                    .map_err(|err| Error::InvalidArgument(format!("invalid priority: {err}")))?,
-            );
-        }
+/// Implements the interface for sending requests via the given seed peers.
+#[async_trait]
+impl RequestWithSeedPeers for ProxyWithSeedPeers {
+    /// Sends a GET request via the seed peers, see [`RequestWithSeedPeers::get`].
+    async fn get(&self, request: &GetRequest) -> Result<GetResponse<Body>> {
+        self.proxy.get(request).await
+    }
 
-        if !request.filtered_query_params.is_empty() {
-            let value = request.filtered_query_params.join(",");
-            headers.insert(
-                "X-Dragonfly-Filtered-Query-Params",
-                value.parse().map_err(|err| {
-                    Error::InvalidArgument(format!("invalid filtered query params: {err}"))
-                })?,
-            );
-        }
+    /// Sends a GET request via the seed peers into `buf`, see
+    /// [`RequestWithSeedPeers::get_into`].
+    async fn get_into(&self, request: &GetRequest, buf: &mut BytesMut) -> Result<GetResponse> {
+        self.proxy.get_into(request, buf).await
+    }
 
-        headers.insert("X-Dragonfly-Use-P2P", HeaderValue::from_static("true"));
-        Ok(headers)
+    /// Looks up the proxy endpoints of the seed peers serving the request, see
+    /// [`RequestWithSeedPeers::lookup_endpoints`].
+    async fn lookup_endpoints(&self, request: &GetRequest) -> Result<Vec<String>> {
+        self.proxy.lookup_endpoints(request).await
     }
 }
 
@@ -2043,169 +2240,14 @@ impl ProxyWithEndpoints {
         ProxyWithEndpointsBuilder::default()
     }
 
-    /// Sends the request to the endpoints, retrying a transient failure on the next
-    /// one, see [`retry_with_endpoints`].
-    async fn try_send(&self, request: &GetRequest) -> Result<reqwest::Response> {
-        let ((), result) =
-            retry_with_endpoints(self.retry, &self.endpoints, (), |(), endpoint| async move {
-                ((), self.send_to(&endpoint, request).await)
-            })
-            .await;
-        result
-    }
-
-    /// Sends the request through the client of the endpoint.
+    /// Sends the request once to the seed peer proxy at `endpoint` through its
+    /// client.
     async fn send_to(&self, endpoint: &str, request: &GetRequest) -> Result<reqwest::Response> {
         let client = self
             .clients
             .get(endpoint)
             .ok_or_else(|| Error::Internal(format!("no client for endpoint {endpoint}")))?;
-        self.send(client, request).await
-    }
-
-    /// Send a request to the specified URL via the client with the given headers.
-    async fn send(
-        &self,
-        client: &ClientWithMiddleware,
-        request: &GetRequest,
-    ) -> Result<reqwest::Response> {
-        let headers = self.make_request_headers(request)?;
-        let response = client
-            .get(&request.url)
-            .headers(headers)
-            .timeout(request.timeout)
-            .send()
-            .await
-            .map_err(|err| match err {
-                reqwest_middleware::Error::Reqwest(err) if err.is_timeout() => {
-                    Error::RequestTimeout(err.to_string())
-                }
-                err => Error::Internal(err.to_string()),
-            })?;
-
-        let status = response.status();
-        if status.is_success() {
-            return Ok(response);
-        }
-
-        let response_headers = response.headers().clone();
-        let header_map = headermap_to_hashmap(&response_headers);
-        let message = response.text().await.ok();
-        let error_type = response_headers
-            .get("X-Dragonfly-Error-Type")
-            .and_then(|v| v.to_str().ok());
-
-        match error_type {
-            Some("backend") => Err(Error::BackendError(BackendError {
-                message,
-                header: header_map,
-                status_code: Some(status),
-            })),
-            Some("proxy") => Err(Error::ProxyError(ProxyError {
-                message,
-                header: header_map,
-                status_code: Some(status),
-            })),
-            Some("dfdaemon") => Err(Error::DfdaemonError(DfdaemonError {
-                message,
-                header: header_map,
-                status_code: Some(status),
-            })),
-            Some(other) => Err(Error::ProxyError(ProxyError {
-                message: Some(format!("unknown error type from proxy: {other}")),
-                header: header_map,
-                status_code: Some(status),
-            })),
-            None => Err(Error::ProxyError(ProxyError {
-                message: Some(format!("unexpected status code from proxy: {status}")),
-                header: header_map,
-                status_code: Some(status),
-            })),
-        }
-    }
-
-    /// Make request headers applies p2p related headers to the request headers.
-    fn make_request_headers(&self, request: &GetRequest) -> Result<HeaderMap> {
-        let mut headers = request.header.clone();
-        if let Some(piece_length) = request.piece_length {
-            headers.insert(
-                "X-Dragonfly-Piece-Length",
-                piece_length.to_string().parse().map_err(|err| {
-                    Error::InvalidArgument(format!("invalid piece length: {err}"))
-                })?,
-            );
-        }
-
-        if let Some(tag) = request.tag.clone() {
-            headers.insert(
-                "X-Dragonfly-Tag",
-                tag.to_string()
-                    .parse()
-                    .map_err(|err| Error::InvalidArgument(format!("invalid tag: {err}")))?,
-            );
-        }
-
-        if let Some(application) = request.application.clone() {
-            headers.insert(
-                "X-Dragonfly-Application",
-                application
-                    .to_string()
-                    .parse()
-                    .map_err(|err| Error::InvalidArgument(format!("invalid application: {err}")))?,
-            );
-        }
-
-        if let Some(content_for_calculating_task_id) =
-            request.content_for_calculating_task_id.clone()
-        {
-            headers.insert(
-                "X-Dragonfly-Content-For-Calculating-Task-ID",
-                content_for_calculating_task_id
-                    .to_string()
-                    .parse()
-                    .map_err(|err| {
-                        Error::InvalidArgument(format!(
-                            "invalid content for calculating task id: {err}"
-                        ))
-                    })?,
-            );
-        }
-
-        headers.insert(
-            "X-Dragonfly-Enable-Task-ID-Based-Blob-Digest",
-            request
-                .enable_task_id_based_blob_digest
-                .to_string()
-                .parse()
-                .map_err(|err| {
-                    Error::InvalidArgument(format!(
-                        "invalid enable task id based blob digest: {err}"
-                    ))
-                })?,
-        );
-
-        if let Some(priority) = request.priority {
-            headers.insert(
-                "X-Dragonfly-Priority",
-                priority
-                    .to_string()
-                    .parse()
-                    .map_err(|err| Error::InvalidArgument(format!("invalid priority: {err}")))?,
-            );
-        }
-
-        if !request.filtered_query_params.is_empty() {
-            let value = request.filtered_query_params.join(",");
-            headers.insert(
-                "X-Dragonfly-Filtered-Query-Params",
-                value.parse().map_err(|err| {
-                    Error::InvalidArgument(format!("invalid filtered query params: {err}"))
-                })?,
-            );
-        }
-
-        headers.insert("X-Dragonfly-Use-P2P", HeaderValue::from_static("true"));
-        Ok(headers)
+        request.send(client).await
     }
 }
 
@@ -2218,7 +2260,14 @@ impl RequestWithEndpoints for ProxyWithEndpoints {
     /// streaming body, see [`RequestWithEndpoints::get`].
     async fn get(&self, request: &GetRequest) -> Result<GetResponse> {
         request.validate()?;
-        let response = self.try_send(request).await?;
+        let ((), result) = self
+            .retry
+            .run_with_endpoints(&self.endpoints, (), |(), endpoint| async move {
+                ((), self.send_to(&endpoint, request).await)
+            })
+            .await;
+
+        let response = result?;
         let header = response.headers().clone();
         let status_code = response.status();
         let body: Body = Box::new(
@@ -2239,50 +2288,51 @@ impl RequestWithEndpoints for ProxyWithEndpoints {
     /// `buf`, see [`RequestWithEndpoints::get_into`].
     async fn get_into(&self, request: &GetRequest, buf: &mut BytesMut) -> Result<GetResponse> {
         request.validate()?;
-        let (body, result) = retry_with_endpoints(
-            self.retry,
-            &self.endpoints,
-            std::mem::take(buf),
-            |mut body, endpoint| async move {
-                let result = match self.send_to(&endpoint, request).await {
-                    Ok(mut response) => {
-                        let status = response.status();
-                        let header = response.headers().clone();
-                        let len = body.len();
-                        if let Some(content_length) = response.content_length() {
-                            body.reserve(content_length as usize);
-                        }
+        let (body, result) = self
+            .retry
+            .run_with_endpoints(
+                &self.endpoints,
+                std::mem::take(buf),
+                |mut body, endpoint| async move {
+                    let result = match self.send_to(&endpoint, request).await {
+                        Ok(mut response) => {
+                            let status = response.status();
+                            let header = response.headers().clone();
+                            let len = body.len();
+                            if let Some(content_length) = response.content_length() {
+                                body.reserve(content_length as usize);
+                            }
 
-                        loop {
-                            match response.chunk().await {
-                                Ok(Some(chunk)) => body.extend_from_slice(&chunk),
-                                Ok(None) => {
-                                    break Ok(GetResponse {
-                                        success: status.is_success(),
-                                        header,
-                                        status_code: Some(status),
-                                        body: None,
-                                    })
-                                }
-                                Err(err) => {
-                                    body.truncate(len);
-                                    if err.is_timeout() {
-                                        break Err(Error::RequestTimeout(err.to_string()));
+                            loop {
+                                match response.chunk().await {
+                                    Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+                                    Ok(None) => {
+                                        break Ok(GetResponse {
+                                            success: status.is_success(),
+                                            header,
+                                            status_code: Some(status),
+                                            body: None,
+                                        })
                                     }
+                                    Err(err) => {
+                                        body.truncate(len);
+                                        if err.is_timeout() {
+                                            break Err(Error::RequestTimeout(err.to_string()));
+                                        }
 
-                                    break Err(Error::Internal(format!(
-                                        "failed to read response body: {err}"
-                                    )));
+                                        break Err(Error::Internal(format!(
+                                            "failed to read response body: {err}"
+                                        )));
+                                    }
                                 }
                             }
                         }
-                    }
-                    Err(err) => Err(err),
-                };
-                (body, result)
-            },
-        )
-        .await;
+                        Err(err) => Err(err),
+                    };
+                    (body, result)
+                },
+            )
+            .await;
         *buf = body;
         result
     }
@@ -2450,6 +2500,53 @@ mod tests {
             assert!(
                 matches!(result, Err(Error::InvalidArgument(_))),
                 "endpoint: {endpoint}, max_retries: {max_retries:?}, health_check_interval: {health_check_interval:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn new_with_seed_peers_invalid_params() {
+        let test_cases = vec![
+            (vec![], None),
+            (
+                vec![SeedPeer {
+                    host: create_seed_peer_host("", 0, 4001),
+                    healthy: true,
+                }],
+                None,
+            ),
+            (
+                vec![
+                    SeedPeer {
+                        host: create_seed_peer_host("seed-peer-1", 0, 4001),
+                        healthy: true,
+                    },
+                    SeedPeer {
+                        host: create_seed_peer_host("seed-peer-1", 0, 4002),
+                        healthy: true,
+                    },
+                ],
+                None,
+            ),
+            (
+                vec![SeedPeer {
+                    host: create_seed_peer_host("seed-peer-1", 0, 4001),
+                    healthy: true,
+                }],
+                Some(11),
+            ),
+        ];
+
+        for (seed_peers, max_retries) in test_cases {
+            let mut builder = ProxyWithSeedPeers::builder().seed_peers(seed_peers.clone());
+            if let Some(max_retries) = max_retries {
+                builder = builder.max_retries(max_retries);
+            }
+
+            let result = builder.build().await;
+            assert!(
+                matches!(result, Err(Error::InvalidArgument(_))),
+                "seed_peers: {seed_peers:?}, max_retries: {max_retries:?}"
             );
         }
     }
@@ -2678,6 +2775,338 @@ mod tests {
         assert_eq!(response.status_code, Some(reqwest::StatusCode::OK));
         assert!(response.body.is_none());
         assert_eq!(&buf[..], b"hello dragonfly");
+    }
+
+    #[tokio::test]
+    async fn get_into_with_seed_peers_downloads_through_their_proxies() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut mocks = MockSet::new();
+        mocks.mock(|when, then| {
+            when.get().path("/file.txt");
+            then.text("hello dragonfly");
+        });
+        let mock_proxy = setup_mock_seed_peer_proxy(mocks).await.unwrap();
+
+        let proxy = ProxyWithSeedPeers::builder()
+            .seed_peers(vec![SeedPeer {
+                host: create_seed_peer_host("seed-peer-1", 0, mock_proxy.port().unwrap()),
+                healthy: true,
+            }])
+            .build()
+            .await
+            .unwrap();
+
+        let request = GetRequest {
+            url: "http://example.com/file.txt".to_string(),
+            replicas: 1,
+            ..Default::default()
+        };
+
+        let mut buf = BytesMut::new();
+        let response = proxy.get_into(&request, &mut buf).await.unwrap();
+        assert!(response.success);
+        assert_eq!(&buf[..], b"hello dragonfly");
+    }
+
+    #[tokio::test]
+    async fn get_fails_fast_once_its_proxy_is_ejected() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let test_cases = vec![
+            "http://example.com/file.txt",
+            "https://example.com/file.txt",
+        ];
+
+        for url in test_cases {
+            let proxy = ProxyWithSeedPeers::builder()
+                .max_retries(0)
+                .seed_peers(vec![SeedPeer {
+                    host: create_seed_peer_host("seed-peer-1", 0, 1),
+                    healthy: true,
+                }])
+                .build()
+                .await
+                .unwrap();
+
+            let request = GetRequest {
+                url: url.to_string(),
+                replicas: 1,
+                ..Default::default()
+            };
+            for _ in 0..selector::MAX_FAILED_COUNT {
+                assert!(proxy.get(&request).await.is_err(), "url: {url}");
+            }
+
+            let result = proxy.get(&request).await;
+            assert!(
+                matches!(result, Err(Error::Internal(message)) if message.contains("ejected")),
+                "url: {url}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lookup_endpoints_skips_the_ejected_replicas() {
+        let hosts = vec![
+            create_seed_peer_host("seed-peer-1", 0, 4001),
+            create_seed_peer_host("seed-peer-2", 0, 4002),
+        ];
+        let proxy = ProxyWithSeedPeers::builder()
+            .seed_peers(
+                hosts
+                    .iter()
+                    .map(|host| SeedPeer {
+                        host: host.clone(),
+                        healthy: true,
+                    })
+                    .collect(),
+            )
+            .build()
+            .await
+            .unwrap();
+
+        let request = GetRequest {
+            url: "http://example.com/file.txt".to_string(),
+            replicas: 2,
+            ..Default::default()
+        };
+        let endpoints = proxy.lookup_endpoints(&request).await.unwrap();
+        for _ in 0..selector::MAX_FAILED_COUNT {
+            proxy.proxy.seed_peer_selector.on_failure(&endpoints[0]);
+        }
+
+        assert_eq!(
+            proxy.lookup_endpoints(&request).await.unwrap(),
+            endpoints[1..]
+        );
+    }
+
+    #[tokio::test]
+    async fn send_to_ignores_failures_other_than_connecting() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut mocks = MockSet::new();
+        mocks.mock(|when, then| {
+            when.get().path("/file.txt");
+            then.status(reqwest::StatusCode::FOUND)
+                .headers([("location", "http://example.com/file.txt")]);
+        });
+        let redirecting_proxy = setup_mock_seed_peer_proxy(mocks).await.unwrap();
+
+        let resetting_proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let resetting_proxy_port = resetting_proxy.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = resetting_proxy.accept().await {
+                stream.set_zero_linger().unwrap();
+            }
+        });
+
+        let test_cases = vec![
+            (
+                redirecting_proxy.port().unwrap(),
+                "http://example.com/file.txt",
+            ),
+            (
+                redirecting_proxy.port().unwrap(),
+                "https://example.com/file.txt",
+            ),
+            (resetting_proxy_port, "http://example.com/file.txt"),
+            (resetting_proxy_port, "https://example.com/file.txt"),
+        ];
+
+        for (proxy_port, url) in test_cases {
+            let host = create_seed_peer_host("seed-peer-1", 0, proxy_port);
+            let proxy = ProxyWithSeedPeers::builder()
+                .seed_peers(vec![SeedPeer {
+                    host: host.clone(),
+                    healthy: true,
+                }])
+                .build()
+                .await
+                .unwrap();
+
+            let request = GetRequest {
+                url: url.to_string(),
+                replicas: 1,
+                ..Default::default()
+            };
+            let endpoint = SeedPeerSelector::proxy_endpoint(&host).unwrap();
+            for _ in 0..selector::MAX_FAILED_COUNT {
+                let result = proxy.proxy.send_to(endpoint.clone(), &request).await;
+                assert!(
+                    matches!(result, Err(Error::Internal(_))),
+                    "proxy port: {proxy_port}, url: {url}"
+                );
+            }
+
+            assert!(
+                !proxy.proxy.seed_peer_selector.is_ejected(&endpoint),
+                "proxy port: {proxy_port}, url: {url}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_seed_peers_replaces_the_seed_peers() {
+        let proxy = ProxyWithSeedPeers::builder()
+            .seed_peers(vec![SeedPeer {
+                host: create_seed_peer_host("seed-peer-1", 0, 4001),
+                healthy: true,
+            }])
+            .build()
+            .await
+            .unwrap();
+
+        let host = create_seed_peer_host("seed-peer-2", 0, 4002);
+        proxy
+            .update_seed_peers(vec![SeedPeer {
+                host: host.clone(),
+                healthy: true,
+            }])
+            .await;
+
+        let request = GetRequest {
+            url: "http://example.com/file.txt".to_string(),
+            replicas: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            proxy.lookup_endpoints(&request).await.unwrap(),
+            [SeedPeerSelector::proxy_endpoint(&host).unwrap()]
+        );
+    }
+
+    #[tokio::test]
+    async fn update_seed_peers_keeps_the_seed_peers_when_given_invalid_ones() {
+        let host = create_seed_peer_host("seed-peer-1", 0, 4001);
+        let proxy = ProxyWithSeedPeers::builder()
+            .seed_peers(vec![SeedPeer {
+                host: host.clone(),
+                healthy: true,
+            }])
+            .build()
+            .await
+            .unwrap();
+
+        let test_cases = vec![
+            vec![],
+            vec![SeedPeer {
+                host: create_seed_peer_host("", 0, 4002),
+                healthy: true,
+            }],
+            vec![
+                SeedPeer {
+                    host: create_seed_peer_host("seed-peer-2", 0, 4002),
+                    healthy: true,
+                },
+                SeedPeer {
+                    host: create_seed_peer_host("seed-peer-2", 0, 4003),
+                    healthy: true,
+                },
+            ],
+        ];
+
+        let request = GetRequest {
+            url: "http://example.com/file.txt".to_string(),
+            replicas: 1,
+            ..Default::default()
+        };
+        for seed_peers in test_cases {
+            proxy.update_seed_peers(seed_peers.clone()).await;
+            assert_eq!(
+                proxy.lookup_endpoints(&request).await.unwrap(),
+                [SeedPeerSelector::proxy_endpoint(&host).unwrap()],
+                "seed_peers: {seed_peers:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn send_to_clears_the_failures_of_a_proxy_that_answers() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let test_cases = vec![
+            reqwest::StatusCode::NOT_FOUND,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        ];
+
+        for status in test_cases {
+            let mut mocks = MockSet::new();
+            mocks.mock(|when, then| {
+                when.get().path("/file.txt");
+                then.status(status);
+            });
+            let mock_proxy = setup_mock_seed_peer_proxy(mocks).await.unwrap();
+            let host = create_seed_peer_host("seed-peer-1", 0, mock_proxy.port().unwrap());
+            let proxy = ProxyWithSeedPeers::builder()
+                .seed_peers(vec![SeedPeer {
+                    host: host.clone(),
+                    healthy: true,
+                }])
+                .build()
+                .await
+                .unwrap();
+
+            let request = GetRequest {
+                url: "http://example.com/file.txt".to_string(),
+                replicas: 1,
+                ..Default::default()
+            };
+            let endpoint = SeedPeerSelector::proxy_endpoint(&host).unwrap();
+            for _ in 1..selector::MAX_FAILED_COUNT {
+                proxy.proxy.seed_peer_selector.on_failure(&endpoint);
+            }
+
+            let result = proxy.proxy.send_to(endpoint.clone(), &request).await;
+            assert!(result.is_err(), "status: {status}");
+
+            proxy.proxy.seed_peer_selector.on_failure(&endpoint);
+            assert!(
+                !proxy.proxy.seed_peer_selector.is_ejected(&endpoint),
+                "status: {status}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduler_client_lists_the_seed_peers_with_their_health() {
+        let mock_seed_peer = setup_mock_seed_peer(MockSet::new()).await.unwrap();
+        let mut not_serving_mocks = MockSet::new();
+        not_serving_mocks.mock(|when, then| {
+            when.path("/grpc.health.v1.Health/Check");
+            then.pb(HealthCheckResponse {
+                status: ServingStatus::NotServing as i32,
+            });
+        });
+        let not_serving_seed_peer =
+            MockServer::new_grpc("dfdaemon.v2.DfdaemonUpload").with_mocks(not_serving_mocks);
+        not_serving_seed_peer.start().await.unwrap();
+        let mock_scheduler = setup_mock_scheduler(vec![
+            create_seed_peer_host("seed-peer-1", mock_seed_peer.port().unwrap(), 0),
+            create_seed_peer_host("seed-peer-2", 1, 0),
+            create_seed_peer_host("seed-peer-3", not_serving_seed_peer.port().unwrap(), 0),
+        ])
+        .await
+        .unwrap();
+
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+        let mut seed_peers = SchedulerClient::new(&scheduler_endpoint, Duration::from_secs(5))
+            .await
+            .unwrap()
+            .list_seed_peers()
+            .await
+            .unwrap();
+        seed_peers.sort_by(|a, b| a.host.name.cmp(&b.host.name));
+
+        let health: Vec<(&str, bool)> = seed_peers
+            .iter()
+            .map(|seed_peer| (seed_peer.host.name.as_str(), seed_peer.healthy))
+            .collect();
+        assert_eq!(
+            health,
+            [
+                ("seed-peer-1", true),
+                ("seed-peer-2", false),
+                ("seed-peer-3", false)
+            ]
+        );
     }
 
     #[tokio::test]
@@ -3277,6 +3706,76 @@ mod tests {
 
         let result = proxy.get(&request).await;
         assert!(matches!(result, Err(Error::InvalidArgument(_))));
+    }
+
+    #[tokio::test]
+    async fn get_invalid_url() {
+        let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let test_cases = vec![
+            "file:///tmp/file.txt",
+            "ftp://example.com/file.txt",
+            "example.com/file.txt",
+            "http://:80/file.txt",
+        ];
+
+        for url in test_cases {
+            let request = GetRequest {
+                url: url.to_string(),
+                ..Default::default()
+            };
+
+            let result = proxy.get(&request).await;
+            assert!(
+                matches!(result, Err(Error::InvalidArgument(_))),
+                "url: {url}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_invalid_header() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mock_seed_peer = setup_mock_seed_peer(MockSet::new()).await.unwrap();
+        let mock_scheduler = setup_mock_scheduler(vec![create_seed_peer_host(
+            "seed-peer-1",
+            mock_seed_peer.port().unwrap(),
+            1,
+        )])
+        .await
+        .unwrap();
+        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint)
+            .build()
+            .await
+            .unwrap();
+
+        let test_cases = vec![
+            (Some("bad\r\nvalue".to_string()), None),
+            (None, Some("bad\r\nvalue".to_string())),
+        ];
+
+        for (tag, application) in test_cases {
+            let request = GetRequest {
+                url: "http://example.com/file.txt".to_string(),
+                tag: tag.clone(),
+                application: application.clone(),
+                ..Default::default()
+            };
+
+            let result = proxy.get(&request).await;
+            assert!(
+                matches!(result, Err(Error::InvalidArgument(_))),
+                "tag: {tag:?}, application: {application:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -4334,7 +4833,7 @@ mod tests {
     #[tokio::test]
     async fn client_pool_get_or_create() {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let pool = PoolBuilder::new(HTTPClientFactory {})
+        let pool = PoolBuilder::new(HTTPClientFactory::default())
             .capacity(10)
             .idle_timeout(Duration::from_secs(600))
             .build();
@@ -4356,7 +4855,7 @@ mod tests {
     #[tokio::test]
     async fn client_pool_cleanup() {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let pool = PoolBuilder::new(HTTPClientFactory {})
+        let pool = PoolBuilder::new(HTTPClientFactory::default())
             .capacity(10)
             .idle_timeout(Duration::from_millis(10))
             .build();

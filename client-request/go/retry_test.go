@@ -66,7 +66,7 @@ func TestRetryPolicyNewBackOff(t *testing.T) {
 	}
 }
 
-func TestRetry(t *testing.T) {
+func TestRetryPolicyRun(t *testing.T) {
 	transient := fmt.Errorf("%w: boom", ErrInternal)
 	definitive := &BackendError{StatusCode: http.StatusNotFound}
 	tests := []struct {
@@ -133,20 +133,20 @@ func TestRetry(t *testing.T) {
 				maxRetries: tc.maxRetries,
 				backoff:    &backoff.ExponentialBackOff{InitialInterval: time.Millisecond, MaxInterval: 2 * time.Millisecond, Multiplier: 2},
 			}
-			_, err := retry(context.Background(), policy, func() (struct{}, error) {
+			err := policy.run(context.Background(), func() error {
 				attempts++
 				if attempts <= len(tc.failures) {
-					return struct{}{}, tc.failures[attempts-1]
+					return tc.failures[attempts-1]
 				}
 
-				return struct{}{}, nil
+				return nil
 			})
 			tc.expect(t, attempts, err)
 		})
 	}
 }
 
-func TestRetryWaitsTheBackoffDelays(t *testing.T) {
+func TestRetryPolicyRunWaitsTheBackoffDelays(t *testing.T) {
 	delay := 20 * time.Millisecond
 	tests := []struct {
 		name    string
@@ -176,14 +176,14 @@ func TestRetryWaitsTheBackoffDelays(t *testing.T) {
 			policy := retryPolicy{maxRetries: 2, backoff: tc.backoff}
 
 			start := time.Now()
-			_, err := retry(context.Background(), policy, func() (struct{}, error) {
-				return struct{}{}, fmt.Errorf("%w: boom", ErrInternal)
+			err := policy.run(context.Background(), func() error {
+				return fmt.Errorf("%w: boom", ErrInternal)
 			})
 			assert.ErrorIs(err, ErrInternal)
 			tc.expect(t, time.Since(start))
 
 			start = time.Now()
-			_, _, err = retryWithEndpoints(context.Background(), policy, []string{"a"}, time.Second, func(context.Context, string) (*http.Response, error) {
+			_, _, err = policy.runWithEndpoints(context.Background(), []string{"a"}, time.Second, func(context.Context, string) (*http.Response, error) {
 				return nil, fmt.Errorf("%w: boom", ErrInternal)
 			})
 			assert.ErrorIs(err, ErrInternal)
@@ -192,7 +192,7 @@ func TestRetryWaitsTheBackoffDelays(t *testing.T) {
 	}
 }
 
-func TestRetryStopsWhenTheContextEnds(t *testing.T) {
+func TestRetryPolicyRunStopsWhenTheContextEnds(t *testing.T) {
 	tests := []struct {
 		name   string
 		cause  error
@@ -228,17 +228,17 @@ func TestRetryStopsWhenTheContextEnds(t *testing.T) {
 				maxRetries: 5,
 				backoff:    &backoff.ExponentialBackOff{InitialInterval: time.Second, MaxInterval: time.Second, Multiplier: 1},
 			}
-			_, err := retry(ctx, policy, func() (struct{}, error) {
+			err := policy.run(ctx, func() error {
 				attempts++
 				cancel(tc.cause)
-				return struct{}{}, fmt.Errorf("%w: boom", ErrInternal)
+				return fmt.Errorf("%w: boom", ErrInternal)
 			})
 			tc.expect(t, attempts, err)
 		})
 	}
 }
 
-func TestRetryWithEndpoints(t *testing.T) {
+func TestRetryPolicyRunWithEndpoints(t *testing.T) {
 	transient := fmt.Errorf("%w: boom", ErrInternal)
 	definitive := &BackendError{StatusCode: http.StatusNotFound}
 	tests := []struct {
@@ -322,7 +322,7 @@ func TestRetryWithEndpoints(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			var attempts []string
-			resp, cancel, err := retryWithEndpoints(context.Background(), retryPolicy{maxRetries: tc.maxRetries}, tc.endpoints, time.Second, func(_ context.Context, endpoint string) (*http.Response, error) {
+			resp, cancel, err := retryPolicy{maxRetries: tc.maxRetries}.runWithEndpoints(context.Background(), tc.endpoints, time.Second, func(_ context.Context, endpoint string) (*http.Response, error) {
 				attempts = append(attempts, endpoint)
 				if len(attempts) <= len(tc.failures) {
 					return nil, tc.failures[len(attempts)-1]

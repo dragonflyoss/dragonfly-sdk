@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"sync"
 	"testing"
-	"time"
 
 	commonv2 "d7y.io/api/v2/pkg/apis/common/v2"
 	"d7y.io/hashring"
@@ -29,30 +28,51 @@ import (
 
 func createTestHost(id, ip string, port int32, hostType uint32) *commonv2.Host {
 	return &commonv2.Host{
-		Id:       id,
-		Ip:       ip,
-		Port:     port,
-		Type:     hostType,
-		Hostname: "host-" + id,
-		Name:     "host-" + id,
+		Id:        id,
+		Ip:        ip,
+		Port:      port,
+		Type:      hostType,
+		ProxyPort: port,
+		Hostname:  "host-" + id,
+		Name:      "host-" + id,
 	}
 }
 
 func createTestSelector() *SeedPeerSelector {
-	return &SeedPeerSelector{
-		healthCheckInterval: 10 * time.Second,
-		requestTimeout:      5 * time.Second,
-		hosts:               make(map[string]*commonv2.Host),
-		ring:                hashring.New(hashring.WithVNodesPerNode(1)),
-		done:                make(chan struct{}),
+	s := New()
+	s.ring = hashring.New(hashring.WithVNodesPerNode(1))
+	return s
+}
+
+func createTestSeedPeers(count int, unhealthyID string) []SeedPeer {
+	seedPeers := make([]SeedPeer, 0, count)
+	for i := 1; i <= count; i++ {
+		host := createTestHost(fmt.Sprint(i), fmt.Sprintf("192.168.1.%d", i), 8080, 1)
+		seedPeers = append(seedPeers, SeedPeer{Host: host, Healthy: host.Id != unhealthyID})
 	}
+
+	return seedPeers
+}
+
+func selectIDs(t *testing.T, s *SeedPeerSelector, taskID string, replicas uint32) []string {
+	t.Helper()
+
+	hosts, err := s.Select(taskID, replicas)
+	assert.NoError(t, err)
+
+	ids := make([]string, 0, len(hosts))
+	for _, host := range hosts {
+		ids = append(ids, host.Id)
+	}
+
+	return ids
 }
 
 func addTestHost(s *SeedPeerSelector, host *commonv2.Host) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.hosts[host.Name] = host
+	s.hosts[host.Name] = SeedPeer{Host: host, Healthy: true}
 	s.ring.Add(host.Name)
 }
 
@@ -129,6 +149,21 @@ func TestSelectAll(t *testing.T) {
 	assert.Len(seen, 5)
 }
 
+func TestSelectAllSkipsUnhealthySeedPeers(t *testing.T) {
+	assert := assert.New(t)
+	s := New()
+	s.Update(createTestSeedPeers(2, "2"))
+
+	hosts, err := s.SelectAll()
+	assert.NoError(err)
+	assert.Len(hosts, 1)
+	assert.Equal("1", hosts[0].Id)
+
+	s.Update(createTestSeedPeers(1, "1"))
+	_, err = s.SelectAll()
+	assert.Error(err)
+}
+
 func TestSelectConsistency(t *testing.T) {
 	assert := assert.New(t)
 	s := createTestSelector()
@@ -171,4 +206,115 @@ func TestConcurrentSelect(t *testing.T) {
 		})
 	}
 	wg.Wait()
+}
+
+func TestConcurrentUpdate(t *testing.T) {
+	assert := assert.New(t)
+	for range 100 {
+		s := New()
+		s.Update(createTestSeedPeers(2, ""))
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for i := range 1000 {
+				s.Update(createTestSeedPeers(2, fmt.Sprint(i%2+1)))
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			s.Update(createTestSeedPeers(3, ""))
+		}()
+		wg.Wait()
+
+		hostNames := make(map[string]struct{}, len(s.hosts))
+		for name := range s.hosts {
+			hostNames[name] = struct{}{}
+		}
+
+		ringNames := make(map[string]struct{}, len(s.hosts))
+		for _, vnode := range s.ring.GetWithReplicas("test-task", s.ring.Len()) {
+			ringNames[vnode.Name()] = struct{}{}
+		}
+		assert.Equal(hostNames, ringNames)
+	}
+}
+
+func TestUpdateSkipsSeedPeersWithoutAHost(t *testing.T) {
+	assert := assert.New(t)
+	s := New()
+	s.Update(append(createTestSeedPeers(1, ""), SeedPeer{Healthy: true}))
+
+	assert.Len(s.hosts, 1)
+}
+
+func TestSelectServesATaskOnlyFromItsHealthyReplicas(t *testing.T) {
+	assert := assert.New(t)
+	s := New()
+	s.Update(createTestSeedPeers(5, ""))
+
+	taskIDs := make([]string, 64)
+	healthySelections := make([][]string, len(taskIDs))
+	for i := range taskIDs {
+		taskIDs[i] = fmt.Sprintf("task-%d", i)
+		healthySelections[i] = selectIDs(t, s, taskIDs[i], 2)
+	}
+
+	s.Update(createTestSeedPeers(5, "3"))
+	for i, taskID := range taskIDs {
+		var expected []string
+		for _, id := range healthySelections[i] {
+			if id != "3" {
+				expected = append(expected, id)
+			}
+		}
+		assert.Equal(expected, selectIDs(t, s, taskID, 2), taskID)
+	}
+
+	s.Update(createTestSeedPeers(5, ""))
+	for i, taskID := range taskIDs {
+		assert.Equal(healthySelections[i], selectIDs(t, s, taskID, 2), taskID)
+	}
+}
+
+func TestSelectFailsWhenEveryReplicaIsUnhealthy(t *testing.T) {
+	assert := assert.New(t)
+	s := New()
+	s.Update([]SeedPeer{
+		{Host: createTestHost("1", "192.168.1.1", 8080, 1), Healthy: false},
+		{Host: createTestHost("2", "192.168.1.2", 8080, 1), Healthy: false},
+		{Host: createTestHost("3", "192.168.1.3", 8080, 1), Healthy: true},
+	})
+
+	var taskID string
+	for i := range 64 {
+		taskID = fmt.Sprintf("task-%d", i)
+		if s.ring.GetWithReplicas(taskID, 1)[0].Name() != "host-3" {
+			break
+		}
+	}
+
+	_, err := s.Select(taskID, 1)
+	assert.Error(err)
+}
+
+func TestOnFailureEjectsAProxyAfterConsecutiveFailuresUntilASuccess(t *testing.T) {
+	assert := assert.New(t)
+	s := New()
+	s.Update(createTestSeedPeers(1, ""))
+	replica := selectIDs(t, s, "test-task", 1)
+	endpoint := s.ProxyEndpoint(s.hosts["host-"+replica[0]].Host)
+
+	for range MaxFailedCount - 1 {
+		s.OnFailure(endpoint)
+	}
+	assert.False(s.IsEjected(endpoint))
+
+	s.OnFailure(endpoint)
+	assert.True(s.IsEjected(endpoint))
+	assert.Equal(replica, selectIDs(t, s, "test-task", 1))
+
+	s.OnSuccess(endpoint)
+	assert.False(s.IsEjected(endpoint))
 }

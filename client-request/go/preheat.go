@@ -59,7 +59,7 @@ func (p *Proxy) Preheat(ctx context.Context, req *PreheatRequest) error {
 	// Select seed peers for downloading.
 	seedPeers, err := p.selectSeedPeers(id, req.scope, req.replicas)
 	if err != nil {
-		return fmt.Errorf("%w: failed to select seed peers from scheduler: %v", ErrInternal, err)
+		return fmt.Errorf("%w: failed to select seed peers: %v", ErrInternal, err)
 	}
 
 	if req.scope == ScopeDefault && len(seedPeers) < req.replicas {
@@ -143,27 +143,25 @@ func (p *Proxy) download(ctx context.Context, peer *commonv2.Host, id string, do
 	defer conn.Close()
 
 	client := dfdaemonv2.NewDfdaemonUploadClient(conn)
-	_, err = retry(ctx, p.retry, func() (struct{}, error) {
+	return p.retry.run(ctx, func() error {
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 
 		stream, err := client.DownloadTask(ctx, downloadTaskRequest)
 		if err != nil {
-			return struct{}{}, fmt.Errorf("%w: failed to download task %s: %w", ErrInternal, id, err)
+			return fmt.Errorf("%w: failed to download task %s: %w", ErrInternal, id, err)
 		}
 
 		for {
 			if _, err := stream.Recv(); err != nil {
 				if errors.Is(err, io.EOF) {
-					return struct{}{}, nil
+					return nil
 				}
 
-				return struct{}{}, fmt.Errorf("%w: failed to download task %s: %w", ErrInternal, id, err)
+				return fmt.Errorf("%w: failed to download task %s: %w", ErrInternal, id, err)
 			}
 		}
 	})
-
-	return err
 }
 
 // PreheatImage preheats an OCI image by downloading its manifests and blobs via

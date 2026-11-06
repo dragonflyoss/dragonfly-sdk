@@ -142,6 +142,21 @@ func setupMockSeedPeerServer(t testing.TB, peer *mockSeedPeer) int32 {
 	return int32(listener.Addr().(*net.TCPAddr).Port)
 }
 
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+type idleConnectionsCloser struct {
+	http.RoundTripper
+	closed bool
+}
+
+func (c *idleConnectionsCloser) CloseIdleConnections() {
+	c.closed = true
+}
+
 func createSeedPeerHost(name string, port, proxyPort int32) *commonv2.Host {
 	return &commonv2.Host{
 		Id:        name,

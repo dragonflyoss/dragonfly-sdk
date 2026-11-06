@@ -62,49 +62,42 @@ func (p retryPolicy) newBackOff() backoff.BackOff {
 	return &b
 }
 
-// retry runs attempt until it succeeds, fails definitively, or has been retried
+// run runs attempt until it succeeds, fails definitively, or has been retried
 // maxRetries times, that is at most 1 + maxRetries attempts in total. A
 // cancelled context ends the retries with ErrInternal, an expired one with
 // ErrRequestTimeout.
 //
-//	attempt ──nil──────────────────────────────────────────▶ result
+//	attempt ──nil──────────────────────────────────────────▶ nil
 //	   │
 //	   └─err──▶ isRetryable(err)? ──no─────────────────────▶ err
 //	                 │ yes
 //	                 └─▶ retried < maxRetries? ──no────────▶ err
 //	                          │ yes
 //	                          └─▶ retried++, wait(delay) ──▶ attempt
-func retry[T any](ctx context.Context, policy retryPolicy, attempt func() (T, error)) (T, error) {
-	result, err := backoff.Retry(ctx, func() (T, error) {
-		result, err := attempt()
+func (p retryPolicy) run(ctx context.Context, attempt func() error) error {
+	_, err := backoff.Retry(ctx, func() (struct{}, error) {
+		err := attempt()
 		if err != nil && !isRetryable(err) {
-			return result, backoff.Permanent(err)
+			return struct{}{}, backoff.Permanent(err)
 		}
 
-		return result, err
-	}, backoff.WithBackOff(policy.newBackOff()), backoff.WithMaxTries(uint(policy.maxRetries)+1), backoff.WithMaxElapsedTime(0))
+		return struct{}{}, err
+	}, backoff.WithBackOff(p.newBackOff()), backoff.WithMaxTries(uint(p.maxRetries)+1), backoff.WithMaxElapsedTime(0))
 
 	var permanent *backoff.PermanentError
 	switch {
 	case errors.As(err, &permanent):
-		return result, permanent.Unwrap()
+		return permanent.Unwrap()
 	case errors.Is(err, context.DeadlineExceeded):
-		return result, fmt.Errorf("%w: %v", ErrRequestTimeout, err)
+		return fmt.Errorf("%w: %v", ErrRequestTimeout, err)
 	case errors.Is(err, context.Canceled):
-		return result, fmt.Errorf("%w: %v", ErrInternal, err)
+		return fmt.Errorf("%w: %v", ErrInternal, err)
 	default:
-		return result, err
+		return err
 	}
 }
 
-// sentResponse is a response of a successful attempt with the cancel function
-// of its timeout, released once the body is read.
-type sentResponse struct {
-	resp   *http.Response
-	cancel context.CancelFunc
-}
-
-// retryWithEndpoints runs send like retry, every attempt aimed at the next
+// runWithEndpoints runs send like run, every attempt aimed at the next
 // endpoint of a shuffled order, wrapping around when the endpoints run out
 // before the retries do. Each attempt runs under its own timeout, and the
 // cancel function of the successful attempt is returned so the caller releases
@@ -115,9 +108,8 @@ type sentResponse struct {
 //	attempt 1 ──▶ B ──▶ 503 transient  ── wait(delay 1)
 //	attempt 2 ──▶ A ──▶ timeout        ── wait(delay 2)
 //	attempt 3 ──▶ B ──▶ 404 definitive ──▶ err
-func retryWithEndpoints(
+func (p retryPolicy) runWithEndpoints(
 	ctx context.Context,
-	policy retryPolicy,
 	endpoints []string,
 	timeout time.Duration,
 	send func(ctx context.Context, endpoint string) (*http.Response, error),
@@ -130,22 +122,25 @@ func retryWithEndpoints(
 	rand.Shuffle(len(shuffled), func(i, j int) { shuffled[i], shuffled[j] = shuffled[j], shuffled[i] })
 
 	attempts := 0
-	sent, err := retry(ctx, policy, func() (sentResponse, error) {
+	var resp *http.Response
+	var cancel context.CancelFunc
+	err := p.run(ctx, func() error {
 		endpoint := shuffled[attempts%len(shuffled)]
 		attempts++
 
-		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
-		resp, err := send(attemptCtx, endpoint)
+		attemptCtx, attemptCancel := context.WithTimeout(ctx, timeout)
+		attemptResp, err := send(attemptCtx, endpoint)
 		if err != nil {
-			cancel()
-			return sentResponse{}, err
+			attemptCancel()
+			return err
 		}
 
-		return sentResponse{resp: resp, cancel: cancel}, nil
+		resp, cancel = attemptResp, attemptCancel
+		return nil
 	})
 	if err != nil {
 		return nil, nil, err
 	}
 
-	return sent.resp, sent.cancel, nil
+	return resp, cancel, nil
 }

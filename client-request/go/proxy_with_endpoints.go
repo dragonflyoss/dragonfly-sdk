@@ -44,10 +44,6 @@ func WithProxyWithEndpointsBackoff(b *backoff.ExponentialBackOff) ProxyWithEndpo
 	return func(p *ProxyWithEndpoints) { p.retry.backoff = b }
 }
 
-// Ensure ProxyWithEndpoints implements the RequestWithEndpoints interface at
-// compile time.
-var _ RequestWithEndpoints = (*ProxyWithEndpoints)(nil)
-
 // ProxyWithEndpoints is the HTTP proxy client that sends requests via the
 // fixed seed peer endpoints of the Dragonfly given at construction, without
 // selecting seed peers by the consistent hash ring or syncing them from the
@@ -91,7 +87,7 @@ func NewWithEndpoints(endpoints []string, opts ...ProxyWithEndpointsOption) (*Pr
 			continue
 		}
 
-		client, err := httpClientFactory(endpoint)
+		client, err := httpClientFactory{}.newHTTPClient(endpoint)
 		if err != nil {
 			return nil, err
 		}
@@ -111,12 +107,19 @@ func (p *ProxyWithEndpoints) Get(ctx context.Context, req *GetRequest) (*GetResp
 		return nil, err
 	}
 
-	resp, cancel, err := p.trySend(ctx, req)
+	resp, cancel, err := p.retry.runWithEndpoints(ctx, p.endpoints, req.timeout, func(ctx context.Context, endpoint string) (*http.Response, error) {
+		return p.sendTo(ctx, endpoint, req)
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	return streamResponse(resp, cancel), nil
+	return &GetResponse{
+		Success:    true,
+		Header:     resp.Header.Clone(),
+		StatusCode: resp.StatusCode,
+		Body:       &cancelReadCloser{body: resp.Body, cancel: cancel},
+	}, nil
 }
 
 // GetInto sends a GET request to a remote server via the seed peer endpoints
@@ -129,71 +132,38 @@ func (p *ProxyWithEndpoints) GetInto(ctx context.Context, req *GetRequest, w io.
 		return nil, err
 	}
 
-	resp, cancel, err := p.trySend(ctx, req)
+	resp, cancel, err := p.retry.runWithEndpoints(ctx, p.endpoints, req.timeout, func(ctx context.Context, endpoint string) (*http.Response, error) {
+		return p.sendTo(ctx, endpoint, req)
+	})
 	if err != nil {
 		return nil, err
 	}
 	defer cancel()
+	defer resp.Body.Close()
 
-	return copyResponse(resp, w)
-}
-
-// trySend sends the request to the endpoints, retrying a transient failure on
-// the next one, see retryWithEndpoints.
-func (p *ProxyWithEndpoints) trySend(ctx context.Context, req *GetRequest) (*http.Response, context.CancelFunc, error) {
-	return retryWithEndpoints(ctx, p.retry, p.endpoints, req.timeout, func(ctx context.Context, endpoint string) (*http.Response, error) {
-		return p.send(ctx, p.clients[endpoint], req)
-	})
-}
-
-// send sends a request to the specified URL via the client with the given
-// headers.
-func (p *ProxyWithEndpoints) send(ctx context.Context, client *http.Client, req *GetRequest) (*http.Response, error) {
-	headers, err := makeRequestHeaders(req)
-	if err != nil {
-		return nil, err
-	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, req.url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
-	}
-	httpReq.Header = headers
-
-	resp, err := client.Do(httpReq)
-	if err != nil {
+	// Drain the response body into the writer.
+	if _, err := io.Copy(w, resp.Body); err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			return nil, fmt.Errorf("%w: %v", ErrRequestTimeout, err)
 		}
 
-		return nil, fmt.Errorf("%w: %v", ErrInternal, err)
+		return nil, fmt.Errorf("%w: failed to read response body: %v", ErrInternal, err)
 	}
 
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		return resp, nil
-	}
-	defer resp.Body.Close()
+	return &GetResponse{
+		Success:    true,
+		Header:     resp.Header.Clone(),
+		StatusCode: resp.StatusCode,
+	}, nil
+}
 
-	message, _ := io.ReadAll(resp.Body)
-	header := resp.Header.Clone()
-	switch errorType := resp.Header.Get("X-Dragonfly-Error-Type"); errorType {
-	case "backend":
-		return nil, &BackendError{Message: string(message), Header: header, StatusCode: resp.StatusCode}
-	case "proxy":
-		return nil, &ProxyError{Message: string(message), Header: header, StatusCode: resp.StatusCode}
-	case "dfdaemon":
-		return nil, &DfdaemonError{Message: string(message), Header: header, StatusCode: resp.StatusCode}
-	case "":
-		return nil, &ProxyError{
-			Message:    fmt.Sprintf("unexpected status code from proxy: %d", resp.StatusCode),
-			Header:     header,
-			StatusCode: resp.StatusCode,
-		}
-	default:
-		return nil, &ProxyError{
-			Message:    fmt.Sprintf("unknown error type from proxy: %s", errorType),
-			Header:     header,
-			StatusCode: resp.StatusCode,
-		}
+// sendTo sends the request once to the seed peer proxy at endpoint through its
+// client.
+func (p *ProxyWithEndpoints) sendTo(ctx context.Context, endpoint string, req *GetRequest) (*http.Response, error) {
+	client, ok := p.clients[endpoint]
+	if !ok {
+		return nil, fmt.Errorf("%w: no client for endpoint %s", ErrInternal, endpoint)
 	}
+
+	return req.send(ctx, client)
 }

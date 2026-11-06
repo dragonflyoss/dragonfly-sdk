@@ -34,6 +34,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
+    // Install the crypto provider of the clients to the seed peer proxies.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let proxy = Proxy::builder()
         .scheduler_endpoint(args[1].clone())
         .build()
