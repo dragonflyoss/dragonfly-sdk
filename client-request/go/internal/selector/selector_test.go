@@ -55,6 +55,8 @@ func createTestSeedPeers(count int, unhealthyID string) []SeedPeer {
 }
 
 func selectIDs(t *testing.T, s *SeedPeerSelector, taskID string, replicas uint32) []string {
+	t.Helper()
+
 	hosts, err := s.Select(taskID, replicas)
 	assert.NoError(t, err)
 
@@ -206,7 +208,48 @@ func TestConcurrentSelect(t *testing.T) {
 	wg.Wait()
 }
 
-func TestSelectServesATaskOnlyFromItsAvailableReplicas(t *testing.T) {
+func TestConcurrentUpdate(t *testing.T) {
+	assert := assert.New(t)
+	for range 100 {
+		s := New()
+		s.Update(createTestSeedPeers(2, ""))
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for i := range 1000 {
+				s.Update(createTestSeedPeers(2, fmt.Sprint(i%2+1)))
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			s.Update(createTestSeedPeers(3, ""))
+		}()
+		wg.Wait()
+
+		hostNames := make(map[string]struct{}, len(s.hosts))
+		for name := range s.hosts {
+			hostNames[name] = struct{}{}
+		}
+
+		ringNames := make(map[string]struct{}, len(s.hosts))
+		for _, vnode := range s.ring.GetWithReplicas("test-task", s.ring.Len()) {
+			ringNames[vnode.Name()] = struct{}{}
+		}
+		assert.Equal(hostNames, ringNames)
+	}
+}
+
+func TestUpdateSkipsSeedPeersWithoutAHost(t *testing.T) {
+	assert := assert.New(t)
+	s := New()
+	s.Update(append(createTestSeedPeers(1, ""), SeedPeer{Healthy: true}))
+
+	assert.Len(s.hosts, 1)
+}
+
+func TestSelectServesATaskOnlyFromItsHealthyReplicas(t *testing.T) {
 	assert := assert.New(t)
 	s := New()
 	s.Update(createTestSeedPeers(5, ""))
@@ -235,7 +278,7 @@ func TestSelectServesATaskOnlyFromItsAvailableReplicas(t *testing.T) {
 	}
 }
 
-func TestSelectFailsWhenEveryReplicaIsUnavailable(t *testing.T) {
+func TestSelectFailsWhenEveryReplicaIsUnhealthy(t *testing.T) {
 	assert := assert.New(t)
 	s := New()
 	s.Update([]SeedPeer{
@@ -259,19 +302,19 @@ func TestSelectFailsWhenEveryReplicaIsUnavailable(t *testing.T) {
 func TestOnFailureEjectsAProxyAfterConsecutiveFailuresUntilASuccess(t *testing.T) {
 	assert := assert.New(t)
 	s := New()
-	s.Update(createTestSeedPeers(2, ""))
+	s.Update(createTestSeedPeers(1, ""))
 	replica := selectIDs(t, s, "test-task", 1)
 	endpoint := s.ProxyEndpoint(s.hosts["host-"+replica[0]].Host)
 
-	for range maxFailedCount - 1 {
+	for range MaxFailedCount - 1 {
 		s.OnFailure(endpoint)
 	}
-	assert.Equal(replica, selectIDs(t, s, "test-task", 1))
+	assert.False(s.IsEjected(endpoint))
 
 	s.OnFailure(endpoint)
-	_, err := s.Select("test-task", 1)
-	assert.Error(err)
+	assert.True(s.IsEjected(endpoint))
+	assert.Equal(replica, selectIDs(t, s, "test-task", 1))
 
 	s.OnSuccess(endpoint)
-	assert.Equal(replica, selectIDs(t, s, "test-task", 1))
+	assert.False(s.IsEjected(endpoint))
 }

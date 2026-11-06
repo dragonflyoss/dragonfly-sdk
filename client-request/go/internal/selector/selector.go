@@ -35,18 +35,17 @@ import (
 )
 
 // healthCheckTimeout is the health check timeout for seed peers.
-const healthCheckTimeout = 5 * time.Second
+const healthCheckTimeout = 3 * time.Second
 
 // seedPeerType is the host type of seed peers, refer to
 // dragonfly-client-config/src/dfdaemon.rs#HostType.
 const seedPeerType = 1
 
-// maxFailedCount is the maximum count of consecutive failed requests to a seed
-// peer proxy, reaching which ejects it.
-const maxFailedCount = 5
+// MaxFailedCount is the maximum consecutive failures to connect to a seed peer
+// proxy before it is ejected.
+const MaxFailedCount = 5
 
-// ejectionCooldown is how long an ejected seed peer proxy is skipped after its
-// ejection.
+// ejectionCooldown is the cooldown of an ejected seed peer proxy.
 const ejectionCooldown = 30 * time.Second
 
 // Selector selects items from a list of items by a specific criteria.
@@ -54,7 +53,7 @@ type Selector interface {
 	// Select selects hosts based on the given taskID and number of replicas.
 	Select(taskID string, replicas uint32) ([]*commonv2.Host, error)
 
-	// SelectAll selects all hosts regardless of the taskID.
+	// SelectAll selects every healthy host regardless of the taskID.
 	SelectAll() ([]*commonv2.Host, error)
 }
 
@@ -105,8 +104,8 @@ func (s *Scheduler) Close() error {
 	return s.conn.Close()
 }
 
-// ListSeedPeers lists the seed peers from the scheduler and checks the health
-// of each concurrently.
+// ListSeedPeers lists the seed peers with their health, taking up to the
+// request timeout plus 3 seconds of health checks.
 func (s *Scheduler) ListSeedPeers(ctx context.Context) ([]SeedPeer, error) {
 	listCtx, cancel := context.WithTimeout(ctx, s.requestTimeout)
 	defer cancel()
@@ -129,6 +128,11 @@ func (s *Scheduler) ListSeedPeers(ctx context.Context) ([]SeedPeer, error) {
 	}
 	wg.Wait()
 
+	// Report the context error rather than every seed peer as unhealthy.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	return seedPeers, nil
 }
 
@@ -143,33 +147,34 @@ func (s *Scheduler) checkHealth(ctx context.Context, addr string) error {
 	ctx, cancel := context.WithTimeout(ctx, healthCheckTimeout)
 	defer cancel()
 
-	_, err = healthpb.NewHealthClient(conn).Check(ctx, &healthpb.HealthCheckRequest{})
-	return err
+	resp, err := healthpb.NewHealthClient(conn).Check(ctx, &healthpb.HealthCheckRequest{})
+	if err != nil {
+		return err
+	}
+
+	if resp.Status != healthpb.HealthCheckResponse_SERVING {
+		return fmt.Errorf("seed peer %s is %s", addr, resp.Status)
+	}
+
+	return nil
 }
 
-// ejection holds the consecutive failed requests to a seed peer proxy, and the
-// ejection they led to.
+// ejection is the ejection state of a seed peer proxy.
 type ejection struct {
-	// failedCount is the count of consecutive failed requests since the last
-	// successful one.
+	// failedCount is the count of consecutive failures to connect.
 	failedCount int
 
-	// ejectedAt is the time of the most recent ejection, zero if the proxy has
-	// never been ejected.
+	// ejectedAt is the time the proxy was last ejected.
 	ejectedAt time.Time
 }
 
 // SeedPeerSelector selects seed peers with a consistent hash ring.
 //
-// The hashring is built from every seed peer, healthy or not, and a task is
-// served only by its replicas, the seed peers following its position on the
-// ring, which hold it. A replica is skipped when it fails its health check, or
-// for ejectionCooldown once its proxy fails maxFailedCount requests in a row,
-// and the task fails when every replica is skipped, rather than moving to a
-// seed peer that does not hold it.
+// The hashring holds every seed peer, and a task is served only by its healthy
+// replicas.
 //
-//	task ──▶ ring position ──▶ replicas ─┬─ seed-peer-1 ──unhealthy or ejected──▶ skipped
-//	                                     └─ seed-peer-2 ──available────────────▶ selected
+//	task ──▶ ring position ──▶ replicas ─┬─ seed-peer-1 ──unhealthy──▶ skipped
+//	                                     └─ seed-peer-2 ──healthy────▶ selected
 //	                           every replica skipped ──▶ host not found
 type SeedPeerSelector struct {
 	// mu protects hosts and ring.
@@ -251,13 +256,19 @@ func (s *SeedPeerSelector) Refresh(ctx context.Context, scheduler *Scheduler) er
 func (s *SeedPeerSelector) Update(seedPeers []SeedPeer) {
 	hosts := make(map[string]SeedPeer, len(seedPeers))
 	for _, seedPeer := range seedPeers {
+		// Skip a seed peer without a host.
+		if seedPeer.Host == nil {
+			continue
+		}
+
 		hosts[seedPeer.Host.Name] = seedPeer
 	}
 
 	// Rebuilding the ring costs DefaultVNodesPerNode hashes per host and a full sort,
 	// so reuse the current ring when the host names are unchanged and only
-	// refresh the host records and their health.
-	s.mu.RLock()
+	// refresh the host records and their health. Compare under the write lock,
+	// so concurrent updates keep the hosts and the ring in step.
+	s.mu.Lock()
 	unchanged := len(hosts) == len(s.hosts)
 	for name := range hosts {
 		if _, ok := s.hosts[name]; !ok {
@@ -265,28 +276,28 @@ func (s *SeedPeerSelector) Update(seedPeers []SeedPeer) {
 			break
 		}
 	}
-	s.mu.RUnlock()
 
 	if unchanged {
-		s.mu.Lock()
 		s.hosts = hosts
 		s.mu.Unlock()
 		return
 	}
+	s.mu.Unlock()
 
 	ring := hashring.New()
 	for name := range hosts {
 		ring.Add(name)
 	}
 
+	// Replace the hosts together with their ring.
 	s.mu.Lock()
 	s.hosts = hosts
 	s.ring = ring
 	s.mu.Unlock()
 }
 
-// OnFailure handles a request to the proxy at endpoint that failed before the
-// proxy answered, ejecting the proxy after maxFailedCount of them in a row.
+// OnFailure records a failure to connect to the proxy at endpoint, ejecting it
+// after MaxFailedCount in a row.
 func (s *SeedPeerSelector) OnFailure(endpoint string) {
 	s.ejectionsMu.Lock()
 	defer s.ejectionsMu.Unlock()
@@ -298,17 +309,15 @@ func (s *SeedPeerSelector) OnFailure(endpoint string) {
 	}
 
 	e.failedCount++
-	if e.failedCount >= maxFailedCount {
+	if e.failedCount >= MaxFailedCount {
 		e.failedCount = 0
 		e.ejectedAt = time.Now()
 	}
 }
 
-// OnSuccess handles a request answered by the proxy at endpoint, clearing its
-// failures and ejection.
+// OnSuccess records an answer of the proxy at endpoint, clearing its failures.
 func (s *SeedPeerSelector) OnSuccess(endpoint string) {
-	// Most requests succeed with nothing to clear, so check under the read
-	// lock before taking the write lock to delete.
+	// Usually there is nothing to clear, so check under the read lock first.
 	s.ejectionsMu.RLock()
 	_, ok := s.ejections[endpoint]
 	s.ejectionsMu.RUnlock()
@@ -322,24 +331,17 @@ func (s *SeedPeerSelector) OnSuccess(endpoint string) {
 	delete(s.ejections, endpoint)
 }
 
-// isEjected reports whether the proxy of the seed peer is still within the
-// cooldown of its most recent ejection.
-func (s *SeedPeerSelector) isEjected(host *commonv2.Host) bool {
+// IsEjected reports whether the proxy at endpoint is ejected.
+func (s *SeedPeerSelector) IsEjected(endpoint string) bool {
 	s.ejectionsMu.RLock()
 	defer s.ejectionsMu.RUnlock()
 
-	// Most of the time no proxy is ejected, so skip formatting the endpoint.
-	if len(s.ejections) == 0 {
-		return false
-	}
-
-	e, ok := s.ejections[s.ProxyEndpoint(host)]
+	e, ok := s.ejections[endpoint]
 	return ok && !e.ejectedAt.IsZero() && time.Since(e.ejectedAt) < ejectionCooldown
 }
 
-// Select selects the available ones of the replicas, the first replicas
-// distinct seed peers for the given taskID in the consistent hash ring order.
-// The number of replicas is clamped to the number of seed peers.
+// Select selects the healthy replicas of the taskID in consistent hash ring
+// order, up to replicas of them.
 func (s *SeedPeerSelector) Select(taskID string, replicas uint32) ([]*commonv2.Host, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -354,7 +356,7 @@ func (s *SeedPeerSelector) Select(taskID string, replicas uint32) ([]*commonv2.H
 	// Walk the ring clockwise from the task position collecting distinct seed
 	// peers, growing the window until enough distinct seed peers are found or
 	// the whole ring is covered.
-	var replicaSeedPeers []SeedPeer
+	replicaSeedPeers := make([]SeedPeer, 0, expectedReplicas)
 	for window := expectedReplicas * 2; ; window *= 2 {
 		replicaSeedPeers = replicaSeedPeers[:0]
 		seen := make(map[string]struct{}, expectedReplicas)
@@ -381,29 +383,27 @@ func (s *SeedPeerSelector) Select(taskID string, replicas uint32) ([]*commonv2.H
 		}
 	}
 
-	// Serve the task only from the replicas that passed their health check and
-	// are not ejected, failing when none is.
-	var seedPeers []*commonv2.Host
+	// Select the healthy replicas, failing when none is.
+	seedPeers := make([]*commonv2.Host, 0, len(replicaSeedPeers))
 	for _, seedPeer := range replicaSeedPeers {
-		if seedPeer.Healthy && !s.isEjected(seedPeer.Host) {
+		if seedPeer.Healthy {
 			seedPeers = append(seedPeers, seedPeer.Host)
 		}
 	}
 
 	if len(seedPeers) == 0 {
-		return nil, fmt.Errorf("host not found: available seed peers")
+		return nil, fmt.Errorf("host not found: selected seed peers")
 	}
 
 	return seedPeers, nil
 }
 
-// SelectAll selects all seed peers that passed their health check, regardless
-// of the taskID.
+// SelectAll selects every healthy seed peer regardless of the taskID.
 func (s *SeedPeerSelector) SelectAll() ([]*commonv2.Host, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	var seedPeers []*commonv2.Host
+	seedPeers := make([]*commonv2.Host, 0, len(s.hosts))
 	for _, seedPeer := range s.hosts {
 		if seedPeer.Healthy {
 			seedPeers = append(seedPeers, seedPeer.Host)
@@ -421,5 +421,5 @@ func (s *SeedPeerSelector) SelectAll() ([]*commonv2.Host, error) {
 // "http://127.0.0.1:4001".
 func (s *SeedPeerSelector) ProxyEndpoint(host *commonv2.Host) string {
 	// TODO(chlins): Support client https scheme.
-	return fmt.Sprintf("http://%s", net.JoinHostPort(host.Ip, strconv.Itoa(int(host.ProxyPort))))
+	return "http://" + net.JoinHostPort(host.Ip, strconv.Itoa(int(host.ProxyPort)))
 }

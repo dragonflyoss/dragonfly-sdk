@@ -573,6 +573,7 @@ dependencies = [
  "futures",
  "hex",
  "hostname",
+ "http",
  "local-ip-address",
  "oci-client",
  "oci-spec",

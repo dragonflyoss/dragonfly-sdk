@@ -18,6 +18,7 @@ package request
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -42,10 +43,6 @@ func WithProxyWithEndpointsMaxRetries(retries uint8) ProxyWithEndpointsOption {
 func WithProxyWithEndpointsBackoff(b *backoff.ExponentialBackOff) ProxyWithEndpointsOption {
 	return func(p *ProxyWithEndpoints) { p.retry.backoff = b }
 }
-
-// Ensure ProxyWithEndpoints implements the RequestWithEndpoints interface at
-// compile time.
-var _ RequestWithEndpoints = (*ProxyWithEndpoints)(nil)
 
 // ProxyWithEndpoints is the HTTP proxy client that sends requests via the
 // fixed seed peer endpoints of the Dragonfly given at construction, without
@@ -90,7 +87,7 @@ func NewWithEndpoints(endpoints []string, opts ...ProxyWithEndpointsOption) (*Pr
 			continue
 		}
 
-		client, err := httpClientFactory(endpoint)
+		client, err := httpClientFactory{}.newHTTPClient(endpoint)
 		if err != nil {
 			return nil, err
 		}
@@ -117,7 +114,12 @@ func (p *ProxyWithEndpoints) Get(ctx context.Context, req *GetRequest) (*GetResp
 		return nil, err
 	}
 
-	return streamResponse(resp, cancel), nil
+	return &GetResponse{
+		Success:    true,
+		Header:     resp.Header.Clone(),
+		StatusCode: resp.StatusCode,
+		Body:       &cancelReadCloser{body: resp.Body, cancel: cancel},
+	}, nil
 }
 
 // GetInto sends a GET request to a remote server via the seed peer endpoints
@@ -137,8 +139,22 @@ func (p *ProxyWithEndpoints) GetInto(ctx context.Context, req *GetRequest, w io.
 		return nil, err
 	}
 	defer cancel()
+	defer resp.Body.Close()
 
-	return copyResponse(resp, w)
+	// Drain the response body into the writer.
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, fmt.Errorf("%w: %v", ErrRequestTimeout, err)
+		}
+
+		return nil, fmt.Errorf("%w: failed to read response body: %v", ErrInternal, err)
+	}
+
+	return &GetResponse{
+		Success:    true,
+		Header:     resp.Header.Clone(),
+		StatusCode: resp.StatusCode,
+	}, nil
 }
 
 // sendTo sends the request once to the seed peer proxy at endpoint through its

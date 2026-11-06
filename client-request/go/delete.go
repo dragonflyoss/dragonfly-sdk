@@ -56,7 +56,7 @@ func (p *Proxy) Delete(ctx context.Context, req *DeleteRequest) error {
 	// Select seed peers serving the task.
 	seedPeers, err := p.selectSeedPeers(id, req.scope, req.replicas)
 	if err != nil {
-		return fmt.Errorf("%w: failed to select seed peers from scheduler: %v", ErrInternal, err)
+		return fmt.Errorf("%w: failed to select seed peers: %v", ErrInternal, err)
 	}
 
 	// Construct the delete task request.

@@ -122,9 +122,10 @@ if err := proxy.DeleteImage(ctx, request.NewDeleteImageRequest("docker.io/librar
 Preheat with multiple replicas and scatter downloads across them. Preheating
 writes the file to the given number of distinct seed peers, and downloading
 scatters each request across those replicas by picking a random one, retrying
-on the others up to the max retries. Preheating fails when the available seed
-peers are fewer than the replicas, while downloading clamps the replicas to
-the available seed peers. The default replicas is 2:
+on the others up to the max retries. Preheating fails when fewer of the task's
+replicas are healthy than requested, while downloading uses its healthy
+replicas whose proxies are not ejected, failing when none is. The default
+replicas is 2:
 
 ```go
 if err := proxy.Preheat(ctx, request.NewPreheatRequest("https://example.com/file.txt", request.WithPreheatRequestReplicas(3))); err != nil {
@@ -186,39 +187,44 @@ defer resp.Body.Close()
 
 Share the seed peers across processes, such as several clients on a host, so
 only one of them lists the seed peers from the scheduler and checks their
-health. `Scheduler.ListSeedPeers` returns every seed peer with its health, and a
-proxy created with `WithProxySeedPeers` neither connects to the scheduler nor
-refreshes them, which `UpdateSeedPeers` does instead. The consistent hash ring
-is built from every seed peer, healthy or not, so a task stays on its replicas:
-an unhealthy replica is skipped, the request failing when every replica is, and
-serves the task again once it recovers. A seed peer proxy failing 5 requests in
-a row is skipped for 30 seconds:
+health. `SchedulerClient.ListSeedPeers` returns every seed peer with its
+health, and a proxy created with `NewWithSeedPeers` neither connects to the
+scheduler nor refreshes them, which `UpdateSeedPeers` does instead. The
+consistent hash ring is built from every seed peer, healthy or not, so a task
+stays on its replicas: an unhealthy replica is skipped, the request failing
+when every replica is, and serves the task again once it recovers. A seed peer
+proxy refusing the connection or unreachable 5 times in a row is skipped for
+30 seconds:
 
 ```go
-scheduler, err := request.NewScheduler("http://127.0.0.1:8002", 5*time.Second)
+schedulerClient, err := request.NewSchedulerClient("http://127.0.0.1:8002", 5*time.Second)
 if err != nil {
     panic(err)
 }
-defer scheduler.Close()
+defer schedulerClient.Close()
 
-seedPeers, err := scheduler.ListSeedPeers(ctx)
+seedPeers, err := schedulerClient.ListSeedPeers(ctx)
 if err != nil {
     panic(err)
 }
 
-proxy, err := request.New(ctx, "", request.WithProxySeedPeers(seedPeers))
+proxy, err := request.NewWithSeedPeers(seedPeers)
 if err != nil {
     panic(err)
 }
-defer proxy.Close()
 
 // Later, replace them with the ones listed again, such as by another process.
-seedPeers, err = scheduler.ListSeedPeers(ctx)
+seedPeers, err = schedulerClient.ListSeedPeers(ctx)
 if err != nil {
     panic(err)
 }
 proxy.UpdateSeedPeers(seedPeers)
 ```
+
+Since 1.11.0 a proxy created with the scheduler endpoint selects the same way, a
+breaking change: a task whose replicas are all unhealthy fails rather than
+moving to another seed peer, and a seed peer answering its health check with
+`NOT_SERVING` counts as unhealthy.
 
 See [examples](./examples) for runnable examples.
 

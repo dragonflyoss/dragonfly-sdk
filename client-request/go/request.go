@@ -27,12 +27,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
 	managertypes "d7y.io/dragonfly/v2/manager/types"
 	"d7y.io/dragonfly/v2/pkg/idgen"
+	"golang.org/x/net/http/httpguts"
 )
 
 // defaultRequestTimeout is the default timeout for requests.
@@ -70,11 +72,11 @@ func (s Scope) validate() error {
 
 // Request is the interface for sending requests via the Dragonfly.
 //
-// A request is served by the seed peers the scheduler picks for its task, and a
-// seed peer's dfdaemon fetches from the origin only what the P2P network does
-// not hold yet:
+// A request is served by the seed peers the consistent hash ring picks for its
+// task, and a seed peer's dfdaemon fetches from the origin only what the P2P
+// network does not hold yet:
 //
-//	client ──lookup──▶ scheduler ──▶ seed peers [B, A]
+//	client ──lookup──▶ hash ring ──▶ seed peers [B, A]
 //	  │
 //	  └──GET──▶ B (seed peer proxy) ──miss──▶ origin
 //	                │
@@ -96,8 +98,8 @@ type Request interface {
 	// Preheat preheats a file: has every replica seed peer, or every seed peer
 	// with ScopeAllSeedPeers, download it through the dfdaemon download task API
 	// without streaming it back. A transient failure is retried on the same seed
-	// peer, so the file lands on every replica. It fails when fewer seed peers
-	// than replicas are available.
+	// peer, so the file lands on every replica. It fails when fewer of the
+	// task's replicas are healthy than the replicas of the request.
 	Preheat(ctx context.Context, req *PreheatRequest) error
 
 	// PreheatImage preheats an OCI image: resolves its manifest, multi-platform
@@ -124,7 +126,7 @@ type Request interface {
 
 	// LookupEndpoints returns the proxy endpoints of the seed peers that would
 	// serve the request, in consistent hash ring order for its task id, up to
-	// the replicas of the request and clamped to the available seed peers.
+	// the replicas of the request and skipping the unhealthy or ejected ones.
 	LookupEndpoints(ctx context.Context, req *GetRequest) ([]string, error)
 }
 
@@ -148,6 +150,25 @@ type RequestWithEndpoints interface {
 	// body into w. A transient failure before the body starts is retried on
 	// the next endpoint, a failed body write is not since w cannot be rewound.
 	GetInto(ctx context.Context, req *GetRequest, w io.Writer) (*GetResponse, error)
+}
+
+// RequestWithSeedPeers is the interface for sending requests via the seed peers
+// given at construction, selected by the consistent hash ring like Request
+// without connecting to the scheduler.
+//
+// ProxyWithSeedPeers implements it.
+type RequestWithSeedPeers interface {
+	// Get sends a GET request via the seed peers and returns a response with a
+	// streaming body the caller must close, see Request.Get.
+	Get(ctx context.Context, req *GetRequest) (*GetResponse, error)
+
+	// GetInto sends a GET request via the seed peers and writes the response
+	// body into w, see Request.GetInto.
+	GetInto(ctx context.Context, req *GetRequest, w io.Writer) (*GetResponse, error)
+
+	// LookupEndpoints returns the proxy endpoints of the seed peers that would
+	// serve the request, see Request.LookupEndpoints.
+	LookupEndpoints(ctx context.Context, req *GetRequest) ([]string, error)
 }
 
 // GetRequest represents a GET request to be sent via the Dragonfly. Construct
@@ -290,14 +311,24 @@ func (r *GetRequest) validate() error {
 		return fmt.Errorf("%w: replicas must be positive", ErrInvalidArgument)
 	}
 
+	// Only http and https urls with a host go through the seed peer proxies.
+	u, err := url.Parse(r.url)
+	if err != nil {
+		return fmt.Errorf("%w: invalid url: %w", ErrInvalidArgument, err)
+	}
+
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
+		return fmt.Errorf("%w: url %q must be http or https with a host", ErrInvalidArgument, r.url)
+	}
+
 	return nil
 }
 
 // send sends the request once through the client of a seed peer proxy,
-// returning the response of a 2xx answer and the error of any other, named by
-// the X-Dragonfly-Error-Type header.
+// converting a non-2xx response into an error by its X-Dragonfly-Error-Type
+// header.
 func (r *GetRequest) send(ctx context.Context, client *http.Client) (*http.Response, error) {
-	headers, err := r.headers()
+	headers, err := r.proxyHeaders()
 	if err != nil {
 		return nil, err
 	}
@@ -346,9 +377,9 @@ func (r *GetRequest) send(ctx context.Context, client *http.Client) (*http.Respo
 	}
 }
 
-// headers returns the headers of the request with the P2P related ones
+// proxyHeaders returns the headers of the request with the P2P related ones
 // applied.
-func (r *GetRequest) headers() (http.Header, error) {
+func (r *GetRequest) proxyHeaders() (http.Header, error) {
 	headers := r.header.Clone()
 	if headers == nil {
 		headers = make(http.Header)
@@ -381,6 +412,20 @@ func (r *GetRequest) headers() (http.Header, error) {
 	}
 
 	headers.Set("X-Dragonfly-Use-P2P", "true")
+
+	// Reject the headers net/http cannot send.
+	for name, values := range headers {
+		if !httpguts.ValidHeaderFieldName(name) {
+			return nil, fmt.Errorf("%w: invalid header name %q", ErrInvalidArgument, name)
+		}
+
+		for _, value := range values {
+			if !httpguts.ValidHeaderFieldValue(value) {
+				return nil, fmt.Errorf("%w: invalid value of header %q", ErrInvalidArgument, name)
+			}
+		}
+	}
+
 	return headers, nil
 }
 

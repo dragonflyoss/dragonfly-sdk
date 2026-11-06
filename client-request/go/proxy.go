@@ -25,6 +25,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"syscall"
 	"time"
 
 	"d7y.io/dragonfly/v2/pkg/idgen"
@@ -106,37 +107,21 @@ func WithProxyHealthCheckInterval(interval time.Duration) ProxyOption {
 	return func(p *Proxy) { p.healthCheckInterval = interval }
 }
 
-// WithProxySeedPeers sets the seed peers of the cluster to select from, such
-// as the ones Scheduler.ListSeedPeers returns, instead of the scheduler
-// endpoint, which New then ignores: the proxy neither connects to the scheduler
-// nor refreshes them, which UpdateSeedPeers replaces, but still selects the
-// replicas of every request by the consistent hash ring. Unlike the endpoints
-// of NewWithEndpoints, which are the replicas already selected for one
-// request, such as by LookupEndpoints.
-func WithProxySeedPeers(seedPeers []SeedPeer) ProxyOption {
-	return func(p *Proxy) {
-		if seedPeers == nil {
-			seedPeers = []SeedPeer{}
-		}
-
-		p.seedPeers = seedPeers
-	}
-}
-
 // SeedPeer is a seed peer listed by the scheduler, with the result of its
 // health check.
 type SeedPeer = selector.SeedPeer
 
-// Scheduler is the scheduler the seed peers are listed from. The seed peers
-// its ListSeedPeers lists can be shared, such as by several processes on a
-// host, and served through WithProxySeedPeers without each process connecting
-// to the scheduler.
-type Scheduler = selector.Scheduler
+// SchedulerClient is the client of the scheduler for listing the seed peers to
+// share through NewWithSeedPeers.
+type SchedulerClient struct {
+	// scheduler is the client of the scheduler service.
+	scheduler *selector.Scheduler
+}
 
-// NewScheduler creates a scheduler at the given endpoint, e.g.
-// "http://scheduler-service:8002", its requests bounded by requestTimeout.
-// The caller must close it.
-func NewScheduler(endpoint string, requestTimeout time.Duration) (*Scheduler, error) {
+// NewSchedulerClient creates a client of the scheduler at the given endpoint,
+// e.g. "http://scheduler-service:8002", bounding its requests by
+// requestTimeout. The caller must close it.
+func NewSchedulerClient(endpoint string, requestTimeout time.Duration) (*SchedulerClient, error) {
 	u, err := url.Parse(endpoint)
 	if err != nil || u.Host == "" {
 		return nil, fmt.Errorf("%w: invalid scheduler endpoint: %s", ErrInvalidArgument, endpoint)
@@ -144,14 +129,27 @@ func NewScheduler(endpoint string, requestTimeout time.Duration) (*Scheduler, er
 
 	scheduler, err := selector.NewScheduler(u.Host, requestTimeout)
 	if err != nil {
-		return nil, fmt.Errorf("%w: failed to connect to scheduler %s: %v", ErrInternal, endpoint, err)
+		return nil, fmt.Errorf("%w: failed to connect to scheduler %s: %w", ErrInternal, endpoint, err)
 	}
 
-	return scheduler, nil
+	return &SchedulerClient{scheduler: scheduler}, nil
 }
 
-// Ensure Proxy implements the Request interface at compile time.
-var _ Request = (*Proxy)(nil)
+// ListSeedPeers lists the seed peers with their health, taking up to the
+// request timeout plus 3 seconds of health checks.
+func (s *SchedulerClient) ListSeedPeers(ctx context.Context) ([]SeedPeer, error) {
+	seedPeers, err := s.scheduler.ListSeedPeers(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to list seed peers: %w", ErrInternal, err)
+	}
+
+	return seedPeers, nil
+}
+
+// Close closes the connection to the scheduler.
+func (s *SchedulerClient) Close() error {
+	return s.scheduler.Close()
+}
 
 // Proxy is the HTTP proxy client that sends requests via Dragonfly.
 type Proxy struct {
@@ -165,17 +163,14 @@ type Proxy struct {
 	// healthCheckInterval is the interval of health check for seed peers.
 	healthCheckInterval time.Duration
 
-	// seedPeers is the seed peers serving the requests instead of the ones
-	// the scheduler lists.
-	seedPeers []SeedPeer
-
 	// seedPeerSelector is the selector service for selecting seed peers.
 	seedPeerSelector *selector.SeedPeerSelector
 
 	// clientPool is the pool of clients.
 	clientPool *pool.Pool
 
-	// scheduler is the scheduler service the seed peers are listed from.
+	// scheduler is the scheduler service the seed peers are listed from, nil
+	// in a ProxyWithSeedPeers.
 	scheduler *selector.Scheduler
 }
 
@@ -186,8 +181,9 @@ func New(ctx context.Context, schedulerEndpoint string, opts ...ProxyOption) (*P
 		retry:                   defaultRetryPolicy,
 		schedulerRequestTimeout: defaultSchedulerRequestTimeout,
 		healthCheckInterval:     defaultHealthCheckInterval,
-		clientPool:              pool.New(httpClientFactory, defaultClientPoolCapacity, defaultClientPoolIdleTimeout),
+		seedPeerSelector:        selector.New(),
 	}
+	p.clientPool = pool.New(httpClientFactory{seedPeerSelector: p.seedPeerSelector}.newHTTPClient, defaultClientPoolCapacity, defaultClientPoolIdleTimeout)
 	for _, opt := range opts {
 		opt(p)
 	}
@@ -196,29 +192,21 @@ func New(ctx context.Context, schedulerEndpoint string, opts ...ProxyOption) (*P
 		return nil, err
 	}
 
-	// Create seed peer selector, from the given seed peers or the ones the
-	// scheduler lists.
-	p.seedPeerSelector = selector.New()
-	if p.seedPeers != nil {
-		p.seedPeerSelector.Update(p.seedPeers)
-		return p, nil
-	}
-
-	scheduler, err := NewScheduler(schedulerEndpoint, p.schedulerRequestTimeout)
+	schedulerClient, err := NewSchedulerClient(schedulerEndpoint, p.schedulerRequestTimeout)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := p.seedPeerSelector.Refresh(ctx, scheduler); err != nil {
-		scheduler.Close()
+	if err := p.seedPeerSelector.Refresh(ctx, schedulerClient.scheduler); err != nil {
+		schedulerClient.Close()
 		return nil, fmt.Errorf("%w: failed to create seed peer selector: %v", ErrInternal, err)
 	}
 
 	// Run the selector service in the background to refresh the seed peers
 	// periodically.
-	go p.seedPeerSelector.Run(scheduler, p.healthCheckInterval)
+	go p.seedPeerSelector.Run(schedulerClient.scheduler, p.healthCheckInterval)
 
-	p.scheduler = scheduler
+	p.scheduler = schedulerClient.scheduler
 	return p, nil
 }
 
@@ -233,22 +221,8 @@ func (p *Proxy) Close() error {
 	return p.scheduler.Close()
 }
 
-// UpdateSeedPeers replaces the seed peers serving the requests, such as the
-// ones Scheduler.ListSeedPeers returns, for a proxy created with
-// WithProxySeedPeers. The consistent hash ring is rebuilt only when the seed
-// peers change, not when their health does, so a task stays on its replicas:
-// an unhealthy replica is skipped, the task failing when every replica is, and
-// serves it again once it recovers.
-func (p *Proxy) UpdateSeedPeers(seedPeers []SeedPeer) {
-	p.seedPeerSelector.Update(seedPeers)
-}
-
 // validate validates the input parameters.
 func (p *Proxy) validate() error {
-	if p.seedPeers != nil && len(p.seedPeers) == 0 {
-		return fmt.Errorf("%w: seed peers must not be empty", ErrInvalidArgument)
-	}
-
 	if p.schedulerRequestTimeout < 100*time.Millisecond {
 		return fmt.Errorf("%w: scheduler request timeout must be at least 100 milliseconds", ErrInvalidArgument)
 	}
@@ -264,35 +238,50 @@ func (p *Proxy) validate() error {
 	return nil
 }
 
-// httpClientFactory creates a new HTTP client configured to use the specified
-// proxy address. The transport follows the shape of net/http DefaultTransport
-// with a larger idle connection pool, since each client serves a single seed
-// peer proxy host.
+// httpClientFactory creates the HTTP clients to the seed peer proxies.
+type httpClientFactory struct {
+	// seedPeerSelector records the answers of the proxies, nil for the clients
+	// whose proxies are never ejected.
+	seedPeerSelector *selector.SeedPeerSelector
+}
+
+// newHTTPClient creates a new HTTP client configured to use the specified
+// proxy address, ejecting the proxy that keeps failing to connect when the
+// seed peer selector is set. The transport follows the shape of net/http
+// DefaultTransport with a larger idle connection pool, since each client
+// serves a single seed peer proxy host.
 //
 // TODO(chlins): Support client certificates and set the insecure skip verify
 // based on the certificates.
-func httpClientFactory(proxyAddr string) (*http.Client, error) {
+func (f httpClientFactory) newHTTPClient(proxyAddr string) (*http.Client, error) {
 	proxyURL, err := url.Parse(proxyAddr)
 	if err != nil {
 		return nil, fmt.Errorf("%w: failed to set proxy %s: %v", ErrInternal, proxyAddr, err)
 	}
 
-	return &http.Client{
-		Transport: &http.Transport{
-			Proxy: http.ProxyURL(proxyURL),
-			DialContext: (&net.Dialer{
-				Timeout:   dialTimeout,
-				KeepAlive: keepAliveInterval,
-			}).DialContext,
-			ForceAttemptHTTP2:     true,
-			TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
-			MaxIdleConns:          poolMaxIdlePerHost,
-			MaxIdleConnsPerHost:   poolMaxIdlePerHost,
-			IdleConnTimeout:       idleConnTimeout,
-			TLSHandshakeTimeout:   tlsHandshakeTimeout,
-			ExpectContinueTimeout: expectContinueTimeout,
-		},
-	}, nil
+	var transport http.RoundTripper = &http.Transport{
+		Proxy: http.ProxyURL(proxyURL),
+		DialContext: (&net.Dialer{
+			Timeout:   dialTimeout,
+			KeepAlive: keepAliveInterval,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
+		MaxIdleConns:          poolMaxIdlePerHost,
+		MaxIdleConnsPerHost:   poolMaxIdlePerHost,
+		IdleConnTimeout:       idleConnTimeout,
+		TLSHandshakeTimeout:   tlsHandshakeTimeout,
+		ExpectContinueTimeout: expectContinueTimeout,
+	}
+	if f.seedPeerSelector != nil {
+		transport = &ejectionTransport{
+			transport:        transport,
+			seedPeerSelector: f.seedPeerSelector,
+			endpoint:         proxyAddr,
+		}
+	}
+
+	return &http.Client{Transport: transport}, nil
 }
 
 // Get sends a GET request to a remote server via the Dragonfly and returns a
@@ -314,7 +303,12 @@ func (p *Proxy) Get(ctx context.Context, req *GetRequest) (*GetResponse, error) 
 		return nil, err
 	}
 
-	return streamResponse(resp, cancel), nil
+	return &GetResponse{
+		Success:    true,
+		Header:     resp.Header.Clone(),
+		StatusCode: resp.StatusCode,
+		Body:       &cancelReadCloser{body: resp.Body, cancel: cancel},
+	}, nil
 }
 
 // GetInto sends a GET request to a remote server via the Dragonfly and writes
@@ -336,26 +330,9 @@ func (p *Proxy) GetInto(ctx context.Context, req *GetRequest, w io.Writer) (*Get
 		return nil, err
 	}
 	defer cancel()
-
-	return copyResponse(resp, w)
-}
-
-// streamResponse builds the response with a streaming body that releases the
-// attempt timeout when the body is closed.
-func streamResponse(resp *http.Response, cancel context.CancelFunc) *GetResponse {
-	return &GetResponse{
-		Success:    true,
-		Header:     resp.Header.Clone(),
-		StatusCode: resp.StatusCode,
-		Body:       &cancelReadCloser{body: resp.Body, cancel: cancel},
-	}
-}
-
-// copyResponse drains the response body into the writer and builds the
-// response.
-func copyResponse(resp *http.Response, w io.Writer) (*GetResponse, error) {
 	defer resp.Body.Close()
 
+	// Drain the response body into the writer.
 	if _, err := io.Copy(w, resp.Body); err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			return nil, fmt.Errorf("%w: %v", ErrRequestTimeout, err)
@@ -374,7 +351,7 @@ func copyResponse(resp *http.Response, w io.Writer) (*GetResponse, error) {
 // LookupEndpoints looks up the proxy endpoints (e.g., "http://127.0.0.1:4001")
 // of the seed peers serving the request, in the consistent hash ring selection
 // order for the request's task id. It returns up to the replicas of the
-// request distinct endpoints, clamped to the number of available seed peers.
+// request, skipping the unhealthy or ejected ones.
 func (p *Proxy) LookupEndpoints(ctx context.Context, req *GetRequest) ([]string, error) {
 	if err := req.validate(); err != nil {
 		return nil, err
@@ -393,20 +370,27 @@ func (p *Proxy) lookupProxyEndpoints(req *GetRequest) ([]string, error) {
 
 	seedPeers, err := p.seedPeerSelector.Select(taskID, uint32(req.replicas))
 	if err != nil {
-		return nil, fmt.Errorf("%w: failed to select seed peers from scheduler: %v", ErrInternal, err)
+		return nil, fmt.Errorf("%w: failed to select seed peers: %v", ErrInternal, err)
 	}
 
+	// Skip the ejected proxies, failing when all are ejected.
 	endpoints := make([]string, 0, len(seedPeers))
 	for _, peer := range seedPeers {
-		endpoints = append(endpoints, p.seedPeerSelector.ProxyEndpoint(peer))
+		endpoint := p.seedPeerSelector.ProxyEndpoint(peer)
+		if !p.seedPeerSelector.IsEjected(endpoint) {
+			endpoints = append(endpoints, endpoint)
+		}
+	}
+
+	if len(endpoints) == 0 {
+		return nil, fmt.Errorf("%w: seed peers of task %s are all ejected", ErrInternal, taskID)
 	}
 
 	return endpoints, nil
 }
 
 // sendTo sends the request once to the seed peer proxy at endpoint through its
-// pooled client, recording whether the proxy answered, so a proxy that keeps
-// failing is ejected.
+// pooled client.
 func (p *Proxy) sendTo(ctx context.Context, endpoint string, req *GetRequest) (*http.Response, error) {
 	entry, err := p.clientPool.Entry(endpoint, endpoint)
 	if err != nil {
@@ -416,17 +400,41 @@ func (p *Proxy) sendTo(ctx context.Context, endpoint string, req *GetRequest) (*
 	guard := entry.RequestGuard()
 	defer guard.Done()
 
-	// A request the caller cancelled says nothing about the proxy, so only a
-	// failure while its context is alive counts.
-	resp, err := req.send(ctx, entry.Client)
+	return req.send(ctx, entry.Client)
+}
+
+// ejectionTransport records whether a seed peer proxy answered, to eject the
+// proxy that keeps failing to connect.
+type ejectionTransport struct {
+	// transport sends the requests.
+	transport http.RoundTripper
+
+	// seedPeerSelector is the seed peer selector recording the answers.
+	seedPeerSelector *selector.SeedPeerSelector
+
+	// endpoint is the endpoint of the seed peer proxy.
+	endpoint string
+}
+
+// RoundTrip sends the request, recording any response as a success and a
+// refused or unreachable proxy as a failure.
+func (t *ejectionTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.transport.RoundTrip(req)
 	switch {
 	case err == nil:
-		p.seedPeerSelector.OnSuccess(endpoint)
-	case errors.Is(err, ErrInternal) && ctx.Err() == nil:
-		p.seedPeerSelector.OnFailure(endpoint)
+		t.seedPeerSelector.OnSuccess(t.endpoint)
+	case errors.Is(err, syscall.ECONNREFUSED), errors.Is(err, syscall.EHOSTUNREACH), errors.Is(err, syscall.ENETUNREACH):
+		t.seedPeerSelector.OnFailure(t.endpoint)
 	}
 
 	return resp, err
+}
+
+// CloseIdleConnections closes the idle connections of the transport.
+func (t *ejectionTransport) CloseIdleConnections() {
+	if transport, ok := t.transport.(interface{ CloseIdleConnections() }); ok {
+		transport.CloseIdleConnections()
+	}
 }
 
 // cancelReadCloser cancels the request timeout context when the body is fully

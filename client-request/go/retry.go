@@ -67,7 +67,7 @@ func (p retryPolicy) newBackOff() backoff.BackOff {
 // cancelled context ends the retries with ErrInternal, an expired one with
 // ErrRequestTimeout.
 //
-//	attempt ──nil──────────────────────────────────────────▶ result
+//	attempt ──nil──────────────────────────────────────────▶ nil
 //	   │
 //	   └─err──▶ isRetryable(err)? ──no─────────────────────▶ err
 //	                 │ yes

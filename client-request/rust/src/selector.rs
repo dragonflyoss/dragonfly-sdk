@@ -21,7 +21,9 @@ use crate::Result;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use dragonfly_api::common::v2::Host;
-use dragonfly_api::scheduler::v2::{scheduler_client::SchedulerClient, ListHostsRequest};
+use dragonfly_api::scheduler::v2::{
+    scheduler_client::SchedulerClient as SchedulerGRPCClient, ListHostsRequest,
+};
 use dragonfly_hashring::VNodeHashRing;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -31,28 +33,29 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
 use tonic::transport::{Channel, Endpoint};
 use tonic_health::pb::{
-    health_client::HealthClient as HealthGRPCClient, HealthCheckRequest, HealthCheckResponse,
+    health_check_response::ServingStatus, health_client::HealthClient as HealthGRPCClient,
+    HealthCheckRequest, HealthCheckResponse,
 };
 use tracing::{debug, error, info, warn, Instrument};
 
 /// The interface for selecting item from a list of items by a specific criteria.
 #[async_trait]
 pub(crate) trait Selector: Send + Sync {
-    /// select selects items based on the given task_id and number of replicas.
+    /// Selects the healthy replicas of the task_id, up to `replicas` of them.
     async fn select(&self, task_id: String, replicas: u32) -> Result<Vec<Host>>;
 
-    /// select_all selects all items regardless of the task_id.
+    /// Selects every healthy item regardless of the task_id.
     async fn select_all(&self) -> Result<Vec<Host>>;
 }
 
 /// The health check timeout for seed peers.
-const SEED_PEERS_HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+const SEED_PEERS_HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// The maximum count of consecutive failed requests to a seed peer proxy,
-/// reaching which ejects it.
-const MAX_FAILED_COUNT: u32 = 5;
+/// The maximum consecutive failures to connect to a seed peer proxy before it
+/// is ejected.
+pub(crate) const MAX_FAILED_COUNT: u32 = 5;
 
-/// How long an ejected seed peer proxy is skipped after its ejection.
+/// The cooldown of an ejected seed peer proxy.
 const EJECTION_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// A seed peer listed by the scheduler, with the result of its health check.
@@ -65,20 +68,19 @@ pub struct SeedPeer {
     pub healthy: bool,
 }
 
-/// The scheduler the seed peers are listed from. The seed peers it lists can be
-/// shared, such as by several processes on a host, and served through
-/// [`ProxyBuilder::seed_peers`](crate::ProxyBuilder::seed_peers) without each
-/// process connecting to the scheduler.
-pub struct Scheduler {
+/// The client of the scheduler for listing the seed peers to share through
+/// [`ProxyWithSeedPeers`](crate::ProxyWithSeedPeers).
+#[derive(Debug, Clone)]
+pub struct SchedulerClient {
     /// The client to communicate with the scheduler service.
-    client: SchedulerClient<Channel>,
+    client: SchedulerGRPCClient<Channel>,
 }
 
-/// Implements the scheduler.
-impl Scheduler {
-    /// Connects to the scheduler, both the connect and every request bounded
-    /// by `timeout`.
-    pub async fn connect(endpoint: &str, timeout: Duration) -> Result<Self> {
+/// Implements the scheduler client.
+impl SchedulerClient {
+    /// Creates the client connected to the scheduler at `endpoint`, bounding the
+    /// connect and every request by `timeout`.
+    pub async fn new(endpoint: &str, timeout: Duration) -> Result<Self> {
         let channel = Endpoint::from_shared(endpoint.to_string())
             .map_err(|err| Error::InvalidArgument(err.to_string()))?
             .connect_timeout(timeout)
@@ -90,12 +92,12 @@ impl Scheduler {
             })?;
 
         Ok(Self {
-            client: SchedulerClient::new(channel),
+            client: SchedulerGRPCClient::new(channel),
         })
     }
 
-    /// Lists the seed peers from the scheduler and checks the health of each
-    /// concurrently.
+    /// Lists the seed peers with their health, taking up to the timeout plus 3
+    /// seconds of health checks.
     pub async fn list_seed_peers(&self) -> Result<Vec<SeedPeer>> {
         // Filter for seed peer types, seed peer type is 1.
         // refer to dragonfly-client-config/src/dfdaemon.rs#HostType.
@@ -112,7 +114,11 @@ impl Scheduler {
             join_set.spawn(
                 async move {
                     let healthy = match Self::check_health(&addr).await {
-                        Ok(_) => true,
+                        Ok(response) if response.status == ServingStatus::Serving as i32 => true,
+                        Ok(response) => {
+                            error!("seed peer {} is not serving: {:?}", addr, response.status());
+                            false
+                        }
                         Err(err) => {
                             error!("health check of seed peer {} failed: {}", addr, err);
                             false
@@ -138,22 +144,28 @@ impl Scheduler {
 
     /// Checks the health of a seed peer.
     async fn check_health(addr: &str) -> Result<HealthCheckResponse> {
-        let channel = Endpoint::from_shared(addr.to_string())?
-            .connect_timeout(SEED_PEERS_HEALTH_CHECK_TIMEOUT)
-            .connect()
-            .await?;
+        // Bound the whole check, including the connect.
+        tokio::time::timeout(SEED_PEERS_HEALTH_CHECK_TIMEOUT, async {
+            let channel = Endpoint::from_shared(addr.to_string())?
+                .connect_timeout(SEED_PEERS_HEALTH_CHECK_TIMEOUT)
+                .connect()
+                .await?;
 
-        let mut client = HealthGRPCClient::new(channel);
-        let mut request = tonic::Request::new(HealthCheckRequest {
-            service: "".to_string(),
-        });
-        request.set_timeout(SEED_PEERS_HEALTH_CHECK_TIMEOUT);
-        let response = client.check(request).await?;
-        Ok(response.into_inner())
+            let mut client = HealthGRPCClient::new(channel);
+            let mut request = tonic::Request::new(HealthCheckRequest {
+                service: "".to_string(),
+            });
+            request.set_timeout(SEED_PEERS_HEALTH_CHECK_TIMEOUT);
+            let response = client.check(request).await?;
+            Ok(response.into_inner())
+        })
+        .await
+        .map_err(|_| Error::RequestTimeout(format!("health check of {addr} timed out")))?
     }
 }
 
 /// Holds the data of seed peers.
+#[derive(Debug)]
 struct SeedPeers {
     /// The seed peers by host name, healthy or not.
     hosts: HashMap<String, SeedPeer>,
@@ -162,32 +174,27 @@ struct SeedPeers {
     hashring: VNodeHashRing,
 }
 
-/// The consecutive failed requests to a seed peer proxy, and the ejection they
-/// led to.
-#[derive(Default)]
+/// The ejection state of a seed peer proxy.
+#[derive(Debug, Default)]
 struct Ejection {
-    /// The count of consecutive failed requests since the last successful one.
+    /// The count of consecutive failures to connect.
     failed_count: u32,
 
-    /// The time of the most recent ejection, `None` if the proxy has never
-    /// been ejected.
+    /// The time the proxy was last ejected.
     ejected_at: Option<Instant>,
 }
 
 /// The implementation of Selector for seed peers.
 ///
-/// The hashring is built from every seed peer, healthy or not, and a task is
-/// served only by its replicas, the seed peers following its position on the
-/// ring, which hold it. A replica is skipped when it fails its health check, or
-/// for [`EJECTION_COOLDOWN`] once its proxy fails [`MAX_FAILED_COUNT`] requests
-/// in a row, and the task fails when every replica is skipped, rather than
-/// moving to a seed peer that does not hold it.
+/// The hashring holds every seed peer, and a task is served only by its healthy
+/// replicas.
 ///
 /// ```text
-/// task ──▶ ring position ──▶ replicas ─┬─ seed-peer-1 ──unhealthy or ejected──▶ skipped
-///                                      └─ seed-peer-2 ──available────────────▶ selected
+/// task ──▶ ring position ──▶ replicas ─┬─ seed-peer-1 ──unhealthy──▶ skipped
+///                                      └─ seed-peer-2 ──healthy────▶ selected
 ///                            every replica skipped ──▶ HostNotFound
 /// ```
+#[derive(Debug)]
 pub(crate) struct SeedPeerSelector {
     /// The data of the seed peer selector.
     seed_peers: RwLock<SeedPeers>,
@@ -199,7 +206,7 @@ pub(crate) struct SeedPeerSelector {
     mutex: Mutex<()>,
 }
 
-/// Implements a selector that selects seed peers from the scheduler service.
+/// Implements a selector that selects seed peers.
 impl SeedPeerSelector {
     /// Creates a new seed peer selector without any seed peer.
     pub(crate) fn new() -> Self {
@@ -213,14 +220,17 @@ impl SeedPeerSelector {
         }
     }
 
-    /// Starts the seed peer selector service, refreshing the seed peers from
-    /// the scheduler every `health_check_interval`.
-    pub(crate) async fn run(&self, scheduler: Scheduler, health_check_interval: Duration) {
+    /// Starts the seed peer selector service.
+    pub(crate) async fn run(
+        &self,
+        scheduler_client: SchedulerClient,
+        health_check_interval: Duration,
+    ) {
         let mut interval = tokio::time::interval(health_check_interval);
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    match self.refresh(&scheduler).await {
+                    match self.refresh(&scheduler_client).await {
                         Err(err) => error!("failed to refresh seed peers: {}", err),
                         Ok(_) => debug!("succeed to refresh seed peers"),
                     }
@@ -234,14 +244,14 @@ impl SeedPeerSelector {
     }
 
     /// Refreshes the seed peers from the scheduler.
-    pub(crate) async fn refresh(&self, scheduler: &Scheduler) -> Result<()> {
+    pub(crate) async fn refresh(&self, scheduler_client: &SchedulerClient) -> Result<()> {
         // Only one refresh can be running at a time.
         let Ok(_guard) = self.mutex.try_lock() else {
             debug!("refresh is already running");
             return Ok(());
         };
 
-        let seed_peers = scheduler.list_seed_peers().await?;
+        let seed_peers = scheduler_client.list_seed_peers().await?;
         self.update(seed_peers).await;
         Ok(())
     }
@@ -255,17 +265,16 @@ impl SeedPeerSelector {
 
         // Rebuilding the ring costs vnodes-per-host hashes per host and a full
         // sort, so reuse the current ring when the host names are unchanged
-        // and only refresh the host records and their health.
-        let unchanged = {
-            let seed_peers = self.seed_peers.read().await;
-            seed_peers.hosts.len() == hosts.len()
-                && hosts.keys().all(|name| seed_peers.hosts.contains_key(name))
-        };
-
-        if unchanged {
+        // and only refresh the host records and their health. Compare under the
+        // write lock, so concurrent updates keep the hosts and the ring in step.
+        {
             let mut seed_peers = self.seed_peers.write().await;
-            seed_peers.hosts = hosts;
-            return;
+            if seed_peers.hosts.len() == hosts.len()
+                && hosts.keys().all(|name| seed_peers.hosts.contains_key(name))
+            {
+                seed_peers.hosts = hosts;
+                return;
+            }
         }
 
         let mut hashring = VNodeHashRing::new();
@@ -279,9 +288,8 @@ impl SeedPeerSelector {
         seed_peers.hashring = hashring;
     }
 
-    /// Handles a request to the proxy at `endpoint` that failed before the
-    /// proxy answered, ejecting the proxy after [`MAX_FAILED_COUNT`] of them
-    /// in a row.
+    /// Records a failure to connect to the proxy at `endpoint`, ejecting it after
+    /// [`MAX_FAILED_COUNT`] in a row.
     pub(crate) fn on_failure(&self, endpoint: &str) {
         let mut ejection = self.ejections.entry(endpoint.to_string()).or_default();
         ejection.failed_count += 1;
@@ -296,11 +304,9 @@ impl SeedPeerSelector {
         }
     }
 
-    /// Handles a request answered by the proxy at `endpoint`, clearing its
-    /// failures and ejection.
+    /// Records an answer of the proxy at `endpoint`, clearing its failures.
     pub(crate) fn on_success(&self, endpoint: &str) {
-        // Most requests succeed with nothing to clear, so check under the
-        // shard read lock before taking the write lock to remove.
+        // Usually there is nothing to clear, so check under the read lock first.
         if self.ejections.contains_key(endpoint) {
             self.ejections.remove(endpoint);
         }
@@ -316,15 +322,10 @@ impl SeedPeerSelector {
         ))
     }
 
-    /// Returns whether the proxy of the seed peer is still within the cooldown
-    /// of its most recent ejection.
-    fn is_ejected(&self, host: &Host) -> bool {
-        let Ok(endpoint) = Self::proxy_endpoint(host) else {
-            return false;
-        };
-
+    /// Returns whether the proxy at `endpoint` is ejected.
+    pub(crate) fn is_ejected(&self, endpoint: &str) -> bool {
         self.ejections
-            .get(&endpoint)
+            .get(endpoint)
             .and_then(|ejection| ejection.ejected_at)
             .is_some_and(|ejected_at| ejected_at.elapsed() < EJECTION_COOLDOWN)
     }
@@ -380,15 +381,14 @@ impl Selector for SeedPeerSelector {
             window *= 2;
         }
 
-        // Serve the task only from the replica_seed_peers that passed their health check
-        // and are not ejected, failing when none is.
+        // Select the healthy replicas, failing when none is.
         let selected: Vec<Host> = replica_seed_peers
             .into_iter()
-            .filter(|seed_peer| seed_peer.healthy && !self.is_ejected(&seed_peer.host))
+            .filter(|seed_peer| seed_peer.healthy)
             .map(|seed_peer| seed_peer.host.clone())
             .collect();
         if selected.is_empty() {
-            return Err(Error::HostNotFound("available seed peers".to_string()));
+            return Err(Error::HostNotFound("selected seed peers".to_string()));
         }
 
         Ok(selected)
@@ -435,12 +435,12 @@ mod tests {
         selector
     }
 
-    fn create_test_seed_peers(count: usize, unhealthy_id: &str) -> Vec<SeedPeer> {
+    fn create_test_seed_peers(count: usize, unhealthy_id: Option<&str>) -> Vec<SeedPeer> {
         (1..=count)
             .map(|i| {
                 let host = create_test_host(&i.to_string(), &format!("192.168.1.{i}"), 8080, 1);
                 SeedPeer {
-                    healthy: host.id != unhealthy_id,
+                    healthy: Some(host.id.as_str()) != unhealthy_id,
                     host,
                 }
             })
@@ -546,13 +546,13 @@ mod tests {
     #[tokio::test]
     async fn select_all_skips_unhealthy_seed_peers() {
         let selector = SeedPeerSelector::new();
-        selector.update(create_test_seed_peers(2, "2")).await;
+        selector.update(create_test_seed_peers(2, Some("2"))).await;
 
         let hosts = selector.select_all().await.unwrap();
         assert_eq!(hosts.len(), 1);
         assert_eq!(hosts[0].id, "1");
 
-        selector.update(create_test_seed_peers(1, "1")).await;
+        selector.update(create_test_seed_peers(1, Some("1"))).await;
         assert!(matches!(
             selector.select_all().await,
             Err(Error::HostNotFound(_))
@@ -613,17 +613,53 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_update() {
+        for _ in 0..100 {
+            let selector = Arc::new(SeedPeerSelector::new());
+            selector.update(create_test_seed_peers(2, None)).await;
+
+            let health_updates = tokio::spawn({
+                let selector = selector.clone();
+                async move {
+                    for i in 0..1000 {
+                        selector
+                            .update(create_test_seed_peers(2, Some(&(i % 2 + 1).to_string())))
+                            .await;
+                    }
+                }
+            });
+            let membership_update = tokio::spawn({
+                let selector = selector.clone();
+                async move { selector.update(create_test_seed_peers(3, None)).await }
+            });
+            health_updates.await.unwrap();
+            membership_update.await.unwrap();
+
+            let seed_peers = selector.seed_peers.read().await;
+            let host_names: HashSet<String> = seed_peers.hosts.keys().cloned().collect();
+            let ring_names: HashSet<String> = seed_peers
+                .hashring
+                .get_with_replicas("test-task", seed_peers.hashring.len())
+                .unwrap()
+                .iter()
+                .map(|vnode| vnode.name().to_string())
+                .collect();
+            assert_eq!(host_names, ring_names);
+        }
+    }
+
     #[tokio::test]
-    async fn select_serves_a_task_only_from_its_available_replicas() {
+    async fn select_serves_a_task_only_from_its_healthy_replicas() {
         let selector = SeedPeerSelector::new();
-        selector.update(create_test_seed_peers(5, "")).await;
+        selector.update(create_test_seed_peers(5, None)).await;
         let task_ids: Vec<String> = (0..64).map(|i| format!("task-{i}")).collect();
         let mut healthy_selections = Vec::with_capacity(task_ids.len());
         for task_id in task_ids.iter() {
             healthy_selections.push(select_ids(&selector, task_id, 2).await);
         }
 
-        selector.update(create_test_seed_peers(5, "3")).await;
+        selector.update(create_test_seed_peers(5, Some("3"))).await;
         for (task_id, healthy_selection) in task_ids.iter().zip(healthy_selections.iter()) {
             let expected: Vec<String> = healthy_selection
                 .iter()
@@ -637,7 +673,7 @@ mod tests {
             );
         }
 
-        selector.update(create_test_seed_peers(5, "")).await;
+        selector.update(create_test_seed_peers(5, None)).await;
         for (task_id, healthy_selection) in task_ids.iter().zip(healthy_selections.iter()) {
             assert_eq!(
                 &select_ids(&selector, task_id, 2).await,
@@ -648,7 +684,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn select_fails_when_every_replica_is_unavailable() {
+    async fn select_fails_when_every_replica_is_unhealthy() {
         let selector = SeedPeerSelector::new();
         selector
             .update(vec![
@@ -682,26 +718,23 @@ mod tests {
     #[tokio::test]
     async fn on_failure_ejects_a_proxy_after_consecutive_failures_until_a_success() {
         let selector = SeedPeerSelector::new();
-        selector.update(create_test_seed_peers(2, "")).await;
-        let task_id = "test-task";
-        let replica = selector.select(task_id.to_string(), 1).await.unwrap()[0].clone();
+        selector.update(create_test_seed_peers(1, None)).await;
+        let replica = selector.select("test-task".to_string(), 1).await.unwrap()[0].clone();
         let endpoint = SeedPeerSelector::proxy_endpoint(&replica).unwrap();
 
         for _ in 1..MAX_FAILED_COUNT {
             selector.on_failure(&endpoint);
         }
+        assert!(!selector.is_ejected(&endpoint));
+
+        selector.on_failure(&endpoint);
+        assert!(selector.is_ejected(&endpoint));
         assert_eq!(
-            select_ids(&selector, task_id, 1).await,
+            select_ids(&selector, "test-task", 1).await,
             [replica.id.clone()]
         );
 
-        selector.on_failure(&endpoint);
-        assert!(matches!(
-            selector.select(task_id.to_string(), 1).await,
-            Err(Error::HostNotFound(_))
-        ));
-
         selector.on_success(&endpoint);
-        assert_eq!(select_ids(&selector, task_id, 1).await, [replica.id]);
+        assert!(!selector.is_ejected(&endpoint));
     }
 }

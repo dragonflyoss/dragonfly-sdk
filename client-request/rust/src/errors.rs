@@ -127,15 +127,8 @@ impl Error {
         }
     }
 
-    /// Converts the non-`2xx` answer of a seed peer proxy into an [`Error`], by
-    /// the `X-Dragonfly-Error-Type` header naming who failed.
-    ///
-    /// ```text
-    /// X-Dragonfly-Error-Type ──backend────────▶ BackendError
-    ///                        ├─proxy──────────▶ ProxyError
-    ///                        ├─dfdaemon───────▶ DfdaemonError
-    ///                        └─other or none──▶ ProxyError naming it
-    /// ```
+    /// Converts a non-`2xx` response of a seed peer proxy into an [`Error`] by
+    /// its `X-Dragonfly-Error-Type` header.
     pub(crate) async fn from_response(response: reqwest::Response) -> Error {
         let status = response.status();
         let header = response.headers().clone();

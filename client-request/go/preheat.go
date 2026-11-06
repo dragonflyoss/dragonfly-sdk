@@ -59,7 +59,7 @@ func (p *Proxy) Preheat(ctx context.Context, req *PreheatRequest) error {
 	// Select seed peers for downloading.
 	seedPeers, err := p.selectSeedPeers(id, req.scope, req.replicas)
 	if err != nil {
-		return fmt.Errorf("%w: failed to select seed peers from scheduler: %v", ErrInternal, err)
+		return fmt.Errorf("%w: failed to select seed peers: %v", ErrInternal, err)
 	}
 
 	if req.scope == ScopeDefault && len(seedPeers) < req.replicas {

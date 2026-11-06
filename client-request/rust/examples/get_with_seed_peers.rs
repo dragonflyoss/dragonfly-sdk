@@ -14,15 +14,14 @@
  * limitations under the License.
  */
 
-//! Lists the seed peers with their health from the scheduler, then downloads a
-//! file via the Dragonfly from those seed peers and writes it to stdout. The
-//! proxy built from the seed peers neither connects to the scheduler nor
-//! refreshes them, so the seed peers listed once can be shared, such as by the
-//! processes on a host.
+//! Lists the seed peers from the scheduler, then downloads a file via the
+//! Dragonfly from them and writes it to stdout.
 //!
 //! Usage: cargo run --example get_with_seed_peers -- <scheduler-endpoint> <url>
 
-use dragonfly_client_request::{GetRequest, Proxy, Request, Scheduler};
+use dragonfly_client_request::{
+    GetRequest, ProxyWithSeedPeers, RequestWithSeedPeers, SchedulerClient,
+};
 use futures::TryStreamExt;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -38,8 +37,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Install the crypto provider of the clients to the seed peer proxies.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    let scheduler = Scheduler::connect(&args[1], Duration::from_secs(5)).await?;
-    let seed_peers = scheduler.list_seed_peers().await?;
+    let scheduler_client = SchedulerClient::new(&args[1], Duration::from_secs(5)).await?;
+    let seed_peers = scheduler_client.list_seed_peers().await?;
     for seed_peer in seed_peers.iter() {
         eprintln!(
             "seed peer {} {}:{} healthy: {}",
@@ -50,7 +49,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let proxy = Proxy::builder().seed_peers(seed_peers).build().await?;
+    let proxy = ProxyWithSeedPeers::builder()
+        .seed_peers(seed_peers)
+        .build()
+        .await?;
     let response = proxy
         .get(&GetRequest {
             url: args[2].clone(),

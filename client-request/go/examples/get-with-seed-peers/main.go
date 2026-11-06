@@ -14,11 +14,8 @@
  * limitations under the License.
  */
 
-// Command get-with-seed-peers lists the seed peers with their health from the
-// scheduler, then downloads a file via the Dragonfly from those seed peers and
-// writes it to stdout. The proxy created from the seed peers neither connects
-// to the scheduler nor refreshes them, so the seed peers listed once can be
-// shared, such as by the processes on a host.
+// Command get-with-seed-peers lists the seed peers from the scheduler, then
+// downloads a file via the Dragonfly from them and writes it to stdout.
 package main
 
 import (
@@ -42,14 +39,14 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	scheduler, err := request.NewScheduler(os.Args[1], 5*time.Second)
+	schedulerClient, err := request.NewSchedulerClient(os.Args[1], 5*time.Second)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	defer scheduler.Close()
+	defer schedulerClient.Close()
 
-	seedPeers, err := scheduler.ListSeedPeers(ctx)
+	seedPeers, err := schedulerClient.ListSeedPeers(ctx)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -59,12 +56,11 @@ func main() {
 		fmt.Fprintf(os.Stderr, "seed peer %s %s:%d healthy: %t\n", seedPeer.Host.Hostname, seedPeer.Host.Ip, seedPeer.Host.ProxyPort, seedPeer.Healthy)
 	}
 
-	proxy, err := request.New(ctx, "", request.WithProxySeedPeers(seedPeers))
+	proxy, err := request.NewWithSeedPeers(seedPeers)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	defer proxy.Close()
 
 	resp, err := proxy.Get(ctx, request.NewGetRequest(os.Args[2]))
 	if err != nil {
