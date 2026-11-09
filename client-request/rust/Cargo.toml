@@ -53,7 +53,7 @@ tokio-util = { version = "0.7.18", features = ["full"] }
 tonic = { version = "=0.14.9", features = ["tls-aws-lc"] }
 tracing = "0.1"
 url = "2.5.4"
-tonic-health = "=0.14.6"
+tonic-health = "=0.14.9"
 thiserror = "2.0"
 
 [dev-dependencies]
