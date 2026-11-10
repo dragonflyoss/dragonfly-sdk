@@ -25,6 +25,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -541,6 +542,93 @@ func TestGetScattersAcrossReplicas(t *testing.T) {
 	body, err := io.ReadAll(resp.Body)
 	assert.NoError(err)
 	assert.Equal("ok", string(body))
+}
+
+func TestGetResumesABodyThatBreaksOff(t *testing.T) {
+	tests := []struct {
+		name       string
+		stall      bool
+		timeout    time.Duration
+		maxRetries uint8
+		expect     func(t *testing.T, content []byte, hits int32, err error)
+	}{
+		{
+			name:       "truncated body",
+			timeout:    time.Second,
+			maxRetries: 1,
+			expect: func(t *testing.T, content []byte, hits int32, err error) {
+				assert := assert.New(t)
+				assert.NoError(err)
+				assert.Equal("hello dragonfly", string(content))
+				assert.Equal(int32(2), hits)
+			},
+		},
+		{
+			name:       "stalled body",
+			stall:      true,
+			timeout:    200 * time.Millisecond,
+			maxRetries: 1,
+			expect: func(t *testing.T, content []byte, hits int32, err error) {
+				assert := assert.New(t)
+				assert.NoError(err)
+				assert.Equal("hello dragonfly", string(content))
+				assert.Equal(int32(2), hits)
+			},
+		},
+		{
+			name:       "truncated body without retries",
+			timeout:    time.Second,
+			maxRetries: 0,
+			expect: func(t *testing.T, content []byte, hits int32, err error) {
+				assert := assert.New(t)
+				assert.ErrorIs(err, ErrInternal)
+				assert.Equal(int32(1), hits)
+			},
+		},
+		{
+			name:       "stalled body without retries",
+			stall:      true,
+			timeout:    200 * time.Millisecond,
+			maxRetries: 0,
+			expect: func(t *testing.T, content []byte, hits int32, err error) {
+				assert := assert.New(t)
+				assert.ErrorIs(err, ErrRequestTimeout)
+				assert.Equal(int32(1), hits)
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var hits atomic.Int32
+			proxyPort := setupMockSeedPeerProxy(t, func(w http.ResponseWriter, r *http.Request) {
+				if hits.Add(1) > 1 {
+					http.ServeContent(w, r, "", time.Time{}, strings.NewReader("hello dragonfly"))
+					return
+				}
+
+				w.Header().Set("Content-Length", "15")
+				fmt.Fprint(w, "hello d")
+				if tc.stall {
+					w.(http.Flusher).Flush()
+					<-r.Context().Done()
+				}
+			})
+			port := setupMockSeedPeer(t, nil)
+			endpoint := setupMockScheduler(t, []*commonv2.Host{createSeedPeerHost("seed-peer-1", port, proxyPort)})
+
+			proxy, err := New(context.Background(), endpoint, WithProxyMaxRetries(tc.maxRetries))
+			assert.NoError(t, err)
+			defer proxy.Close()
+
+			resp, err := proxy.Get(context.Background(), NewGetRequest("http://example.com/file.txt", WithGetRequestReplicas(1), WithGetRequestTimeout(tc.timeout)))
+			assert.NoError(t, err)
+			defer resp.Body.Close()
+
+			content, err := io.ReadAll(resp.Body)
+			tc.expect(t, content, hits.Load(), err)
+		})
+	}
 }
 
 func TestGetRetriesOnlyTransientAnswers(t *testing.T) {

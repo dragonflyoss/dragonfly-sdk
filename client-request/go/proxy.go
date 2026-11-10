@@ -296,18 +296,25 @@ func (p *Proxy) Get(ctx context.Context, req *GetRequest) (*GetResponse, error) 
 		return nil, err
 	}
 
-	resp, cancel, err := p.retry.runWithEndpoints(ctx, endpoints, req.timeout, func(ctx context.Context, endpoint string) (*http.Response, error) {
+	attempts, err := p.retry.newAttempts(endpoints, req.timeout)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, cancel, err := attempts.run(ctx, func(ctx context.Context, endpoint string) (*http.Response, error) {
 		return p.sendTo(ctx, endpoint, req)
 	})
 	if err != nil {
 		return nil, err
 	}
 
+	// Send the request again on the next seed peer for the bytes left when
+	// the body breaks off.
 	return &GetResponse{
 		Success:    true,
 		Header:     resp.Header.Clone(),
 		StatusCode: resp.StatusCode,
-		Body:       &cancelReadCloser{body: resp.Body, cancel: cancel},
+		Body:       newResumableBody(ctx, p, req, attempts, resp, cancel),
 	}, nil
 }
 
@@ -323,22 +330,26 @@ func (p *Proxy) GetInto(ctx context.Context, req *GetRequest, w io.Writer) (*Get
 		return nil, err
 	}
 
-	resp, cancel, err := p.retry.runWithEndpoints(ctx, endpoints, req.timeout, func(ctx context.Context, endpoint string) (*http.Response, error) {
+	attempts, err := p.retry.newAttempts(endpoints, req.timeout)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, cancel, err := attempts.run(ctx, func(ctx context.Context, endpoint string) (*http.Response, error) {
 		return p.sendTo(ctx, endpoint, req)
 	})
 	if err != nil {
 		return nil, err
 	}
-	defer cancel()
-	defer resp.Body.Close()
+
+	// Send the request again on the next seed peer for the bytes left when
+	// the body breaks off.
+	body := newResumableBody(ctx, p, req, attempts, resp, cancel)
+	defer body.Close()
 
 	// Drain the response body into the writer.
-	if _, err := io.Copy(w, resp.Body); err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			return nil, fmt.Errorf("%w: %v", ErrRequestTimeout, err)
-		}
-
-		return nil, fmt.Errorf("%w: failed to read response body: %v", ErrInternal, err)
+	if err := body.copyTo(w); err != nil {
+		return nil, err
 	}
 
 	return &GetResponse{
@@ -435,31 +446,4 @@ func (t *ejectionTransport) CloseIdleConnections() {
 	if transport, ok := t.transport.(interface{ CloseIdleConnections() }); ok {
 		transport.CloseIdleConnections()
 	}
-}
-
-// cancelReadCloser cancels the request timeout context when the body is fully
-// read or closed, releasing the timeout resources as soon as the stream ends.
-// It follows the same pattern as net/http's cancelTimerBody.
-type cancelReadCloser struct {
-	body   io.ReadCloser
-	cancel context.CancelFunc
-}
-
-// Read implements io.Reader. It cancels the timeout context once the read
-// reaches EOF or fails; the cancel function is idempotent, so canceling again
-// on Close is safe.
-func (c *cancelReadCloser) Read(p []byte) (int, error) {
-	n, err := c.body.Read(p)
-	if err != nil {
-		c.cancel()
-	}
-
-	return n, err
-}
-
-// Close implements io.Closer.
-func (c *cancelReadCloser) Close() error {
-	err := c.body.Close()
-	c.cancel()
-	return err
 }

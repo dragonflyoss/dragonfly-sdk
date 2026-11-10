@@ -215,11 +215,13 @@ impl<S: Sender> ResumableBody<S> {
 mod tests {
     use super::*;
     use futures::TryStreamExt;
-    use reqwest::header::HeaderName;
+    use reqwest::header::{HeaderName, CONTENT_TYPE};
     use reqwest::Method;
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
+    type Chunk = std::result::Result<&'static str, &'static str>;
+    type Answer = (u16, HeaderName, &'static str, Vec<Chunk>);
     type ExpectBody = fn(Result<Vec<u8>>, Vec<String>);
 
     struct MockSender {
@@ -236,51 +238,17 @@ mod tests {
         }
     }
 
-    fn response(
-        status: StatusCode,
-        headers: Vec<(HeaderName, &str)>,
-        chunks: Vec<std::result::Result<&'static str, &str>>,
-    ) -> Result<Response> {
-        let chunks: Vec<std::result::Result<Bytes, std::io::Error>> = chunks
-            .into_iter()
-            .map(|chunk| {
-                chunk
-                    .map(|chunk| Bytes::from_static(chunk.as_bytes()))
-                    .map_err(std::io::Error::other)
-            })
-            .collect();
-
-        let mut builder = ::http::Response::builder().status(status);
-        for (name, value) in headers {
-            builder = builder.header(name, value);
-        }
-
-        Ok(builder
-            .body(reqwest::Body::wrap_stream(stream::iter(chunks)))
-            .unwrap()
-            .into())
-    }
-
-    fn partial(
-        content_range: &str,
-        chunks: Vec<std::result::Result<&'static str, &str>>,
-    ) -> Result<Response> {
-        response(
-            StatusCode::PARTIAL_CONTENT,
-            vec![(CONTENT_RANGE, content_range)],
-            chunks,
-        )
-    }
-
     #[tokio::test]
     async fn resumable_body_sends_the_request_again_for_the_bytes_left() {
-        let test_cases: Vec<(u8, Vec<Result<Response>>, ExpectBody)> = vec![
+        let test_cases: Vec<(u8, Vec<Result<Answer>>, ExpectBody)> = vec![
             (
                 1,
-                vec![partial(
+                vec![Ok((
+                    206,
+                    CONTENT_RANGE,
                     "bytes 0-14/15",
                     vec![Ok("hello "), Ok("dragonfly")],
-                )],
+                ))],
                 |result, ranges| {
                     assert_eq!(result.unwrap(), b"hello dragonfly");
                     assert!(ranges.is_empty());
@@ -289,23 +257,18 @@ mod tests {
             (
                 1,
                 vec![
-                    partial("bytes 0-14/15", vec![Ok("hello "), Err("reset")]),
-                    partial("bytes 6-14/15", vec![Ok("drag"), Ok("onfly")]),
-                ],
-                |result, ranges| {
-                    assert_eq!(result.unwrap(), b"hello dragonfly");
-                    assert_eq!(ranges, ["bytes=6-14"]);
-                },
-            ),
-            (
-                1,
-                vec![
-                    response(
-                        StatusCode::OK,
-                        vec![(CONTENT_LENGTH, "15")],
+                    Ok((
+                        206,
+                        CONTENT_RANGE,
+                        "bytes 0-14/15",
                         vec![Ok("hello "), Err("reset")],
-                    ),
-                    partial("bytes 6-14/15", vec![Ok("dragonfly")]),
+                    )),
+                    Ok((
+                        206,
+                        CONTENT_RANGE,
+                        "bytes 6-14/15",
+                        vec![Ok("drag"), Ok("onfly")],
+                    )),
                 ],
                 |result, ranges| {
                     assert_eq!(result.unwrap(), b"hello dragonfly");
@@ -315,8 +278,8 @@ mod tests {
             (
                 1,
                 vec![
-                    partial("bytes 0-14/15", vec![Ok("hello ")]),
-                    partial("bytes 6-14/15", vec![Ok("dragonfly")]),
+                    Ok((200, CONTENT_LENGTH, "15", vec![Ok("hello "), Err("reset")])),
+                    Ok((206, CONTENT_RANGE, "bytes 6-14/15", vec![Ok("dragonfly")])),
                 ],
                 |result, ranges| {
                     assert_eq!(result.unwrap(), b"hello dragonfly");
@@ -326,8 +289,29 @@ mod tests {
             (
                 1,
                 vec![
-                    partial("bytes 100-114/1000", vec![Ok("hello "), Err("reset")]),
-                    partial("bytes 106-114/1000", vec![Ok("dragonfly")]),
+                    Ok((206, CONTENT_RANGE, "bytes 0-14/15", vec![Ok("hello ")])),
+                    Ok((206, CONTENT_RANGE, "bytes 6-14/15", vec![Ok("dragonfly")])),
+                ],
+                |result, ranges| {
+                    assert_eq!(result.unwrap(), b"hello dragonfly");
+                    assert_eq!(ranges, ["bytes=6-14"]);
+                },
+            ),
+            (
+                1,
+                vec![
+                    Ok((
+                        206,
+                        CONTENT_RANGE,
+                        "bytes 100-114/1000",
+                        vec![Ok("hello "), Err("reset")],
+                    )),
+                    Ok((
+                        206,
+                        CONTENT_RANGE,
+                        "bytes 106-114/1000",
+                        vec![Ok("dragonfly")],
+                    )),
                 ],
                 |result, ranges| {
                     assert_eq!(result.unwrap(), b"hello dragonfly");
@@ -337,9 +321,19 @@ mod tests {
             (
                 2,
                 vec![
-                    partial("bytes 0-14/15", vec![Ok("hello "), Err("reset")]),
-                    partial("bytes 6-14/15", vec![Ok("drag"), Err("reset")]),
-                    partial("bytes 10-14/15", vec![Ok("onfly")]),
+                    Ok((
+                        206,
+                        CONTENT_RANGE,
+                        "bytes 0-14/15",
+                        vec![Ok("hello "), Err("reset")],
+                    )),
+                    Ok((
+                        206,
+                        CONTENT_RANGE,
+                        "bytes 6-14/15",
+                        vec![Ok("drag"), Err("reset")],
+                    )),
+                    Ok((206, CONTENT_RANGE, "bytes 10-14/15", vec![Ok("onfly")])),
                 ],
                 |result, ranges| {
                     assert_eq!(result.unwrap(), b"hello dragonfly");
@@ -349,9 +343,19 @@ mod tests {
             (
                 2,
                 vec![
-                    partial("bytes 0-14/15", vec![Ok("hello "), Err("reset")]),
-                    partial("bytes 0-14/15", vec![Ok("hello dragonfly")]),
-                    partial("bytes 6-14/15", vec![Ok("dragonfly")]),
+                    Ok((
+                        206,
+                        CONTENT_RANGE,
+                        "bytes 0-14/15",
+                        vec![Ok("hello "), Err("reset")],
+                    )),
+                    Ok((
+                        206,
+                        CONTENT_RANGE,
+                        "bytes 0-14/15",
+                        vec![Ok("hello dragonfly")],
+                    )),
+                    Ok((206, CONTENT_RANGE, "bytes 6-14/15", vec![Ok("dragonfly")])),
                 ],
                 |result, ranges| {
                     assert_eq!(result.unwrap(), b"hello dragonfly");
@@ -360,22 +364,28 @@ mod tests {
             ),
             (
                 0,
-                vec![partial("bytes 0-14/15", vec![Ok("hello "), Err("reset")])],
-                |result, ranges| {
-                    assert!(
-                        matches!(result, Err(Error::Internal(_))),
-                        "result: {result:?}"
-                    );
-                    assert!(ranges.is_empty());
-                },
-            ),
-            (
-                1,
-                vec![response(
-                    StatusCode::OK,
-                    vec![],
+                vec![Ok((
+                    206,
+                    CONTENT_RANGE,
+                    "bytes 0-14/15",
                     vec![Ok("hello "), Err("reset")],
-                )],
+                ))],
+                |result, ranges| {
+                    assert!(
+                        matches!(result, Err(Error::Internal(_))),
+                        "result: {result:?}"
+                    );
+                    assert!(ranges.is_empty());
+                },
+            ),
+            (
+                1,
+                vec![Ok((
+                    200,
+                    CONTENT_TYPE,
+                    "text/plain",
+                    vec![Ok("hello "), Err("reset")],
+                ))],
                 |result, ranges| {
                     assert!(
                         matches!(result, Err(Error::Internal(_))),
@@ -387,8 +397,18 @@ mod tests {
             (
                 1,
                 vec![
-                    partial("bytes 0-14/15", vec![Ok("hello "), Err("reset")]),
-                    partial("bytes 0-14/15", vec![Ok("hello dragonfly")]),
+                    Ok((
+                        206,
+                        CONTENT_RANGE,
+                        "bytes 0-14/15",
+                        vec![Ok("hello "), Err("reset")],
+                    )),
+                    Ok((
+                        206,
+                        CONTENT_RANGE,
+                        "bytes 0-14/15",
+                        vec![Ok("hello dragonfly")],
+                    )),
                 ],
                 |result, ranges| {
                     assert_eq!(
@@ -401,8 +421,13 @@ mod tests {
             (
                 1,
                 vec![
-                    partial("bytes 0-14/15", vec![Ok("hello "), Err("reset")]),
-                    partial("bytes 6-14/16", vec![Ok("dragonfly!")]),
+                    Ok((
+                        206,
+                        CONTENT_RANGE,
+                        "bytes 0-14/15",
+                        vec![Ok("hello "), Err("reset")],
+                    )),
+                    Ok((206, CONTENT_RANGE, "bytes 6-14/16", vec![Ok("dragonfly!")])),
                 ],
                 |result, ranges| {
                     assert_eq!(
@@ -415,7 +440,12 @@ mod tests {
             (
                 1,
                 vec![
-                    partial("bytes 0-14/15", vec![Ok("hello "), Err("reset")]),
+                    Ok((
+                        206,
+                        CONTENT_RANGE,
+                        "bytes 0-14/15",
+                        vec![Ok("hello "), Err("reset")],
+                    )),
                     Err(Error::InvalidArgument("bad".to_string())),
                 ],
                 |result, ranges| {
@@ -438,7 +468,25 @@ mod tests {
                 .unwrap();
             let request = Request::new(Method::GET, "http://example.com/blob".parse().unwrap());
             let ranges = Arc::new(Mutex::new(Vec::new()));
-            let mut answers = VecDeque::from(answers);
+            let mut answers: VecDeque<Result<Response>> = answers
+                .into_iter()
+                .map(|answer| {
+                    answer.map(|(status, name, value, chunks)| {
+                        let chunks = chunks.into_iter().map(|chunk| {
+                            chunk
+                                .map(|chunk| Bytes::from_static(chunk.as_bytes()))
+                                .map_err(std::io::Error::other)
+                        });
+
+                        ::http::Response::builder()
+                            .status(status)
+                            .header(name, value)
+                            .body(reqwest::Body::wrap_stream(stream::iter(chunks)))
+                            .unwrap()
+                            .into()
+                    })
+                })
+                .collect();
             let response = answers.pop_front().unwrap().unwrap();
             let sender = MockSender {
                 answers: Mutex::new(answers),

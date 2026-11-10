@@ -18,6 +18,7 @@ package request
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"testing"
@@ -183,7 +184,10 @@ func TestRetryPolicyRunWaitsTheBackoffDelays(t *testing.T) {
 			tc.expect(t, time.Since(start))
 
 			start = time.Now()
-			_, _, err = policy.runWithEndpoints(context.Background(), []string{"a"}, time.Second, func(context.Context, string) (*http.Response, error) {
+			attempts, err := policy.newAttempts([]string{"a"}, time.Second)
+			assert.NoError(err)
+
+			_, _, err = attempts.run(context.Background(), func(context.Context, string) (*http.Response, error) {
 				return nil, fmt.Errorf("%w: boom", ErrInternal)
 			})
 			assert.ErrorIs(err, ErrInternal)
@@ -238,7 +242,7 @@ func TestRetryPolicyRunStopsWhenTheContextEnds(t *testing.T) {
 	}
 }
 
-func TestRetryPolicyRunWithEndpoints(t *testing.T) {
+func TestAttemptsRun(t *testing.T) {
 	transient := fmt.Errorf("%w: boom", ErrInternal)
 	definitive := &BackendError{StatusCode: http.StatusNotFound}
 	tests := []struct {
@@ -321,11 +325,17 @@ func TestRetryPolicyRunWithEndpoints(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			var attempts []string
-			resp, cancel, err := retryPolicy{maxRetries: tc.maxRetries}.runWithEndpoints(context.Background(), tc.endpoints, time.Second, func(_ context.Context, endpoint string) (*http.Response, error) {
-				attempts = append(attempts, endpoint)
-				if len(attempts) <= len(tc.failures) {
-					return nil, tc.failures[len(attempts)-1]
+			var tried []string
+			attempts, err := retryPolicy{maxRetries: tc.maxRetries}.newAttempts(tc.endpoints, time.Second)
+			if err != nil {
+				tc.expect(t, tried, err)
+				return
+			}
+
+			resp, cancel, err := attempts.run(context.Background(), func(_ context.Context, endpoint string) (*http.Response, error) {
+				tried = append(tried, endpoint)
+				if len(tried) <= len(tc.failures) {
+					return nil, tc.failures[len(tried)-1]
 				}
 
 				return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
@@ -334,7 +344,136 @@ func TestRetryPolicyRunWithEndpoints(t *testing.T) {
 				assert.Equal(t, http.StatusOK, resp.StatusCode)
 				cancel()
 			}
-			tc.expect(t, attempts, err)
+			tc.expect(t, tried, err)
+		})
+	}
+}
+
+func TestAttemptsShareTheRetriesAcrossRunsAndBackoffs(t *testing.T) {
+	transient := fmt.Errorf("%w: boom", ErrInternal)
+	tests := []struct {
+		name       string
+		maxRetries uint8
+		failures   []error
+		expect     func(t *testing.T, tried []string, ok bool, err error)
+	}{
+		{
+			name:       "a retry left after the backoff",
+			maxRetries: 2,
+			failures:   []error{transient},
+			expect: func(t *testing.T, tried []string, ok bool, err error) {
+				assert := assert.New(t)
+				assert.True(ok)
+				assert.NoError(err)
+				assert.Len(tried, 3)
+				assert.NotEqual(tried[0], tried[1])
+				assert.Equal(tried[0], tried[2])
+			},
+		},
+		{
+			name:       "no retry left for the backoff",
+			maxRetries: 1,
+			failures:   []error{transient},
+			expect: func(t *testing.T, tried []string, ok bool, err error) {
+				assert := assert.New(t)
+				assert.False(ok)
+				assert.NoError(err)
+				assert.Len(tried, 2)
+			},
+		},
+		{
+			name:       "no retry left after the backoff",
+			maxRetries: 1,
+			failures:   []error{nil, transient},
+			expect: func(t *testing.T, tried []string, ok bool, err error) {
+				assert := assert.New(t)
+				assert.True(ok)
+				assert.ErrorIs(err, transient)
+				assert.Len(tried, 2)
+				assert.NotEqual(tried[0], tried[1])
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var tried []string
+			send := func(_ context.Context, endpoint string) (*http.Response, error) {
+				tried = append(tried, endpoint)
+				if len(tried) <= len(tc.failures) && tc.failures[len(tried)-1] != nil {
+					return nil, tc.failures[len(tried)-1]
+				}
+
+				return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
+			}
+
+			attempts, err := retryPolicy{maxRetries: tc.maxRetries}.newAttempts([]string{"a", "b"}, time.Second)
+			assert.NoError(t, err)
+
+			_, cancel, err := attempts.run(context.Background(), send)
+			assert.NoError(t, err)
+			cancel()
+
+			_, ok := attempts.backoff()
+			if ok {
+				_, cancel, err = attempts.run(context.Background(), send)
+				if err == nil {
+					cancel()
+				}
+			}
+			tc.expect(t, tried, ok, err)
+		})
+	}
+}
+
+func TestAttemptsSleepStopsWhenTheContextEnds(t *testing.T) {
+	other := errors.New("other")
+	tests := []struct {
+		name   string
+		cause  error
+		expect func(t *testing.T, err error)
+	}{
+		{
+			name: "not ended",
+			expect: func(t *testing.T, err error) {
+				assert.NoError(t, err)
+			},
+		},
+		{
+			name:  "cancelled",
+			cause: context.Canceled,
+			expect: func(t *testing.T, err error) {
+				assert.ErrorIs(t, err, ErrInternal)
+			},
+		},
+		{
+			name:  "deadline exceeded",
+			cause: context.DeadlineExceeded,
+			expect: func(t *testing.T, err error) {
+				assert.ErrorIs(t, err, ErrRequestTimeout)
+			},
+		},
+		{
+			name:  "another cause",
+			cause: other,
+			expect: func(t *testing.T, err error) {
+				assert.Equal(t, other, err)
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancelCause(context.Background())
+			defer cancel(nil)
+
+			if tc.cause != nil {
+				cancel(tc.cause)
+			}
+			attempts, err := retryPolicy{}.newAttempts([]string{"a"}, time.Second)
+			assert.NoError(t, err)
+
+			tc.expect(t, attempts.sleep(ctx, 0))
 		})
 	}
 }

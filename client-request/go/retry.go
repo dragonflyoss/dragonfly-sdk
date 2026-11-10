@@ -97,50 +97,124 @@ func (p retryPolicy) run(ctx context.Context, attempt func() error) error {
 	}
 }
 
-// runWithEndpoints runs send like run, every attempt aimed at the next
-// endpoint of a shuffled order, wrapping around when the endpoints run out
-// before the retries do. Each attempt runs under its own timeout, and the
-// cancel function of the successful attempt is returned so the caller releases
-// it once the body is read.
+// newAttempts returns the attempts of a request across endpoints, shuffled
+// once, each under its own timeout. It fails with ErrInvalidArgument when
+// endpoints is empty.
+func (p retryPolicy) newAttempts(endpoints []string, timeout time.Duration) (*attempts, error) {
+	if len(endpoints) == 0 {
+		return nil, fmt.Errorf("%w: no endpoints to send request", ErrInvalidArgument)
+	}
+
+	shuffled := slices.Clone(endpoints)
+	rand.Shuffle(len(shuffled), func(i, j int) { shuffled[i], shuffled[j] = shuffled[j], shuffled[i] })
+
+	delays := p.newBackOff()
+	delays.Reset()
+	return &attempts{
+		endpoints: shuffled,
+		retries:   p.maxRetries,
+		delays:    delays,
+		timeout:   timeout,
+	}, nil
+}
+
+// attempts is the attempts of one request across the endpoints serving it: the
+// shuffled endpoints, the next one to aim at and the retries left. It keeps
+// them across runs, so a streamed body that breaks off is sent again within
+// the same maxRetries.
+type attempts struct {
+	// endpoints is the endpoints in the shuffled order the attempts follow.
+	endpoints []string
+
+	// next is the index of the next attempt, wrapping around the endpoints.
+	next int
+
+	// retries is the retries left.
+	retries uint8
+
+	// delays is the delays of the retries left.
+	delays backoff.BackOff
+
+	// timeout is the timeout of each attempt.
+	timeout time.Duration
+}
+
+// run runs send until it succeeds, fails definitively, or no retry is left,
+// every attempt aimed at the next endpoint, wrapping around when the endpoints
+// run out before the retries do. Each attempt runs under its own timeout, and
+// the cancel function of the successful attempt is returned so the caller
+// releases it once the body is read. The loop is written out because
+// backoff.Retry resets its backoff and counts its own tries on every call.
 //
 //	endpoints [B, A]                  maxRetries 3
 //
 //	attempt 1 ──▶ B ──▶ 503 transient  ── wait(delay 1)
 //	attempt 2 ──▶ A ──▶ timeout        ── wait(delay 2)
 //	attempt 3 ──▶ B ──▶ 404 definitive ──▶ err
-func (p retryPolicy) runWithEndpoints(
+func (a *attempts) run(
 	ctx context.Context,
-	endpoints []string,
-	timeout time.Duration,
 	send func(ctx context.Context, endpoint string) (*http.Response, error),
 ) (*http.Response, context.CancelFunc, error) {
-	if len(endpoints) == 0 {
-		return nil, nil, fmt.Errorf("%w: no endpoints to send request", ErrInvalidArgument)
-	}
+	for {
+		endpoint := a.endpoints[a.next%len(a.endpoints)]
+		a.next++
 
-	shuffled := slices.Clone(endpoints)
-	rand.Shuffle(len(shuffled), func(i, j int) { shuffled[i], shuffled[j] = shuffled[j], shuffled[i] })
+		attemptCtx, cancel := context.WithTimeout(ctx, a.timeout)
+		resp, err := send(attemptCtx, endpoint)
+		if err == nil {
+			return resp, cancel, nil
+		}
+		cancel()
 
-	attempts := 0
-	var resp *http.Response
-	var cancel context.CancelFunc
-	err := p.run(ctx, func() error {
-		endpoint := shuffled[attempts%len(shuffled)]
-		attempts++
-
-		attemptCtx, attemptCancel := context.WithTimeout(ctx, timeout)
-		attemptResp, err := send(attemptCtx, endpoint)
-		if err != nil {
-			attemptCancel()
-			return err
+		if !isRetryable(err) {
+			return nil, nil, err
 		}
 
-		resp, cancel = attemptResp, attemptCancel
-		return nil
-	})
-	if err != nil {
-		return nil, nil, err
+		delay, ok := a.backoff()
+		if !ok {
+			return nil, nil, err
+		}
+
+		if err := a.sleep(ctx, delay); err != nil {
+			return nil, nil, err
+		}
+	}
+}
+
+// backoff returns the delay of the next retry after an attempt failed, in run
+// or outside it, such as a body that broke off, and false once no retry is
+// left.
+func (a *attempts) backoff() (time.Duration, bool) {
+	if a.retries == 0 {
+		return 0, false
 	}
 
-	return resp, cancel, nil
+	a.retries--
+	return a.delays.NextBackOff(), true
+}
+
+// sleep waits for the delay of a retry. Like run, a cancelled context ends it
+// with ErrInternal, an expired one with ErrRequestTimeout and one ended with
+// another cause with that cause.
+func (a *attempts) sleep(ctx context.Context, delay time.Duration) error {
+	// Check the context first, so a zero delay never outruns it.
+	if ctx.Err() == nil {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+
+		select {
+		case <-timer.C:
+			return nil
+		case <-ctx.Done():
+		}
+	}
+
+	switch err := context.Cause(ctx); {
+	case errors.Is(err, context.DeadlineExceeded):
+		return fmt.Errorf("%w: %v", ErrRequestTimeout, err)
+	case errors.Is(err, context.Canceled):
+		return fmt.Errorf("%w: %v", ErrInternal, err)
+	default:
+		return err
+	}
 }

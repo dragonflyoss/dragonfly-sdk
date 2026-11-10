@@ -2526,68 +2526,6 @@ mod tests {
     type ExpectElapsed = fn(Duration);
     type ExpectResumed = fn(Result<Vec<u8>>, usize, Duration);
 
-    async fn read_body(response: GetResponse) -> Result<Vec<u8>> {
-        response
-            .body
-            .unwrap()
-            .try_fold(Vec::new(), |mut content, chunk| async move {
-                content.extend_from_slice(&chunk);
-                Ok(content)
-            })
-            .await
-    }
-
-    fn resumed_test_cases() -> Vec<(FlakyFirstConnection, Duration, u8, ExpectResumed)> {
-        vec![
-            (
-                FlakyFirstConnection::TruncateBody,
-                DEFAULT_REQUEST_TIMEOUT,
-                1,
-                |result, connections, _elapsed| {
-                    assert_eq!(result.unwrap(), b"hello dragonfly");
-                    assert_eq!(connections, 2);
-                },
-            ),
-            (
-                FlakyFirstConnection::StallBody,
-                Duration::from_millis(300),
-                1,
-                |result, connections, elapsed| {
-                    assert_eq!(result.unwrap(), b"hello dragonfly");
-                    assert_eq!(connections, 2);
-                    assert!(
-                        (Duration::from_millis(300)..Duration::from_millis(900)).contains(&elapsed),
-                        "elapsed: {elapsed:?}"
-                    );
-                },
-            ),
-            (
-                FlakyFirstConnection::TruncateBody,
-                DEFAULT_REQUEST_TIMEOUT,
-                0,
-                |result, connections, _elapsed| {
-                    assert!(
-                        matches!(result, Err(Error::Internal(_))),
-                        "result: {result:?}"
-                    );
-                    assert_eq!(connections, 1);
-                },
-            ),
-            (
-                FlakyFirstConnection::StallBody,
-                Duration::from_millis(300),
-                0,
-                |result, connections, _elapsed| {
-                    assert!(
-                        matches!(result, Err(Error::RequestTimeout(_))),
-                        "result: {result:?}"
-                    );
-                    assert_eq!(connections, 1);
-                },
-            ),
-        ]
-    }
-
     #[tokio::test]
     async fn new_success() {
         let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
@@ -3496,7 +3434,56 @@ mod tests {
 
     #[tokio::test]
     async fn get_resumes_a_body_that_breaks_off() {
-        for (first, timeout, max_retries, expect) in resumed_test_cases() {
+        let test_cases: Vec<(FlakyFirstConnection, Duration, u8, ExpectResumed)> = vec![
+            (
+                FlakyFirstConnection::TruncateBody,
+                DEFAULT_REQUEST_TIMEOUT,
+                1,
+                |result, connections, _elapsed| {
+                    assert_eq!(result.unwrap(), b"hello dragonfly");
+                    assert_eq!(connections, 2);
+                },
+            ),
+            (
+                FlakyFirstConnection::StallBody,
+                Duration::from_millis(300),
+                1,
+                |result, connections, elapsed| {
+                    assert_eq!(result.unwrap(), b"hello dragonfly");
+                    assert_eq!(connections, 2);
+                    assert!(
+                        (Duration::from_millis(300)..Duration::from_millis(900)).contains(&elapsed),
+                        "elapsed: {elapsed:?}"
+                    );
+                },
+            ),
+            (
+                FlakyFirstConnection::TruncateBody,
+                DEFAULT_REQUEST_TIMEOUT,
+                0,
+                |result, connections, _elapsed| {
+                    assert!(
+                        matches!(result, Err(Error::Internal(_))),
+                        "result: {result:?}"
+                    );
+                    assert_eq!(connections, 1);
+                },
+            ),
+            (
+                FlakyFirstConnection::StallBody,
+                Duration::from_millis(300),
+                0,
+                |result, connections, _elapsed| {
+                    assert!(
+                        matches!(result, Err(Error::RequestTimeout(_))),
+                        "result: {result:?}"
+                    );
+                    assert_eq!(connections, 1);
+                },
+            ),
+        ];
+
+        for (first, timeout, max_retries, expect) in test_cases {
             let (port, connections) = setup_flaky_seed_peer_proxy(first, "hello dragonfly").await;
             let mock_seed_peer = setup_mock_seed_peer(MockSet::new()).await.unwrap();
             let mock_scheduler = setup_mock_scheduler(vec![create_seed_peer_host(
@@ -3525,7 +3512,14 @@ mod tests {
             let start = std::time::Instant::now();
             let response = proxy.get(&request).await.unwrap();
             assert!(response.success, "first: {first:?}");
-            let result = read_body(response).await;
+            let result = response
+                .body
+                .unwrap()
+                .try_fold(Vec::new(), |mut content, chunk| async move {
+                    content.extend_from_slice(&chunk);
+                    Ok(content)
+                })
+                .await;
             expect(
                 result,
                 connections.load(std::sync::atomic::Ordering::SeqCst),
@@ -3537,7 +3531,56 @@ mod tests {
     #[tokio::test]
     async fn get_with_endpoints_resumes_a_body_that_breaks_off() {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        for (first, timeout, max_retries, expect) in resumed_test_cases() {
+        let test_cases: Vec<(FlakyFirstConnection, Duration, u8, ExpectResumed)> = vec![
+            (
+                FlakyFirstConnection::TruncateBody,
+                DEFAULT_REQUEST_TIMEOUT,
+                1,
+                |result, connections, _elapsed| {
+                    assert_eq!(result.unwrap(), b"hello dragonfly");
+                    assert_eq!(connections, 2);
+                },
+            ),
+            (
+                FlakyFirstConnection::StallBody,
+                Duration::from_millis(300),
+                1,
+                |result, connections, elapsed| {
+                    assert_eq!(result.unwrap(), b"hello dragonfly");
+                    assert_eq!(connections, 2);
+                    assert!(
+                        (Duration::from_millis(300)..Duration::from_millis(900)).contains(&elapsed),
+                        "elapsed: {elapsed:?}"
+                    );
+                },
+            ),
+            (
+                FlakyFirstConnection::TruncateBody,
+                DEFAULT_REQUEST_TIMEOUT,
+                0,
+                |result, connections, _elapsed| {
+                    assert!(
+                        matches!(result, Err(Error::Internal(_))),
+                        "result: {result:?}"
+                    );
+                    assert_eq!(connections, 1);
+                },
+            ),
+            (
+                FlakyFirstConnection::StallBody,
+                Duration::from_millis(300),
+                0,
+                |result, connections, _elapsed| {
+                    assert!(
+                        matches!(result, Err(Error::RequestTimeout(_))),
+                        "result: {result:?}"
+                    );
+                    assert_eq!(connections, 1);
+                },
+            ),
+        ];
+
+        for (first, timeout, max_retries, expect) in test_cases {
             let (port, connections) = setup_flaky_seed_peer_proxy(first, "hello dragonfly").await;
             let proxy = ProxyWithEndpoints::builder()
                 .endpoints(vec![format!("http://127.0.0.1:{port}")])
@@ -3555,7 +3598,14 @@ mod tests {
             let start = std::time::Instant::now();
             let response = proxy.get(&request).await.unwrap();
             assert!(response.success, "first: {first:?}");
-            let result = read_body(response).await;
+            let result = response
+                .body
+                .unwrap()
+                .try_fold(Vec::new(), |mut content, chunk| async move {
+                    content.extend_from_slice(&chunk);
+                    Ok(content)
+                })
+                .await;
             expect(
                 result,
                 connections.load(std::sync::atomic::Ordering::SeqCst),
@@ -3590,7 +3640,13 @@ mod tests {
 
         let response = proxy.get(&request).await.unwrap();
         assert!(response.success);
-        assert_eq!(read_body(response).await.unwrap(), b"hello dragonfly");
+
+        let mut body = response.body.unwrap();
+        let mut content = Vec::new();
+        while let Some(chunk) = body.try_next().await.unwrap() {
+            content.extend_from_slice(&chunk);
+        }
+        assert_eq!(content, b"hello dragonfly");
 
         let mut connections = [
             first_connections.load(std::sync::atomic::Ordering::SeqCst),

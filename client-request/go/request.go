@@ -85,14 +85,15 @@ func (s Scope) validate() error {
 // Proxy implements it.
 type Request interface {
 	// Get sends a GET request via the Dragonfly and returns a response with a
-	// streaming body the caller must close. A transient failure before the
-	// body starts is retried on the next seed peer, a failure while streaming
-	// it is not.
+	// streaming body the caller must close. A transient failure, a body that
+	// breaks off included, is retried on the next seed peer, the body sent
+	// again for the bytes left when the response tells its length.
 	Get(ctx context.Context, req *GetRequest) (*GetResponse, error)
 
 	// GetInto sends a GET request via the Dragonfly and writes the response
-	// body into w. A transient failure before the body starts is retried on
-	// the next seed peer, a failed body write is not since w cannot be rewound.
+	// body into w. A transient failure, a body that breaks off included, is
+	// retried on the next seed peer, the body sent again for the bytes left
+	// when the response tells its length, so w is never rewound.
 	GetInto(ctx context.Context, req *GetRequest, w io.Writer) (*GetResponse, error)
 
 	// Preheat preheats a file: has every replica seed peer, or every seed peer
@@ -141,14 +142,15 @@ type Request interface {
 // ProxyWithEndpoints implements it.
 type RequestWithEndpoints interface {
 	// Get sends a GET request to the endpoints and returns a response with a
-	// streaming body the caller must close. A transient failure before the
-	// body starts is retried on the next endpoint, a failure while streaming
-	// it is not.
+	// streaming body the caller must close. A transient failure, a body that
+	// breaks off included, is retried on the next endpoint, the body sent
+	// again for the bytes left when the response tells its length.
 	Get(ctx context.Context, req *GetRequest) (*GetResponse, error)
 
 	// GetInto sends a GET request to the endpoints and writes the response
-	// body into w. A transient failure before the body starts is retried on
-	// the next endpoint, a failed body write is not since w cannot be rewound.
+	// body into w. A transient failure, a body that breaks off included, is
+	// retried on the next endpoint, the body sent again for the bytes left
+	// when the response tells its length, so w is never rewound.
 	GetInto(ctx context.Context, req *GetRequest, w io.Writer) (*GetResponse, error)
 }
 
