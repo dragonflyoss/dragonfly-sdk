@@ -163,10 +163,14 @@ func (b *resumableBody) Read(p []byte) (int, error) {
 // Close implements io.Closer. It ends the body, a Read or a reopen in
 // progress included, and releases the current response.
 func (b *resumableBody) Close() error {
-	b.end(http.ErrBodyReadAfterClose)
-
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.err == nil {
+		b.err = http.ErrBodyReadAfterClose
+	}
+
+	b.stop()
+	b.cancel()
 	return b.rc.Close()
 }
 
