@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -403,14 +405,18 @@ func TestGetWithEndpointsRetriesOnlyTransientAnswers(t *testing.T) {
 	}
 }
 
-func TestGetIntoWithEndpointsDoesNotRetryATruncatedBody(t *testing.T) {
+func TestGetIntoWithEndpointsResumesATruncatedBody(t *testing.T) {
 	assert := assert.New(t)
 
 	var hits atomic.Int32
 	proxyPort := setupMockSeedPeerProxy(t, func(w http.ResponseWriter, r *http.Request) {
-		hits.Add(1)
+		if hits.Add(1) > 1 {
+			http.ServeContent(w, r, "", time.Time{}, strings.NewReader("hello dragonfly"))
+			return
+		}
+
 		w.Header().Set("Content-Length", "15")
-		fmt.Fprint(w, "hello")
+		fmt.Fprint(w, "hello d")
 	})
 
 	proxy, err := NewWithEndpoints([]string{fmt.Sprintf("http://127.0.0.1:%d", proxyPort)}, WithProxyWithEndpointsMaxRetries(3))
@@ -418,8 +424,184 @@ func TestGetIntoWithEndpointsDoesNotRetryATruncatedBody(t *testing.T) {
 
 	var buf bytes.Buffer
 	_, err = proxy.GetInto(context.Background(), NewGetRequest("http://example.com/file.txt"), &buf)
-	assert.ErrorIs(err, ErrInternal)
+	assert.NoError(err)
+	assert.Equal("hello dragonfly", buf.String())
+	assert.Equal(int32(2), hits.Load())
+}
+
+func TestGetWithEndpointsResumesABodyThatBreaksOff(t *testing.T) {
+	tests := []struct {
+		name       string
+		stall      bool
+		timeout    time.Duration
+		maxRetries uint8
+		expect     func(t *testing.T, content []byte, hits int32, err error)
+	}{
+		{
+			name:       "truncated body",
+			timeout:    time.Second,
+			maxRetries: 1,
+			expect: func(t *testing.T, content []byte, hits int32, err error) {
+				assert := assert.New(t)
+				assert.NoError(err)
+				assert.Equal("hello dragonfly", string(content))
+				assert.Equal(int32(2), hits)
+			},
+		},
+		{
+			name:       "stalled body",
+			stall:      true,
+			timeout:    200 * time.Millisecond,
+			maxRetries: 1,
+			expect: func(t *testing.T, content []byte, hits int32, err error) {
+				assert := assert.New(t)
+				assert.NoError(err)
+				assert.Equal("hello dragonfly", string(content))
+				assert.Equal(int32(2), hits)
+			},
+		},
+		{
+			name:       "truncated body without retries",
+			timeout:    time.Second,
+			maxRetries: 0,
+			expect: func(t *testing.T, content []byte, hits int32, err error) {
+				assert := assert.New(t)
+				assert.ErrorIs(err, ErrInternal)
+				assert.Equal(int32(1), hits)
+			},
+		},
+		{
+			name:       "stalled body without retries",
+			stall:      true,
+			timeout:    200 * time.Millisecond,
+			maxRetries: 0,
+			expect: func(t *testing.T, content []byte, hits int32, err error) {
+				assert := assert.New(t)
+				assert.ErrorIs(err, ErrRequestTimeout)
+				assert.Equal(int32(1), hits)
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var hits atomic.Int32
+			proxyPort := setupMockSeedPeerProxy(t, func(w http.ResponseWriter, r *http.Request) {
+				if hits.Add(1) > 1 {
+					http.ServeContent(w, r, "", time.Time{}, strings.NewReader("hello dragonfly"))
+					return
+				}
+
+				w.Header().Set("Content-Length", "15")
+				fmt.Fprint(w, "hello d")
+				if tc.stall {
+					w.(http.Flusher).Flush()
+					<-r.Context().Done()
+				}
+			})
+
+			proxy, err := NewWithEndpoints([]string{fmt.Sprintf("http://127.0.0.1:%d", proxyPort)}, WithProxyWithEndpointsMaxRetries(tc.maxRetries))
+			assert.NoError(t, err)
+
+			resp, err := proxy.Get(context.Background(), NewGetRequest("http://example.com/file.txt", WithGetRequestTimeout(tc.timeout)))
+			assert.NoError(t, err)
+			defer resp.Body.Close()
+
+			content, err := io.ReadAll(resp.Body)
+			tc.expect(t, content, hits.Load(), err)
+		})
+	}
+}
+
+func TestGetWithEndpointsCloseEndsARead(t *testing.T) {
+	assert := assert.New(t)
+
+	var hits atomic.Int32
+	proxyPort := setupMockSeedPeerProxy(t, func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Length", "15")
+		fmt.Fprint(w, "hello d")
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	})
+
+	proxy, err := NewWithEndpoints([]string{fmt.Sprintf("http://127.0.0.1:%d", proxyPort)}, WithProxyWithEndpointsMaxRetries(3))
+	assert.NoError(err)
+
+	resp, err := proxy.Get(context.Background(), NewGetRequest("http://example.com/file.txt"))
+	assert.NoError(err)
+
+	errs := make(chan error, 1)
+	go func() {
+		_, err := io.ReadAll(resp.Body)
+		errs <- err
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	assert.NoError(resp.Body.Close())
+	select {
+	case err := <-errs:
+		assert.ErrorIs(err, http.ErrBodyReadAfterClose)
+	case <-time.After(5 * time.Second):
+		assert.Fail("read did not end after Close")
+	}
 	assert.Equal(int32(1), hits.Load())
+}
+
+func TestGetWithEndpointsResumesABodyOnTheNextEndpoint(t *testing.T) {
+	assert := assert.New(t)
+
+	var hits [2]atomic.Int32
+	endpoints := make([]string, 0, len(hits))
+	for i := range hits {
+		proxyPort := setupMockSeedPeerProxy(t, func(w http.ResponseWriter, r *http.Request) {
+			if hits[i].Add(1) > 1 {
+				http.ServeContent(w, r, "", time.Time{}, strings.NewReader("hello dragonfly"))
+				return
+			}
+
+			first, last := 0, 14
+			if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &first, &last); err == nil {
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/15", first, last))
+				w.Header().Set("Content-Length", strconv.Itoa(last-first+1))
+				w.WriteHeader(http.StatusPartialContent)
+			} else {
+				w.Header().Set("Content-Length", "15")
+			}
+			fmt.Fprint(w, "hello dragonfly"[first:first+(last-first+1)/2])
+		})
+		endpoints = append(endpoints, fmt.Sprintf("http://127.0.0.1:%d", proxyPort))
+	}
+
+	proxy, err := NewWithEndpoints(endpoints, WithProxyWithEndpointsMaxRetries(2))
+	assert.NoError(err)
+
+	resp, err := proxy.Get(context.Background(), NewGetRequest("http://example.com/file.txt"))
+	assert.NoError(err)
+	defer resp.Body.Close()
+
+	content, err := io.ReadAll(resp.Body)
+	assert.NoError(err)
+	assert.Equal("hello dragonfly", string(content))
+	assert.ElementsMatch([]int32{1, 2}, []int32{hits[0].Load(), hits[1].Load()})
+}
+
+func TestGetIntoWithEndpointsFailsOnAWriterError(t *testing.T) {
+	assert := assert.New(t)
+
+	proxyPort := setupMockSeedPeerProxy(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "hello dragonfly")
+	})
+
+	proxy, err := NewWithEndpoints([]string{fmt.Sprintf("http://127.0.0.1:%d", proxyPort)})
+	assert.NoError(err)
+
+	pr, pw := io.Pipe()
+	assert.NoError(pr.Close())
+
+	_, err = proxy.GetInto(context.Background(), NewGetRequest("http://example.com/file.txt"), pw)
+	assert.ErrorIs(err, ErrInternal)
+	assert.ErrorIs(err, io.ErrClosedPipe)
 }
 
 func TestGetIntoWithEndpointsTimeout(t *testing.T) {

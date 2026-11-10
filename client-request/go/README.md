@@ -59,9 +59,13 @@ Retry transient failures. A request is retried on another seed peer when the
 peer cannot be reached or answers too slowly, or the proxy, backend or dfdaemon
 answers `5xx`, `408` or `429`, since another seed peer may not be rate limited
 or out of space. Any other answer, such as `404` or a dfdaemon `422`, is
-definitive and returns at once. A failed body read is never retried, `GetInto`
-cannot rewind the writer. Preheating retries the same way on each replica seed
-peer.
+definitive and returns at once. A body that breaks off is retried too: `Get`
+and `GetInto` send the request again within the same retries, its `Range`
+narrowed to the bytes not read yet, so the writer of `GetInto` is never
+rewound. That needs the response to tell its length, by a `Content-Length` or
+the `Content-Range` of a single range; a body without them, such as a chunked
+one, fails when it breaks off. Preheating retries the same way on each replica
+seed peer.
 
 The default is one retry at once and `WithProxyMaxRetries(0)` disables retries.
 An exponential backoff from [cenkalti/backoff](https://pkg.go.dev/github.com/cenkalti/backoff/v5)

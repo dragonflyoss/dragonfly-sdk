@@ -30,13 +30,16 @@
 //!
 //! [`Error::is_retryable`] decides what is transient, [`RetryPolicy::delays`] how
 //! long each retry waits. [`RetryPolicy::run`] runs the same loop against one
-//! fixed target and serves the preheat of a single seed peer.
+//! fixed target and serves the preheat of a single seed peer. [`Attempts`] keeps
+//! the order and the retries left of one request, so a streamed body that breaks
+//! off is sent again within the same `max_retries`.
 
 use crate::errors::Error;
 use crate::Result;
 use backon::{Backoff, BackoffBuilder, ExponentialBuilder, Retryable, RetryableWithContext};
 use rand::seq::SliceRandom;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// The retry policy of a client: how often a request is retried and how long
@@ -85,7 +88,7 @@ impl RetryPolicy {
 
     /// Sleeps for the delay, returning at once for a zero delay so retries
     /// without a backoff never yield to the timer.
-    async fn sleep(delay: Duration) {
+    pub(crate) async fn sleep(delay: Duration) {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
@@ -125,37 +128,89 @@ impl RetryPolicy {
     /// Fails with [`Error::InvalidArgument`] when `endpoints` is empty.
     pub(crate) async fn run_with_endpoints<Ctx, T, F, Fut>(
         &self,
-        endpoints: &[String],
+        endpoints: Arc<[String]>,
         ctx: Ctx,
-        mut attempt: F,
+        attempt: F,
     ) -> (Ctx, Result<T>)
     where
         F: FnMut(Ctx, String) -> Fut,
         Fut: Future<Output = (Ctx, Result<T>)>,
     {
+        match self.attempts(endpoints) {
+            Ok(mut attempts) => attempts.run(ctx, attempt).await,
+            Err(err) => (ctx, Err(err)),
+        }
+    }
+
+    /// Returns the attempts of a request across `endpoints`, shuffled once.
+    /// Fails with [`Error::InvalidArgument`] when `endpoints` is empty.
+    pub(crate) fn attempts(&self, endpoints: Arc<[String]>) -> Result<Attempts> {
         if endpoints.is_empty() {
-            return (
-                ctx,
-                Err(Error::InvalidArgument(
-                    "no endpoints to send request".to_string(),
-                )),
-            );
+            return Err(Error::InvalidArgument(
+                "no endpoints to send request".to_string(),
+            ));
         }
 
-        let mut shuffled: Vec<&String> = endpoints.iter().collect();
-        shuffled.shuffle(&mut rand::rng());
+        let mut order: Vec<usize> = (0..endpoints.len()).collect();
+        order.shuffle(&mut rand::rng());
+        Ok(Attempts {
+            endpoints,
+            order,
+            next: 0,
+            delays: self.delays(),
+        })
+    }
+}
 
-        let mut attempts = 0usize;
+/// The attempts of one request across the endpoints serving it: the shuffled
+/// order of the endpoints, the next one to aim at and the delays of the
+/// retries left.
+pub(crate) struct Attempts {
+    /// The endpoints serving the request.
+    endpoints: Arc<[String]>,
+
+    /// The indexes of the endpoints in the shuffled order the attempts follow.
+    order: Vec<usize>,
+
+    /// The index of the next attempt, wrapping around the order.
+    next: usize,
+
+    /// The delays of the retries left.
+    delays: Box<dyn Backoff>,
+}
+
+/// Implements the attempts of a request.
+impl Attempts {
+    /// Runs `attempt` on the next endpoints like
+    /// [`RetryPolicy::run_with_endpoints`], spending the retries left.
+    pub(crate) async fn run<Ctx, T, F, Fut>(&mut self, ctx: Ctx, mut attempt: F) -> (Ctx, Result<T>)
+    where
+        F: FnMut(Ctx, String) -> Fut,
+        Fut: Future<Output = (Ctx, Result<T>)>,
+    {
+        let Self {
+            endpoints,
+            order,
+            next,
+            delays,
+        } = self;
         (|ctx: Ctx| {
-            let endpoint = shuffled[attempts % shuffled.len()].clone();
-            attempts += 1;
+            let endpoint = endpoints[order[*next % order.len()]].clone();
+            *next += 1;
             attempt(ctx, endpoint)
         })
-        .retry(self.delays())
-        .sleep(Self::sleep)
+        .retry(delays)
+        .sleep(RetryPolicy::sleep)
         .context(ctx)
         .when(Error::is_retryable)
         .await
+    }
+
+    /// Returns the delay of the next retry after an attempt failed outside
+    /// [`run`](Self::run), such as a body that broke off, `None` once no retry
+    /// is left.
+    pub(crate) fn backoff(&mut self) -> Option<Duration> {
+        self.delays.next()
     }
 }
 
@@ -167,6 +222,7 @@ mod tests {
     type ExpectElapsed = fn(Duration);
     type ExpectAttempts = fn(usize, Result<()>);
     type ExpectEndpoints = fn(&[String], Result<()>);
+    type ExpectBackoff = fn(&[String], Option<Duration>, Result<()>);
 
     fn internal() -> Error {
         Error::Internal("boom".to_string())
@@ -249,7 +305,7 @@ mod tests {
                 max_retries: 2,
                 backoff,
             };
-            let endpoints = vec!["a".to_string()];
+            let endpoints: Arc<[String]> = Arc::from(["a".to_string()]);
 
             let start = tokio::time::Instant::now();
             let result: Result<()> = policy.run(|| async { Err(internal()) }).await;
@@ -258,7 +314,7 @@ mod tests {
 
             let start = tokio::time::Instant::now();
             let ((), result) = policy
-                .run_with_endpoints(&endpoints, (), |(), _endpoint| async {
+                .run_with_endpoints(endpoints.clone(), (), |(), _endpoint| async {
                     ((), Err::<(), _>(internal()))
                 })
                 .await;
@@ -368,14 +424,14 @@ mod tests {
         ];
 
         for (endpoints, max_retries, failures, expect) in test_cases {
-            let endpoints: Vec<String> = endpoints
+            let endpoints: Arc<[String]> = endpoints
                 .iter()
                 .map(|endpoint| endpoint.to_string())
                 .collect();
             let mut failures = VecDeque::from(failures);
             let (attempts, result) = policy(max_retries)
                 .run_with_endpoints(
-                    &endpoints,
+                    endpoints,
                     Vec::new(),
                     |mut attempts: Vec<String>, endpoint| {
                         attempts.push(endpoint);
@@ -385,6 +441,54 @@ mod tests {
                 )
                 .await;
             expect(&attempts, result);
+        }
+    }
+
+    #[tokio::test]
+    async fn attempts_share_the_retries_across_runs_and_backoffs() {
+        let test_cases: Vec<(u8, Vec<Result<()>>, ExpectBackoff)> = vec![
+            (2, vec![Err(internal())], |tried, backoff, result| {
+                assert_eq!(backoff, Some(Duration::ZERO));
+                assert!(result.is_ok(), "result: {result:?}");
+                assert_eq!(tried.len(), 3);
+                assert_ne!(tried[0], tried[1]);
+                assert_eq!(tried[0], tried[2]);
+            }),
+            (1, vec![Err(internal())], |tried, backoff, result| {
+                assert_eq!(backoff, None);
+                assert!(result.is_ok(), "result: {result:?}");
+                assert_eq!(tried.len(), 2);
+            }),
+            (
+                1,
+                vec![Ok(()), Err(internal())],
+                |tried, backoff, result| {
+                    assert_eq!(backoff, Some(Duration::ZERO));
+                    assert!(matches!(result, Err(Error::Internal(_))));
+                    assert_eq!(tried.len(), 2);
+                    assert_ne!(tried[0], tried[1]);
+                },
+            ),
+        ];
+
+        for (max_retries, outcomes, expect) in test_cases {
+            let endpoints: Arc<[String]> = Arc::from(["a".to_string(), "b".to_string()]);
+            let mut outcomes = VecDeque::from(outcomes);
+            let mut attempt = |mut tried: Vec<String>, endpoint: String| {
+                tried.push(endpoint);
+                let outcome = outcomes.pop_front().unwrap_or(Ok(()));
+                async move { (tried, outcome) }
+            };
+
+            let mut attempts = policy(max_retries).attempts(endpoints).unwrap();
+            let (tried, result) = attempts.run(Vec::new(), &mut attempt).await;
+            let backoff = attempts.backoff();
+            let (tried, result) = if backoff.is_some() {
+                attempts.run(tried, &mut attempt).await
+            } else {
+                (tried, result)
+            };
+            expect(&tried, backoff, result);
         }
     }
 }

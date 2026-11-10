@@ -19,6 +19,7 @@
 //! GET requests and preheating files or OCI images through seed peers.
 
 use async_trait::async_trait;
+use body::{ResumableBody, Sender};
 use bytes::{Bytes, BytesMut};
 use digest::{is_blob_url, is_manifest_digest_url};
 use dragonfly_api::common::v2::{Download, Host, Priority, SchedulingPolicy, TaskType};
@@ -27,7 +28,7 @@ use dragonfly_api::dfdaemon::v2::{
     DownloadTaskRequest,
 };
 use errors::Error;
-use futures::{Stream, TryStreamExt};
+use futures::Stream;
 use http::{default_proxy_rule_filtered_query_params, headermap_to_hashmap};
 use id_generator::{IDGenerator, TaskIDParameter};
 use net::{format_url, preferred_local_ip};
@@ -80,11 +81,13 @@ pub use dragonfly_hashring as hashring;
 pub use backon::ExponentialBuilder;
 pub use selector::{SchedulerClient, SeedPeer};
 
+mod body;
 mod http;
 mod net;
 #[cfg(feature = "preheat")]
 mod oci;
 mod pool;
+mod range;
 mod retry;
 mod selector;
 mod shutdown;
@@ -172,8 +175,8 @@ pub type Body = Box<dyn Stream<Item = Result<Bytes>> + Send + Unpin>;
 #[async_trait]
 pub trait Request {
     /// Sends a GET request via the Dragonfly and returns a response with a
-    /// streaming body. A transient failure before the body starts is retried on
-    /// the next seed peer, a failure while streaming it is not.
+    /// streaming body. A transient failure, a body that breaks off included, is
+    /// retried on the next seed peer, the body sent again for the bytes left.
     async fn get(&self, request: &GetRequest) -> Result<GetResponse<Body>>;
 
     /// Sends a GET request via the Dragonfly and appends the response body to
@@ -232,8 +235,8 @@ pub trait Request {
 #[async_trait]
 pub trait RequestWithEndpoints {
     /// Sends a GET request to the endpoints and returns a response with a
-    /// streaming body. A transient failure before the body starts is retried on
-    /// the next endpoint, a failure while streaming it is not.
+    /// streaming body. A transient failure, a body that breaks off included, is
+    /// retried on the next endpoint, the body sent again for the bytes left.
     async fn get(&self, request: &GetRequest) -> Result<GetResponse<Body>>;
 
     /// Sends a GET request to the endpoints and appends the response body to
@@ -355,21 +358,33 @@ impl GetRequest {
         Ok(())
     }
 
-    /// Sends the request once through the client of a seed peer proxy, converting
-    /// a non-`2xx` response into an error.
-    async fn send(&self, client: &ClientWithMiddleware) -> Result<reqwest::Response> {
-        let response = client
-            .get(&self.url)
-            .headers(self.proxy_headers()?)
-            .timeout(self.timeout)
-            .send()
-            .await
-            .map_err(|err| match err {
-                reqwest_middleware::Error::Reqwest(err) if err.is_timeout() => {
-                    Error::RequestTimeout(err.to_string())
-                }
-                err => Error::Internal(err.to_string()),
-            })?;
+    /// Makes the HTTP request with the P2P related headers applied, once for
+    /// all the attempts that send a copy of it.
+    fn make_request(&self) -> Result<reqwest::Request> {
+        let url = reqwest::Url::parse(&self.url)
+            .map_err(|err| Error::InvalidArgument(format!("invalid url {}: {}", self.url, err)))?;
+        let mut request = reqwest::Request::new(reqwest::Method::GET, url);
+        *request.headers_mut() = self.proxy_headers()?;
+        *request.timeout_mut() = Some(self.timeout);
+        Ok(request)
+    }
+
+    /// Sends a copy of `request`, made by [`GetRequest::make_request`], once
+    /// through the client of a seed peer proxy, converting a non-`2xx` response
+    /// into an error.
+    async fn send(
+        client: &ClientWithMiddleware,
+        request: &reqwest::Request,
+    ) -> Result<reqwest::Response> {
+        let request = request
+            .try_clone()
+            .ok_or_else(|| Error::Internal("failed to copy request".to_string()))?;
+        let response = client.execute(request).await.map_err(|err| match err {
+            reqwest_middleware::Error::Reqwest(err) if err.is_timeout() => {
+                Error::RequestTimeout(err.to_string())
+            }
+            err => Error::Internal(err.to_string()),
+        })?;
 
         if !response.status().is_success() {
             return Err(Error::from_response(response).await);
@@ -988,6 +1003,10 @@ impl Factory<String, ClientWithMiddleware> for HTTPClientFactory {
             .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             .tcp_keepalive(KEEP_ALIVE_INTERVAL)
             .connect_timeout(CONNECT_TIMEOUT)
+            .no_gzip()
+            .no_brotli()
+            .no_zstd()
+            .no_deflate()
             .proxy(reqwest::Proxy::all(proxy_addr).map_err(|err| {
                 Error::Internal(format!("failed to set proxy {proxy_addr}: {err}"))
             })?)
@@ -1260,21 +1279,21 @@ impl Request for Proxy {
     async fn get(&self, request: &GetRequest) -> Result<GetResponse> {
         request.validate()?;
         let endpoints = self.lookup_proxy_endpoints(request).await?;
-        let ((), result) = self
-            .retry
-            .run_with_endpoints(&endpoints, (), |(), endpoint| async move {
-                ((), self.send_to(endpoint, request).await)
+        let request = request.make_request()?;
+        let mut attempts = self.retry.attempts(endpoints.into())?;
+        let ((), result) = attempts
+            .run((), |(), endpoint| {
+                let request = &request;
+                async move { ((), self.send_to(endpoint, request).await) }
             })
             .await;
         let response = result?;
         let header = response.headers().clone();
         let status_code = response.status();
-        let body: Body = Box::new(
-            response
-                .bytes_stream()
-                .map_err(|err| Error::Internal(err.to_string())),
-        );
 
+        // Send the request again on the next seed peer for the bytes left when
+        // the body breaks off.
+        let body = ResumableBody::new(self.clone(), response, request, attempts).into_body();
         Ok(GetResponse {
             success: status_code.is_success(),
             header,
@@ -1288,10 +1307,11 @@ impl Request for Proxy {
     async fn get_into(&self, request: &GetRequest, buf: &mut BytesMut) -> Result<GetResponse> {
         request.validate()?;
         let endpoints = self.lookup_proxy_endpoints(request).await?;
+        let request = &request.make_request()?;
         let (body, result) = self
             .retry
             .run_with_endpoints(
-                &endpoints,
+                endpoints.into(),
                 std::mem::take(buf),
                 |mut body, endpoint| async move {
                     let result = match self.send_to(endpoint, request).await {
@@ -1964,12 +1984,20 @@ impl Proxy {
 
         Ok(endpoints)
     }
+}
 
-    /// Sends the request once to the seed peer proxy at `endpoint` through its
-    /// pooled client.
-    async fn send_to(&self, endpoint: String, request: &GetRequest) -> Result<reqwest::Response> {
+/// Implements the sender of the requests via the seed peer proxies.
+#[async_trait]
+impl Sender for Proxy {
+    /// Sends a copy of `request` once to the seed peer proxy at `endpoint`
+    /// through its pooled client.
+    async fn send_to(
+        &self,
+        endpoint: String,
+        request: &reqwest::Request,
+    ) -> Result<reqwest::Response> {
         let entry = self.client_pool.entry(&endpoint, &endpoint).await?;
-        request.send(&entry.client).await
+        GetRequest::send(&entry.client, request).await
     }
 }
 
@@ -2193,9 +2221,9 @@ impl ProxyWithEndpointsBuilder {
         }
 
         Ok(ProxyWithEndpoints {
-            endpoints: self.endpoints,
+            endpoints: self.endpoints.into(),
             retry: self.retry,
-            clients,
+            clients: Arc::new(clients),
         })
     }
 
@@ -2223,14 +2251,14 @@ impl ProxyWithEndpointsBuilder {
 #[derive(Clone)]
 pub struct ProxyWithEndpoints {
     /// The seed peer endpoints serving the requests.
-    endpoints: Vec<String>,
+    endpoints: Arc<[String]>,
 
     /// The retry policy of the requests.
     retry: RetryPolicy,
 
     /// The clients keyed by endpoint, so every endpoint has its own reusable
     /// connection pool.
-    clients: HashMap<String, ClientWithMiddleware>,
+    clients: Arc<HashMap<String, ClientWithMiddleware>>,
 }
 
 /// Implements the proxy client that sends requests via the fixed seed peer endpoints.
@@ -2239,15 +2267,23 @@ impl ProxyWithEndpoints {
     pub fn builder() -> ProxyWithEndpointsBuilder {
         ProxyWithEndpointsBuilder::default()
     }
+}
 
-    /// Sends the request once to the seed peer proxy at `endpoint` through its
-    /// client.
-    async fn send_to(&self, endpoint: &str, request: &GetRequest) -> Result<reqwest::Response> {
+/// Implements the sender of the requests via the fixed seed peer endpoints.
+#[async_trait]
+impl Sender for ProxyWithEndpoints {
+    /// Sends a copy of `request` once to the seed peer proxy at `endpoint`
+    /// through its client.
+    async fn send_to(
+        &self,
+        endpoint: String,
+        request: &reqwest::Request,
+    ) -> Result<reqwest::Response> {
         let client = self
             .clients
-            .get(endpoint)
+            .get(&endpoint)
             .ok_or_else(|| Error::Internal(format!("no client for endpoint {endpoint}")))?;
-        request.send(client).await
+        GetRequest::send(client, request).await
     }
 }
 
@@ -2260,21 +2296,22 @@ impl RequestWithEndpoints for ProxyWithEndpoints {
     /// streaming body, see [`RequestWithEndpoints::get`].
     async fn get(&self, request: &GetRequest) -> Result<GetResponse> {
         request.validate()?;
-        let ((), result) = self
-            .retry
-            .run_with_endpoints(&self.endpoints, (), |(), endpoint| async move {
-                ((), self.send_to(&endpoint, request).await)
+        let request = request.make_request()?;
+        let mut attempts = self.retry.attempts(self.endpoints.clone())?;
+        let ((), result) = attempts
+            .run((), |(), endpoint| {
+                let request = &request;
+                async move { ((), self.send_to(endpoint, request).await) }
             })
             .await;
 
         let response = result?;
         let header = response.headers().clone();
         let status_code = response.status();
-        let body: Body = Box::new(
-            response
-                .bytes_stream()
-                .map_err(|err| Error::Internal(err.to_string())),
-        );
+
+        // Send the request again on the next endpoint for the bytes left when
+        // the body breaks off.
+        let body = ResumableBody::new(self.clone(), response, request, attempts).into_body();
 
         Ok(GetResponse {
             success: status_code.is_success(),
@@ -2288,13 +2325,14 @@ impl RequestWithEndpoints for ProxyWithEndpoints {
     /// `buf`, see [`RequestWithEndpoints::get_into`].
     async fn get_into(&self, request: &GetRequest, buf: &mut BytesMut) -> Result<GetResponse> {
         request.validate()?;
+        let request = &request.make_request()?;
         let (body, result) = self
             .retry
             .run_with_endpoints(
-                &self.endpoints,
+                self.endpoints.clone(),
                 std::mem::take(buf),
                 |mut body, endpoint| async move {
-                    let result = match self.send_to(&endpoint, request).await {
+                    let result = match self.send_to(endpoint, request).await {
                         Ok(mut response) => {
                             let status = response.status();
                             let header = response.headers().clone();
@@ -2345,6 +2383,7 @@ mod tests {
     use dragonfly_api::common::v2::Host;
     use dragonfly_api::dfdaemon::v2::DownloadTaskResponse;
     use dragonfly_api::scheduler::v2::ListHostsResponse;
+    use futures::TryStreamExt;
     use mocktail::prelude::*;
     use std::time::Duration;
     use tonic_health::pb::health_check_response::ServingStatus;
@@ -2442,13 +2481,33 @@ mod tests {
                         return;
                     }
 
+                    let request = String::from_utf8_lossy(&request).to_lowercase();
+                    let range = request
+                        .lines()
+                        .find_map(|line| line.strip_prefix("range: bytes="))
+                        .and_then(|range| range.split_once('-'))
+                        .and_then(|(start, end)| Some((start.parse().ok()?, end.parse().ok()?)));
+                    let (status, content_range, body) = match range {
+                        Some((start, end)) => (
+                            "206 Partial Content",
+                            format!("Content-Range: bytes {start}-{end}/{}\r\n", body.len()),
+                            &body[start..=end],
+                        ),
+                        None => ("200 OK", String::new(), body),
+                    };
+
                     let head = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        "HTTP/1.1 {status}\r\n{content_range}Content-Length: {}\r\nConnection: close\r\n\r\n",
                         body.len()
                     );
                     let _ = stream.write_all(head.as_bytes()).await;
                     let served = if flaky { &body[..body.len() / 2] } else { body };
                     let _ = stream.write_all(served.as_bytes()).await;
+                    if flaky && first == FlakyFirstConnection::StallBody {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                        return;
+                    }
+
                     let _ = stream.shutdown().await;
                 });
             }
@@ -2461,9 +2520,11 @@ mod tests {
     enum FlakyFirstConnection {
         Hang,
         TruncateBody,
+        StallBody,
     }
 
     type ExpectElapsed = fn(Duration);
+    type ExpectResumed = fn(Result<Vec<u8>>, usize, Duration);
 
     #[tokio::test]
     async fn new_success() {
@@ -2930,7 +2991,10 @@ mod tests {
             };
             let endpoint = SeedPeerSelector::proxy_endpoint(&host).unwrap();
             for _ in 0..selector::MAX_FAILED_COUNT {
-                let result = proxy.proxy.send_to(endpoint.clone(), &request).await;
+                let result = proxy
+                    .proxy
+                    .send_to(endpoint.clone(), &request.make_request().unwrap())
+                    .await;
                 assert!(
                     matches!(result, Err(Error::Internal(_))),
                     "proxy port: {proxy_port}, url: {url}"
@@ -3054,7 +3118,10 @@ mod tests {
                 proxy.proxy.seed_peer_selector.on_failure(&endpoint);
             }
 
-            let result = proxy.proxy.send_to(endpoint.clone(), &request).await;
+            let result = proxy
+                .proxy
+                .send_to(endpoint.clone(), &request.make_request().unwrap())
+                .await;
             assert!(result.is_err(), "status: {status}");
 
             proxy.proxy.seed_peer_selector.on_failure(&endpoint);
@@ -3366,14 +3433,202 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_with_endpoints_streams_a_truncated_body_without_retrying() {
+    async fn get_resumes_a_body_that_breaks_off() {
+        let test_cases: Vec<(FlakyFirstConnection, Duration, u8, ExpectResumed)> = vec![
+            (
+                FlakyFirstConnection::TruncateBody,
+                DEFAULT_REQUEST_TIMEOUT,
+                1,
+                |result, connections, _elapsed| {
+                    assert_eq!(result.unwrap(), b"hello dragonfly");
+                    assert_eq!(connections, 2);
+                },
+            ),
+            (
+                FlakyFirstConnection::StallBody,
+                Duration::from_millis(300),
+                1,
+                |result, connections, elapsed| {
+                    assert_eq!(result.unwrap(), b"hello dragonfly");
+                    assert_eq!(connections, 2);
+                    assert!(
+                        (Duration::from_millis(300)..Duration::from_millis(900)).contains(&elapsed),
+                        "elapsed: {elapsed:?}"
+                    );
+                },
+            ),
+            (
+                FlakyFirstConnection::TruncateBody,
+                DEFAULT_REQUEST_TIMEOUT,
+                0,
+                |result, connections, _elapsed| {
+                    assert!(
+                        matches!(result, Err(Error::Internal(_))),
+                        "result: {result:?}"
+                    );
+                    assert_eq!(connections, 1);
+                },
+            ),
+            (
+                FlakyFirstConnection::StallBody,
+                Duration::from_millis(300),
+                0,
+                |result, connections, _elapsed| {
+                    assert!(
+                        matches!(result, Err(Error::RequestTimeout(_))),
+                        "result: {result:?}"
+                    );
+                    assert_eq!(connections, 1);
+                },
+            ),
+        ];
+
+        for (first, timeout, max_retries, expect) in test_cases {
+            let (port, connections) = setup_flaky_seed_peer_proxy(first, "hello dragonfly").await;
+            let mock_seed_peer = setup_mock_seed_peer(MockSet::new()).await.unwrap();
+            let mock_scheduler = setup_mock_scheduler(vec![create_seed_peer_host(
+                "seed-peer-1",
+                mock_seed_peer.port().unwrap(),
+                port,
+            )])
+            .await
+            .unwrap();
+
+            let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+            let proxy = Proxy::builder()
+                .scheduler_endpoint(scheduler_endpoint)
+                .max_retries(max_retries)
+                .build()
+                .await
+                .unwrap();
+
+            let request = GetRequest {
+                url: "http://example.com/file.txt".to_string(),
+                replicas: 1,
+                timeout,
+                ..Default::default()
+            };
+
+            let start = std::time::Instant::now();
+            let response = proxy.get(&request).await.unwrap();
+            assert!(response.success, "first: {first:?}");
+            let result = response
+                .body
+                .unwrap()
+                .try_fold(Vec::new(), |mut content, chunk| async move {
+                    content.extend_from_slice(&chunk);
+                    Ok(content)
+                })
+                .await;
+            expect(
+                result,
+                connections.load(std::sync::atomic::Ordering::SeqCst),
+                start.elapsed(),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_with_endpoints_resumes_a_body_that_breaks_off() {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let (port, connections) =
+        let test_cases: Vec<(FlakyFirstConnection, Duration, u8, ExpectResumed)> = vec![
+            (
+                FlakyFirstConnection::TruncateBody,
+                DEFAULT_REQUEST_TIMEOUT,
+                1,
+                |result, connections, _elapsed| {
+                    assert_eq!(result.unwrap(), b"hello dragonfly");
+                    assert_eq!(connections, 2);
+                },
+            ),
+            (
+                FlakyFirstConnection::StallBody,
+                Duration::from_millis(300),
+                1,
+                |result, connections, elapsed| {
+                    assert_eq!(result.unwrap(), b"hello dragonfly");
+                    assert_eq!(connections, 2);
+                    assert!(
+                        (Duration::from_millis(300)..Duration::from_millis(900)).contains(&elapsed),
+                        "elapsed: {elapsed:?}"
+                    );
+                },
+            ),
+            (
+                FlakyFirstConnection::TruncateBody,
+                DEFAULT_REQUEST_TIMEOUT,
+                0,
+                |result, connections, _elapsed| {
+                    assert!(
+                        matches!(result, Err(Error::Internal(_))),
+                        "result: {result:?}"
+                    );
+                    assert_eq!(connections, 1);
+                },
+            ),
+            (
+                FlakyFirstConnection::StallBody,
+                Duration::from_millis(300),
+                0,
+                |result, connections, _elapsed| {
+                    assert!(
+                        matches!(result, Err(Error::RequestTimeout(_))),
+                        "result: {result:?}"
+                    );
+                    assert_eq!(connections, 1);
+                },
+            ),
+        ];
+
+        for (first, timeout, max_retries, expect) in test_cases {
+            let (port, connections) = setup_flaky_seed_peer_proxy(first, "hello dragonfly").await;
+            let proxy = ProxyWithEndpoints::builder()
+                .endpoints(vec![format!("http://127.0.0.1:{port}")])
+                .max_retries(max_retries)
+                .build()
+                .await
+                .unwrap();
+
+            let request = GetRequest {
+                url: "http://example.com/file.txt".to_string(),
+                timeout,
+                ..Default::default()
+            };
+
+            let start = std::time::Instant::now();
+            let response = proxy.get(&request).await.unwrap();
+            assert!(response.success, "first: {first:?}");
+            let result = response
+                .body
+                .unwrap()
+                .try_fold(Vec::new(), |mut content, chunk| async move {
+                    content.extend_from_slice(&chunk);
+                    Ok(content)
+                })
+                .await;
+            expect(
+                result,
+                connections.load(std::sync::atomic::Ordering::SeqCst),
+                start.elapsed(),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_with_endpoints_resumes_a_body_on_the_next_endpoint() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (first_port, first_connections) =
+            setup_flaky_seed_peer_proxy(FlakyFirstConnection::TruncateBody, "hello dragonfly")
+                .await;
+        let (second_port, second_connections) =
             setup_flaky_seed_peer_proxy(FlakyFirstConnection::TruncateBody, "hello dragonfly")
                 .await;
         let proxy = ProxyWithEndpoints::builder()
-            .endpoints(vec![format!("http://127.0.0.1:{port}")])
-            .max_retries(3)
+            .endpoints(vec![
+                format!("http://127.0.0.1:{first_port}"),
+                format!("http://127.0.0.1:{second_port}"),
+            ])
+            .max_retries(2)
             .build()
             .await
             .unwrap();
@@ -3388,16 +3643,17 @@ mod tests {
 
         let mut body = response.body.unwrap();
         let mut content = Vec::new();
-        let err = loop {
-            match body.try_next().await {
-                Ok(Some(chunk)) => content.extend_from_slice(&chunk),
-                Ok(None) => panic!("truncated body must not end cleanly"),
-                Err(err) => break err,
-            }
-        };
-        assert!(matches!(err, Error::Internal(_)), "unexpected: {err:?}");
-        assert!(content.len() < b"hello dragonfly".len());
-        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 1);
+        while let Some(chunk) = body.try_next().await.unwrap() {
+            content.extend_from_slice(&chunk);
+        }
+        assert_eq!(content, b"hello dragonfly");
+
+        let mut connections = [
+            first_connections.load(std::sync::atomic::Ordering::SeqCst),
+            second_connections.load(std::sync::atomic::Ordering::SeqCst),
+        ];
+        connections.sort_unstable();
+        assert_eq!(connections, [1, 2]);
     }
 
     #[tokio::test]
@@ -3576,7 +3832,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(proxy.retry.max_retries, 1);
-        assert_eq!(proxy.endpoints, endpoints);
+        assert_eq!(proxy.endpoints[..], endpoints[..]);
         assert_eq!(proxy.clients.len(), 2);
         assert!(proxy.clients.contains_key("http://127.0.0.1:4001"));
         assert!(proxy.clients.contains_key("http://127.0.0.1:4002"));

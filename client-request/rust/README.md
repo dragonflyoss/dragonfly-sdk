@@ -86,9 +86,10 @@ Retry transient failures. A request is retried on another seed peer when the
 peer cannot be reached or answers too slowly, or the proxy, backend or dfdaemon
 answers `5xx`, `408` or `429`, since another seed peer may not be rate limited or
 out of space. Any other answer, such as `404` or a dfdaemon `422`, is definitive
-and returns at once. `get_into` also retries a failed body read, `get` cannot
-once the body is streaming. Preheating retries the same way on each replica
-seed peer.
+and returns at once. A body that breaks off is retried too: `get_into` reads it
+again from the start, and `get` sends the request again within the same retries,
+its `Range` narrowed to the bytes not streamed yet. Preheating retries the same
+way on each replica seed peer.
 
 The default is one retry at once and `max_retries(0)` disables retries. An
 exponential backoff spreads the retries out, `ExponentialBuilder` being
@@ -173,7 +174,7 @@ deleting a preheated OCI image from the seed peers:
 
 ```toml
 [dependencies]
-dragonfly-client-request = { version = "1.11.0", features = ["preheat"] }
+dragonfly-client-request = { version = "1.12.0", features = ["preheat"] }
 ```
 
 ```rust

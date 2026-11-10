@@ -18,7 +18,6 @@ package request
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -107,47 +106,59 @@ func (p *ProxyWithEndpoints) Get(ctx context.Context, req *GetRequest) (*GetResp
 		return nil, err
 	}
 
-	resp, cancel, err := p.retry.runWithEndpoints(ctx, p.endpoints, req.timeout, func(ctx context.Context, endpoint string) (*http.Response, error) {
+	attempts, err := p.retry.newAttempts(p.endpoints, req.timeout)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, cancel, err := attempts.run(ctx, func(ctx context.Context, endpoint string) (*http.Response, error) {
 		return p.sendTo(ctx, endpoint, req)
 	})
 	if err != nil {
 		return nil, err
 	}
 
+	// Send the request again on the next endpoint for the bytes left when the
+	// body breaks off.
 	return &GetResponse{
 		Success:    true,
 		Header:     resp.Header.Clone(),
 		StatusCode: resp.StatusCode,
-		Body:       &cancelReadCloser{body: resp.Body, cancel: cancel},
+		Body:       newResumableBody(ctx, p, req, attempts, resp, cancel),
 	}, nil
 }
 
 // GetInto sends a GET request to a remote server via the seed peer endpoints
 // of the Dragonfly and writes the response body directly into the provided
 // writer. The request is sent to a randomly picked endpoint and a transient
-// failure is retried on the others up to the max retries, while a failed body
-// read is not, since the writer cannot be rewound.
+// failure, a body that breaks off included, is retried on the others up to
+// the max retries, the body sent again for the bytes left when the response
+// tells its length, so the writer is never rewound.
 func (p *ProxyWithEndpoints) GetInto(ctx context.Context, req *GetRequest, w io.Writer) (*GetResponse, error) {
 	if err := req.validate(); err != nil {
 		return nil, err
 	}
 
-	resp, cancel, err := p.retry.runWithEndpoints(ctx, p.endpoints, req.timeout, func(ctx context.Context, endpoint string) (*http.Response, error) {
+	attempts, err := p.retry.newAttempts(p.endpoints, req.timeout)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, cancel, err := attempts.run(ctx, func(ctx context.Context, endpoint string) (*http.Response, error) {
 		return p.sendTo(ctx, endpoint, req)
 	})
 	if err != nil {
 		return nil, err
 	}
-	defer cancel()
-	defer resp.Body.Close()
+
+	// Send the request again on the next endpoint for the bytes left when the
+	// body breaks off.
+	body := newResumableBody(ctx, p, req, attempts, resp, cancel)
+	defer body.Close()
 
 	// Drain the response body into the writer.
-	if _, err := io.Copy(w, resp.Body); err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			return nil, fmt.Errorf("%w: %v", ErrRequestTimeout, err)
-		}
-
-		return nil, fmt.Errorf("%w: failed to read response body: %v", ErrInternal, err)
+	if err := body.copyTo(w); err != nil {
+		return nil, err
 	}
 
 	return &GetResponse{
