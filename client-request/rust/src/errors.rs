@@ -68,12 +68,13 @@ impl Error {
     /// | proxy / backend / dfdaemon answer `5xx`, `408` or `429`      | yes   |
     /// | proxy / backend / dfdaemon answer without a status code      | yes   |
     /// | gRPC `Internal`, `Unavailable`, `Unknown`, `Aborted`         | yes   |
+    /// | gRPC `ResourceExhausted`                                     | yes   |
     /// | any other answer, such as `403`, `404`, `422`                | no    |
     /// | any other gRPC code, `InvalidArgument`, `HostNotFound`       | no    |
     ///
-    /// `429` and `507` are retried because another seed peer may not be rate
-    /// limited or out of space. Any other `4xx` is definitive: every seed peer
-    /// would answer the same.
+    /// `429`, `507` and `ResourceExhausted` are retried because another seed peer
+    /// may not be rate limited or out of space. Any other `4xx` is definitive:
+    /// every seed peer would answer the same.
     pub(crate) fn is_retryable(&self) -> bool {
         match self {
             Error::RequestTimeout(_) | Error::Internal(_) => true,
@@ -88,7 +89,11 @@ impl Error {
             }
             Error::TonicStatus(status) => matches!(
                 status.code(),
-                Code::Internal | Code::Unavailable | Code::Unknown | Code::Aborted
+                Code::Internal
+                    | Code::Unavailable
+                    | Code::Unknown
+                    | Code::Aborted
+                    | Code::ResourceExhausted
             ),
             Error::InvalidArgument(_)
             | Error::HostNotFound(_)
@@ -102,9 +107,11 @@ impl Error {
     /// ```text
     /// Status ──details decode as Backend──▶ BackendError { status_code, header, message }
     ///    │
-    ///    ├──DeadlineExceeded─────────────▶ RequestTimeout
+    ///    ├──DeadlineExceeded, Cancelled──▶ RequestTimeout
     ///    └──anything else────────────────▶ TonicStatus
     /// ```
+    ///
+    /// The timeout of an attempt ends the call as `Cancelled`.
     ///
     /// The dfdaemon reports an origin failure as `Internal` with the origin's
     /// status code in the details. Decoding it keeps a `404` definitive instead of
@@ -122,7 +129,9 @@ impl Error {
         }
 
         match status.code() {
-            Code::DeadlineExceeded => Error::RequestTimeout(status.message().to_string()),
+            Code::DeadlineExceeded | Code::Cancelled => {
+                Error::RequestTimeout(status.message().to_string())
+            }
             _ => Error::TonicStatus(status),
         }
     }
@@ -286,11 +295,11 @@ mod tests {
             (status(Code::Unavailable), true),
             (status(Code::Unknown), true),
             (status(Code::Aborted), true),
+            (status(Code::ResourceExhausted), true),
             (status(Code::InvalidArgument), false),
             (status(Code::NotFound), false),
             (status(Code::PermissionDenied), false),
             (status(Code::Unauthenticated), false),
-            (status(Code::ResourceExhausted), false),
             (Error::InvalidArgument("bad".to_string()), false),
             (Error::HostNotFound("host".to_string()), false),
         ];
@@ -367,6 +376,10 @@ mod tests {
                 },
             ),
             (tonic::Status::deadline_exceeded("too slow"), |err| {
+                assert!(matches!(err, Error::RequestTimeout(_)));
+                assert!(err.is_retryable());
+            }),
+            (tonic::Status::cancelled("Timeout expired"), |err| {
                 assert!(matches!(err, Error::RequestTimeout(_)));
                 assert!(err.is_retryable());
             }),

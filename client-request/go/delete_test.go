@@ -262,6 +262,17 @@ func TestDeleteImageRetriesOnlyTransientDeleteFailures(t *testing.T) {
 			},
 		},
 		{
+			name:       "resource exhausted",
+			code:       codes.ResourceExhausted,
+			maxRetries: 1,
+			expect: func(t *testing.T, hits int32, resp *DeleteImageResponse, err error) {
+				assert := assert.New(t)
+				assert.NoError(err)
+				assert.Empty(resp.Peers)
+				assert.Equal(int32(2), hits)
+			},
+		},
+		{
 			name:       "not found",
 			code:       codes.NotFound,
 			maxRetries: 3,
@@ -303,6 +314,55 @@ func TestDeleteImageRetriesOnlyTransientDeleteFailures(t *testing.T) {
 
 			resp, err := proxy.DeleteImage(context.Background(), NewDeleteImageRequest("example.com/foo/bar:1.0"))
 			tc.expect(t, hits.Load(), resp, err)
+		})
+	}
+}
+
+func TestDeleteImageFailsWhenTheContextEnds(t *testing.T) {
+	tests := []struct {
+		name   string
+		cause  error
+		expect func(t *testing.T, resp *DeleteImageResponse, err error)
+	}{
+		{
+			name:  "cancelled",
+			cause: context.Canceled,
+			expect: func(t *testing.T, resp *DeleteImageResponse, err error) {
+				assert := assert.New(t)
+				assert.ErrorIs(err, context.Canceled)
+				assert.Nil(resp)
+			},
+		},
+		{
+			name:  "deadline exceeded",
+			cause: context.DeadlineExceeded,
+			expect: func(t *testing.T, resp *DeleteImageResponse, err error) {
+				assert := assert.New(t)
+				assert.ErrorIs(err, context.DeadlineExceeded)
+				assert.Nil(resp)
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancelCause(context.Background())
+			defer cancel(nil)
+
+			port := setupMockSeedPeerServer(t, &mockSeedPeer{
+				deleteImage: func(*dfdaemonv2.DeleteImageRequest) (*dfdaemonv2.DeleteImageResponse, error) {
+					cancel(tc.cause)
+					return nil, status.Error(codes.Unavailable, "delete failed")
+				},
+			})
+			endpoint := setupMockScheduler(t, []*commonv2.Host{createSeedPeerHost("seed-peer-1", port, 0)})
+
+			proxy, err := New(context.Background(), endpoint)
+			assert.NoError(t, err)
+			defer proxy.Close()
+
+			resp, err := proxy.DeleteImage(ctx, NewDeleteImageRequest("example.com/foo/bar:1.0"))
+			tc.expect(t, resp, err)
 		})
 	}
 }
@@ -443,6 +503,16 @@ func TestDeleteRetriesOnlyTransientDeleteFailures(t *testing.T) {
 				assert := assert.New(t)
 				assert.Equal(codes.Unavailable, status.Code(err))
 				assert.Equal(int32(3), hits)
+			},
+		},
+		{
+			name:       "resource exhausted",
+			code:       codes.ResourceExhausted,
+			maxRetries: 1,
+			expect: func(t *testing.T, hits int32, err error) {
+				assert := assert.New(t)
+				assert.Equal(codes.ResourceExhausted, status.Code(err))
+				assert.Equal(int32(2), hits)
 			},
 		},
 		{

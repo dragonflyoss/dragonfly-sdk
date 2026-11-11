@@ -295,7 +295,7 @@ func TestIsRetryable(t *testing.T) {
 			name: "grpc resource exhausted",
 			err:  status.Error(codes.ResourceExhausted, "no"),
 			expect: func(t *testing.T, retryable bool) {
-				assert.False(t, retryable)
+				assert.True(t, retryable)
 			},
 		},
 		{

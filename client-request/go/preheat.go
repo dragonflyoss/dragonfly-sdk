@@ -130,7 +130,7 @@ func (p *Proxy) PreheatImage(ctx context.Context, req *PreheatImageRequest) erro
 
 	opts := []oci.ResolveOption{
 		oci.WithAuth(req.username, req.password),
-		oci.WithHTTPClient(oci.DefaultHTTPClient()),
+		oci.WithHTTPClient(p.registryClient),
 	}
 
 	if req.platform != nil {
@@ -200,7 +200,7 @@ func (p *Proxy) PreheatImage(ctx context.Context, req *PreheatImageRequest) erro
 	for _, target := range targets {
 		g.Go(func() error {
 			// Generate task id for selecting seed peer.
-			id, err := idgen.TaskIDV2(target.url, req.pieceLength, req.tag, req.application, req.filteredQueryParams, req.contentForCalculatingTaskID, req.enableTaskIDBasedBlobDigest)
+			id, err := idgen.TaskIDV2(target.url, req.pieceLength, req.tag, req.application, req.filteredQueryParams, "", req.enableTaskIDBasedBlobDigest)
 			if err != nil {
 				return fmt.Errorf("%w: failed to generate task id: %v", ErrInternal, err)
 			}
@@ -238,10 +238,6 @@ func (p *Proxy) PreheatImage(ctx context.Context, req *PreheatImageRequest) erro
 				download.Application = &req.application
 			}
 
-			if req.contentForCalculatingTaskID != "" {
-				download.ContentForCalculatingTaskId = &req.contentForCalculatingTaskID
-			}
-
 			downloadTaskRequest := &dfdaemonv2.DownloadTaskRequest{Download: download}
 
 			// Trigger every replica seed peer to download the task concurrently.
@@ -261,29 +257,29 @@ func (p *Proxy) PreheatImage(ctx context.Context, req *PreheatImageRequest) erro
 
 // downloadTask has the seed peer download the task and drains the response
 // stream, retrying a transient failure on the same seed peer so the file lands
-// on every replica. Each attempt runs under the timeout. The gRPC status of a
-// failure stays in the error, so isRetryable can tell a definitive one apart.
+// on every replica. Each attempt connects to the seed peer and runs under the
+// timeout. The gRPC status of a failure stays in the error, so isRetryable can
+// tell a definitive one apart.
 func (p *Proxy) downloadTask(ctx context.Context, peer *commonv2.Host, id string, downloadTaskRequest *dfdaemonv2.DownloadTaskRequest, timeout time.Duration) error {
 	addr := net.JoinHostPort(peer.Ip, strconv.Itoa(int(peer.Port)))
-	conn, err := grpc.NewClient(
-		addr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(math.MaxInt32),
-			grpc.MaxCallSendMsgSize(math.MaxInt32),
-		),
-	)
-	if err != nil {
-		return fmt.Errorf("%w: failed to connect to seed peer %s: %v", ErrInternal, addr, err)
-	}
-	defer conn.Close()
-
-	client := dfdaemonv2.NewDfdaemonUploadClient(conn)
 	return p.retry.run(ctx, func() error {
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 
-		stream, err := client.DownloadTask(ctx, downloadTaskRequest)
+		conn, err := grpc.NewClient(
+			addr,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithDefaultCallOptions(
+				grpc.MaxCallRecvMsgSize(math.MaxInt32),
+				grpc.MaxCallSendMsgSize(math.MaxInt32),
+			),
+		)
+		if err != nil {
+			return fmt.Errorf("%w: failed to connect to seed peer %s: %v", ErrInternal, addr, err)
+		}
+		defer conn.Close()
+
+		stream, err := dfdaemonv2.NewDfdaemonUploadClient(conn).DownloadTask(ctx, downloadTaskRequest)
 		if err != nil {
 			return fmt.Errorf("%w: failed to download task %s: %w", ErrInternal, id, err)
 		}

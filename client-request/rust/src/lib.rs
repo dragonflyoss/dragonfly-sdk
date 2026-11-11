@@ -120,6 +120,10 @@ const DEFAULT_CLIENT_POOL_CAPACITY: usize = 128;
 /// scheduler service.
 const DEFAULT_SCHEDULER_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The default timeout(1 minute) for requests to the registry.
+#[cfg(feature = "preheat")]
+const DEFAULT_REGISTRY_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// The default timeout(10 minutes) for requests.
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
@@ -521,11 +525,6 @@ pub struct PreheatImageRequest {
     /// Default value includes the filtered query params of s3, gcs, oss, obs, cos.
     pub filtered_query_params: Vec<String>,
 
-    /// Content for calculating task id. This is used when the task ID cannot be calculated based
-    /// on URL and other parameters, such as when the URL contains dynamic query parameters that
-    /// cannot be filtered out.
-    pub content_for_calculating_task_id: Option<String>,
-
     /// Enable task id based blob digest. It indicates whether to use the blob digest for task ID calculation
     /// when downloading from OCI registries. When enabled for OCI blob URLs (e.g., `/v2/<name>/blobs/sha256:<digest>`),
     /// the task ID is derived from the blob digest rather than the full URL. This enables deduplication across
@@ -569,7 +568,6 @@ impl Default for PreheatImageRequest {
             tag: None,
             application: None,
             filtered_query_params: default_proxy_rule_filtered_query_params(),
-            content_for_calculating_task_id: None,
             enable_task_id_based_blob_digest: true,
             priority: None,
             replicas: DEFAULT_REPLICAS,
@@ -742,7 +740,7 @@ pub struct StatImageRequest {
     /// found on the peers, default is true.
     pub enable_task_id_based_blob_digest: bool,
 
-    /// The timeout for the request, default is 10 minutes.
+    /// The timeout of each layer stat on a seed peer, default is 10 minutes.
     pub timeout: Duration,
 
     /// The number of seed peers to stat the image on concurrently, default is 500.
@@ -1370,7 +1368,11 @@ impl Request for Proxy {
         request.validate()?;
 
         // Parse image reference.
-        let client = OciClient::new(ClientConfig::default());
+        let client = OciClient::new(ClientConfig {
+            connect_timeout: Some(DEFAULT_REGISTRY_REQUEST_TIMEOUT),
+            read_timeout: Some(DEFAULT_REGISTRY_REQUEST_TIMEOUT),
+            ..Default::default()
+        });
         let reference: Reference = request
             .image
             .parse()
@@ -1510,7 +1512,7 @@ impl Request for Proxy {
                 tag: request.tag.clone(),
                 application: request.application.clone(),
                 filtered_query_params: request.filtered_query_params.clone(),
-                content_for_calculating_task_id: request.content_for_calculating_task_id.clone(),
+                content_for_calculating_task_id: None,
                 enable_task_id_based_blob_digest: request.enable_task_id_based_blob_digest,
                 priority: request.priority,
                 replicas: request.replicas,
@@ -1533,7 +1535,7 @@ impl Request for Proxy {
                         preheat_request.tag.clone(),
                         preheat_request.application.clone(),
                         preheat_request.filtered_query_params.clone(),
-                        preheat_request.content_for_calculating_task_id.clone(),
+                        None,
                         preheat_request.enable_task_id_based_blob_digest,
                     )?;
 
@@ -1579,9 +1581,6 @@ impl Request for Proxy {
                                         ))
                                     })?,
                             ),
-                            content_for_calculating_task_id: preheat_request
-                                .content_for_calculating_task_id
-                                .clone(),
                             remote_ip: preferred_local_ip().map(|ip| ip.to_string()),
                             enable_task_id_based_blob_digest: preheat_request
                                 .enable_task_id_based_blob_digest,
@@ -1677,7 +1676,11 @@ impl Request for Proxy {
         request.validate()?;
 
         // Parse image reference.
-        let client = OciClient::new(ClientConfig::default());
+        let client = OciClient::new(ClientConfig {
+            connect_timeout: Some(DEFAULT_REGISTRY_REQUEST_TIMEOUT),
+            read_timeout: Some(DEFAULT_REGISTRY_REQUEST_TIMEOUT),
+            ..Default::default()
+        });
         let reference: Reference = request
             .image
             .parse()
@@ -1775,6 +1778,8 @@ impl Request for Proxy {
         );
 
         // Stat the layers on every seed peer concurrently.
+        let layers: Arc<[String]> = layers.into();
+        let stat_local_task_requests: Arc<[StatLocalTaskRequest]> = stat_local_task_requests.into();
         let semaphore = Arc::new(Semaphore::new(request.concurrent_peer_count));
         let mut join_set: JoinSet<Result<Option<PeerStatedImage>>> = JoinSet::new();
         for peer in seed_peers.iter() {
@@ -1819,7 +1824,7 @@ impl Request for Proxy {
                             // A NotFound answer means the seed peer has not cached the layer.
                             let mut cached_layers = Vec::new();
                             for (layer, stat_local_task_request) in
-                                layers.iter().zip(&stat_local_task_requests)
+                                layers.iter().zip(stat_local_task_requests.iter())
                             {
                                 match client
                                     .stat_local_task(stat_local_task_request.clone())
@@ -1860,7 +1865,10 @@ impl Request for Proxy {
             }
         }
 
-        Ok(StatImageResponse { layers, peers })
+        Ok(StatImageResponse {
+            layers: layers.to_vec(),
+            peers,
+        })
     }
 
     /// Deletes a preheated OCI image from the seed peers via the Dragonfly.

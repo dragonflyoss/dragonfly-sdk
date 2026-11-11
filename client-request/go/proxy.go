@@ -30,6 +30,7 @@ import (
 
 	commonv2 "d7y.io/api/v2/pkg/apis/common/v2"
 	"d7y.io/dragonfly/v2/pkg/idgen"
+	"d7y.io/dragonfly/v2/pkg/oci"
 	"github.com/cenkalti/backoff/v5"
 
 	"d7y.io/dragonfly-sdk/client-request/go/internal/pool"
@@ -170,6 +171,9 @@ type Proxy struct {
 	// clientPool is the pool of clients.
 	clientPool *pool.Pool
 
+	// registryClient is the http client of the registry requests.
+	registryClient *http.Client
+
 	// scheduler is the scheduler service the seed peers are listed from, nil
 	// in a ProxyWithSeedPeers.
 	scheduler *selector.Scheduler
@@ -183,6 +187,7 @@ func New(ctx context.Context, schedulerEndpoint string, opts ...ProxyOption) (*P
 		schedulerRequestTimeout: defaultSchedulerRequestTimeout,
 		healthCheckInterval:     defaultHealthCheckInterval,
 		seedPeerSelector:        selector.New(),
+		registryClient:          oci.DefaultHTTPClient(),
 	}
 	p.clientPool = pool.New(httpClientFactory{seedPeerSelector: p.seedPeerSelector}.newHTTPClient, defaultClientPoolCapacity, defaultClientPoolIdleTimeout)
 	for _, opt := range opts {
@@ -215,6 +220,7 @@ func New(ctx context.Context, schedulerEndpoint string, opts ...ProxyOption) (*P
 // connection.
 func (p *Proxy) Close() error {
 	p.seedPeerSelector.Close()
+	p.registryClient.CloseIdleConnections()
 	if p.scheduler == nil {
 		return nil
 	}

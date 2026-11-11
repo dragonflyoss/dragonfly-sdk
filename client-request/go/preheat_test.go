@@ -200,6 +200,16 @@ func TestPreheatRetriesOnlyTransientDownloadFailures(t *testing.T) {
 			},
 		},
 		{
+			name:       "resource exhausted",
+			code:       codes.ResourceExhausted,
+			maxRetries: 1,
+			expect: func(t *testing.T, hits int32, err error) {
+				assert := assert.New(t)
+				assert.Equal(codes.ResourceExhausted, status.Code(err))
+				assert.Equal(int32(2), hits)
+			},
+		},
+		{
 			name:       "not found",
 			code:       codes.NotFound,
 			maxRetries: 3,

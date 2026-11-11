@@ -218,13 +218,13 @@ func TestStatImageStatsLayersOnSeedPeers(t *testing.T) {
 	tests := []struct {
 		name          string
 		req           *StatImageRequest
-		statLocalTask func(name string, req *dfdaemonv2.StatLocalTaskRequest) (*dfdaemonv2.StatLocalTaskResponse, error)
+		statLocalTask func(name string, req *dfdaemonv2.StatLocalTaskRequest, cancel context.CancelCauseFunc) (*dfdaemonv2.StatLocalTaskResponse, error)
 		expect        func(t *testing.T, resp *StatImageResponse, err error)
 	}{
 		{
 			name: "all platforms",
 			req:  NewStatImageRequest(registry + "/foo/bar:1.0"),
-			statLocalTask: func(name string, req *dfdaemonv2.StatLocalTaskRequest) (*dfdaemonv2.StatLocalTaskResponse, error) {
+			statLocalTask: func(name string, req *dfdaemonv2.StatLocalTaskRequest, cancel context.CancelCauseFunc) (*dfdaemonv2.StatLocalTaskResponse, error) {
 				if name == "seed-peer-2" {
 					return nil, status.Error(codes.NotFound, "local task not found")
 				}
@@ -249,7 +249,7 @@ func TestStatImageStatsLayersOnSeedPeers(t *testing.T) {
 		{
 			name: "platform",
 			req:  NewStatImageRequest(registry+"/foo/bar:1.0", WithStatImageRequestPlatform("linux/arm64")),
-			statLocalTask: func(name string, req *dfdaemonv2.StatLocalTaskRequest) (*dfdaemonv2.StatLocalTaskResponse, error) {
+			statLocalTask: func(name string, req *dfdaemonv2.StatLocalTaskRequest, cancel context.CancelCauseFunc) (*dfdaemonv2.StatLocalTaskResponse, error) {
 				if name == "seed-peer-2" {
 					return nil, status.Error(codes.NotFound, "local task not found")
 				}
@@ -273,7 +273,7 @@ func TestStatImageStatsLayersOnSeedPeers(t *testing.T) {
 		{
 			name: "unfinished layer cached by one seed peer",
 			req:  NewStatImageRequest(registry + "/foo/bar:1.0"),
-			statLocalTask: func(name string, req *dfdaemonv2.StatLocalTaskRequest) (*dfdaemonv2.StatLocalTaskResponse, error) {
+			statLocalTask: func(name string, req *dfdaemonv2.StatLocalTaskRequest, cancel context.CancelCauseFunc) (*dfdaemonv2.StatLocalTaskResponse, error) {
 				if name == "seed-peer-1" && req.GetTaskId() == layerTaskID {
 					return &dfdaemonv2.StatLocalTaskResponse{TaskId: req.GetTaskId()}, nil
 				}
@@ -294,7 +294,7 @@ func TestStatImageStatsLayersOnSeedPeers(t *testing.T) {
 		{
 			name: "failed seed peer is left out",
 			req:  NewStatImageRequest(registry + "/foo/bar:1.0"),
-			statLocalTask: func(name string, req *dfdaemonv2.StatLocalTaskRequest) (*dfdaemonv2.StatLocalTaskResponse, error) {
+			statLocalTask: func(name string, req *dfdaemonv2.StatLocalTaskRequest, cancel context.CancelCauseFunc) (*dfdaemonv2.StatLocalTaskResponse, error) {
 				if name == "seed-peer-1" {
 					return nil, status.Error(codes.PermissionDenied, "stat failed")
 				}
@@ -316,15 +316,44 @@ func TestStatImageStatsLayersOnSeedPeers(t *testing.T) {
 				}}, resp.Peers)
 			},
 		},
+		{
+			name: "cancelled context",
+			req:  NewStatImageRequest(registry + "/foo/bar:1.0"),
+			statLocalTask: func(name string, req *dfdaemonv2.StatLocalTaskRequest, cancel context.CancelCauseFunc) (*dfdaemonv2.StatLocalTaskResponse, error) {
+				cancel(context.Canceled)
+				return nil, status.Error(codes.Unavailable, "stat failed")
+			},
+			expect: func(t *testing.T, resp *StatImageResponse, err error) {
+				assert := assert.New(t)
+				assert.ErrorIs(err, context.Canceled)
+				assert.Nil(resp)
+			},
+		},
+		{
+			name: "deadline exceeded context",
+			req:  NewStatImageRequest(registry + "/foo/bar:1.0"),
+			statLocalTask: func(name string, req *dfdaemonv2.StatLocalTaskRequest, cancel context.CancelCauseFunc) (*dfdaemonv2.StatLocalTaskResponse, error) {
+				cancel(context.DeadlineExceeded)
+				return nil, status.Error(codes.Unavailable, "stat failed")
+			},
+			expect: func(t *testing.T, resp *StatImageResponse, err error) {
+				assert := assert.New(t)
+				assert.ErrorIs(err, context.DeadlineExceeded)
+				assert.Nil(resp)
+			},
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancelCause(context.Background())
+			defer cancel(nil)
+
 			var hosts []*commonv2.Host
 			for _, name := range []string{"seed-peer-1", "seed-peer-2"} {
 				port := setupMockSeedPeerServer(t, &mockSeedPeer{
 					statLocalTask: func(req *dfdaemonv2.StatLocalTaskRequest) (*dfdaemonv2.StatLocalTaskResponse, error) {
-						return tc.statLocalTask(name, req)
+						return tc.statLocalTask(name, req, cancel)
 					},
 				})
 				hosts = append(hosts, createSeedPeerHost(name, port, 0))
@@ -335,7 +364,7 @@ func TestStatImageStatsLayersOnSeedPeers(t *testing.T) {
 			assert.NoError(t, err)
 			defer proxy.Close()
 
-			resp, err := proxy.StatImage(context.Background(), tc.req)
+			resp, err := proxy.StatImage(ctx, tc.req)
 			tc.expect(t, resp, err)
 		})
 	}

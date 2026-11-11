@@ -39,14 +39,11 @@ import (
 // Dragonfly. It resolves the image manifests, all the platforms or the
 // specified one, and asks every healthy seed peer for the layers it has cached
 // by the dfdaemon stat local task API. A seed peer that fails is left out of
-// the response.
+// the response, an ended context fails the request.
 func (p *Proxy) StatImage(ctx context.Context, req *StatImageRequest) (*StatImageResponse, error) {
 	if err := req.validate(); err != nil {
 		return nil, err
 	}
-
-	ctx, cancel := context.WithTimeout(ctx, req.timeout)
-	defer cancel()
 
 	ref, err := oci.ParseImage(req.image)
 	if err != nil {
@@ -55,7 +52,7 @@ func (p *Proxy) StatImage(ctx context.Context, req *StatImageRequest) (*StatImag
 
 	opts := []oci.ResolveOption{
 		oci.WithAuth(req.username, req.password),
-		oci.WithHTTPClient(oci.DefaultHTTPClient()),
+		oci.WithHTTPClient(p.registryClient),
 	}
 
 	if req.platform != nil {
@@ -103,51 +100,52 @@ func (p *Proxy) StatImage(ctx context.Context, req *StatImageRequest) (*StatImag
 	for i, peer := range seedPeers {
 		g.Go(func() error {
 			addr := net.JoinHostPort(peer.Ip, strconv.Itoa(int(peer.Port)))
-			conn, err := grpc.NewClient(
-				addr,
-				grpc.WithTransportCredentials(insecure.NewCredentials()),
-				grpc.WithDefaultCallOptions(
-					grpc.MaxCallRecvMsgSize(math.MaxInt32),
-					grpc.MaxCallSendMsgSize(math.MaxInt32),
-				),
-			)
-			if err != nil {
-				return fmt.Errorf("%w: failed to connect to seed peer %s: %v", ErrInternal, addr, err)
-			}
-			defer conn.Close()
+			return p.retry.run(ctx, func() error {
+				conn, err := grpc.NewClient(
+					addr,
+					grpc.WithTransportCredentials(insecure.NewCredentials()),
+					grpc.WithDefaultCallOptions(
+						grpc.MaxCallRecvMsgSize(math.MaxInt32),
+						grpc.MaxCallSendMsgSize(math.MaxInt32),
+					),
+				)
+				if err != nil {
+					return fmt.Errorf("%w: failed to connect to seed peer %s: %v", ErrInternal, addr, err)
+				}
+				defer conn.Close()
 
-			// A NotFound answer means the seed peer has not cached the layer.
-			var cachedLayers []*Layer
-			client := dfdaemonv2.NewDfdaemonUploadClient(conn)
-			for j, statLocalTaskRequest := range statLocalTaskRequests {
-				var statLocalTaskResponse *dfdaemonv2.StatLocalTaskResponse
-				if err := p.retry.run(ctx, func() error {
+				// A NotFound answer means the seed peer has not cached the layer.
+				var cachedLayers []*Layer
+				client := dfdaemonv2.NewDfdaemonUploadClient(conn)
+				for j, statLocalTaskRequest := range statLocalTaskRequests {
+					ctx, cancel := context.WithTimeout(ctx, req.timeout)
 					resp, err := client.StatLocalTask(ctx, statLocalTaskRequest)
-					if err != nil && status.Code(err) != codes.NotFound {
+					cancel()
+					if status.Code(err) == codes.NotFound {
+						continue
+					}
+
+					if err != nil {
 						return fmt.Errorf("%w: failed to stat task %s: %w", ErrInternal, statLocalTaskRequest.GetTaskId(), err)
 					}
 
-					statLocalTaskResponse = resp
-					return nil
-				}); err != nil {
-					return err
+					cachedLayers = append(cachedLayers, &Layer{URL: layers[j], IsFinished: resp.GetFinishedAt() != nil})
 				}
 
-				if statLocalTaskResponse != nil {
-					cachedLayers = append(cachedLayers, &Layer{URL: layers[j], IsFinished: statLocalTaskResponse.GetFinishedAt() != nil})
+				if len(cachedLayers) > 0 {
+					peers[i] = &PeerStatedImage{IP: peer.Ip, Hostname: peer.Hostname, CachedLayers: cachedLayers}
 				}
-			}
 
-			if len(cachedLayers) > 0 {
-				peers[i] = &PeerStatedImage{IP: peer.Ip, Hostname: peer.Hostname, CachedLayers: cachedLayers}
-			}
-
-			return nil
+				return nil
+			})
 		})
 	}
 
 	// A seed peer that fails is left out of the response.
 	_ = g.Wait()
+	if err := context.Cause(ctx); err != nil {
+		return nil, err
+	}
 
 	return &StatImageResponse{Layers: layers, Peers: slices.DeleteFunc(peers, func(peer *PeerStatedImage) bool { return peer == nil })}, nil
 }

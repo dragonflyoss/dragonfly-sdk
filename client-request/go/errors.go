@@ -44,12 +44,13 @@ var (
 //	| ErrRequestTimeout, ErrInternal (connect, transport)            | yes   |
 //	| proxy / backend / dfdaemon answer 5xx, 408 or 429              | yes   |
 //	| gRPC Internal, Unavailable, Unknown, Aborted, DeadlineExceeded | yes   |
+//	| gRPC ResourceExhausted                                         | yes   |
 //	| any other answer, such as 403, 404, 422                        | no    |
 //	| any other gRPC code, ErrInvalidArgument                        | no    |
 //
-// 429 and 507 are retried because another seed peer may not be rate limited
-// or out of space. Any other 4xx is definitive: every seed peer would answer
-// the same.
+// 429, 507 and ResourceExhausted are retried because another seed peer may not
+// be rate limited or out of space. Any other 4xx is definitive: every seed peer
+// would answer the same.
 func isRetryable(err error) bool {
 	var answer interface{ retryable() bool }
 	if errors.As(err, &answer) {
@@ -58,7 +59,7 @@ func isRetryable(err error) bool {
 
 	if st, ok := status.FromError(err); ok {
 		switch st.Code() {
-		case codes.Internal, codes.Unavailable, codes.Unknown, codes.Aborted, codes.DeadlineExceeded:
+		case codes.Internal, codes.Unavailable, codes.Unknown, codes.Aborted, codes.DeadlineExceeded, codes.ResourceExhausted:
 			return true
 		}
 

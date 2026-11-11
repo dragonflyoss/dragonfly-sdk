@@ -634,9 +634,6 @@ type PreheatImageRequest struct {
 	// filteredQueryParams is the filtered query params to generate the task id.
 	filteredQueryParams []string
 
-	// contentForCalculatingTaskID is the content for calculating the task id.
-	contentForCalculatingTaskID string
-
 	// enableTaskIDBasedBlobDigest indicates whether to use the blob digest for
 	// task id calculation when downloading from OCI registries.
 	enableTaskIDBasedBlobDigest bool
@@ -702,12 +699,6 @@ func WithPreheatImageRequestApplication(application string) PreheatImageRequestO
 // generate the task id.
 func WithPreheatImageRequestFilteredQueryParams(params []string) PreheatImageRequestOption {
 	return func(r *PreheatImageRequest) { r.filteredQueryParams = params }
-}
-
-// WithPreheatImageRequestContentForCalculatingTaskID sets the content for calculating
-// the task id.
-func WithPreheatImageRequestContentForCalculatingTaskID(content string) PreheatImageRequestOption {
-	return func(r *PreheatImageRequest) { r.contentForCalculatingTaskID = content }
 }
 
 // WithPreheatImageRequestEnableTaskIDBasedBlobDigest sets whether to use the blob
@@ -828,7 +819,7 @@ type StatImageRequest struct {
 	// the tasks can not be found on the peers.
 	enableTaskIDBasedBlobDigest bool
 
-	// timeout is the timeout of the request.
+	// timeout is the timeout of each layer stat on a seed peer.
 	timeout time.Duration
 
 	// concurrentPeerCount is the number of seed peers to stat the image on
@@ -886,7 +877,8 @@ func WithStatImageRequestEnableTaskIDBasedBlobDigest(enable bool) StatImageReque
 	return func(r *StatImageRequest) { r.enableTaskIDBasedBlobDigest = enable }
 }
 
-// WithStatImageRequestTimeout sets the timeout of the request.
+// WithStatImageRequestTimeout sets the timeout of each layer stat on a seed
+// peer.
 func WithStatImageRequestTimeout(timeout time.Duration) StatImageRequestOption {
 	return func(r *StatImageRequest) { r.timeout = timeout }
 }

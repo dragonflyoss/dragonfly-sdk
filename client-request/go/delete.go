@@ -80,7 +80,7 @@ func (p *Proxy) Delete(ctx context.Context, req *DeleteRequest) error {
 // DeleteImage deletes a preheated OCI image from every healthy seed peer by the
 // dfdaemon delete image API, for all its platforms or the specified one. A task
 // still referenced by another image or platform is retained. A seed peer that
-// fails is left out of the response.
+// fails is left out of the response, an ended context fails the request.
 func (p *Proxy) DeleteImage(ctx context.Context, req *DeleteImageRequest) (*DeleteImageResponse, error) {
 	if err := req.validate(); err != nil {
 		return nil, err
@@ -135,34 +135,37 @@ func (p *Proxy) DeleteImage(ctx context.Context, req *DeleteImageRequest) (*Dele
 
 	// A seed peer that fails is left out of the response.
 	_ = g.Wait()
+	if err := context.Cause(ctx); err != nil {
+		return nil, err
+	}
 
 	return &DeleteImageResponse{Peers: slices.DeleteFunc(peers, func(peer *PeerDeletedImage) bool { return peer == nil })}, nil
 }
 
 // deleteTask has the seed peer delete the task, retrying a transient failure on
-// the same seed peer. Each attempt runs under the timeout. A NotFound answer
-// counts as deleted, aligned with the delete task job of the scheduler.
+// the same seed peer. Each attempt connects to the seed peer and runs under the
+// timeout. A NotFound answer counts as deleted, aligned with the delete task job
+// of the scheduler.
 func (p *Proxy) deleteTask(ctx context.Context, peer *commonv2.Host, deleteTaskRequest *dfdaemonv2.DeleteTaskRequest, timeout time.Duration) error {
 	addr := net.JoinHostPort(peer.Ip, strconv.Itoa(int(peer.Port)))
-	conn, err := grpc.NewClient(
-		addr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(math.MaxInt32),
-			grpc.MaxCallSendMsgSize(math.MaxInt32),
-		),
-	)
-	if err != nil {
-		return fmt.Errorf("%w: failed to connect to seed peer %s: %v", ErrInternal, addr, err)
-	}
-	defer conn.Close()
-
-	client := dfdaemonv2.NewDfdaemonUploadClient(conn)
 	return p.retry.run(ctx, func() error {
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 
-		if _, err := client.DeleteTask(ctx, deleteTaskRequest); err != nil && status.Code(err) != codes.NotFound {
+		conn, err := grpc.NewClient(
+			addr,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithDefaultCallOptions(
+				grpc.MaxCallRecvMsgSize(math.MaxInt32),
+				grpc.MaxCallSendMsgSize(math.MaxInt32),
+			),
+		)
+		if err != nil {
+			return fmt.Errorf("%w: failed to connect to seed peer %s: %v", ErrInternal, addr, err)
+		}
+		defer conn.Close()
+
+		if _, err := dfdaemonv2.NewDfdaemonUploadClient(conn).DeleteTask(ctx, deleteTaskRequest); err != nil && status.Code(err) != codes.NotFound {
 			return fmt.Errorf("%w: failed to delete task %s: %w", ErrInternal, deleteTaskRequest.GetTaskId(), err)
 		}
 
@@ -171,29 +174,30 @@ func (p *Proxy) deleteTask(ctx context.Context, peer *commonv2.Host, deleteTaskR
 }
 
 // deleteImage has the seed peer delete the tasks of the image, retrying a
-// transient failure on the same seed peer. Each attempt runs under the timeout.
+// transient failure on the same seed peer. Each attempt connects to the seed
+// peer and runs under the timeout.
 func (p *Proxy) deleteImage(ctx context.Context, peer *commonv2.Host, deleteImageRequest *dfdaemonv2.DeleteImageRequest, timeout time.Duration) (*dfdaemonv2.DeleteImageResponse, error) {
 	addr := net.JoinHostPort(peer.Ip, strconv.Itoa(int(peer.Port)))
-	conn, err := grpc.NewClient(
-		addr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(math.MaxInt32),
-			grpc.MaxCallSendMsgSize(math.MaxInt32),
-		),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("%w: failed to connect to seed peer %s: %v", ErrInternal, addr, err)
-	}
-	defer conn.Close()
 
 	var deleteImageResponse *dfdaemonv2.DeleteImageResponse
-	client := dfdaemonv2.NewDfdaemonUploadClient(conn)
 	if err := p.retry.run(ctx, func() error {
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 
-		resp, err := client.DeleteImage(ctx, deleteImageRequest)
+		conn, err := grpc.NewClient(
+			addr,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithDefaultCallOptions(
+				grpc.MaxCallRecvMsgSize(math.MaxInt32),
+				grpc.MaxCallSendMsgSize(math.MaxInt32),
+			),
+		)
+		if err != nil {
+			return fmt.Errorf("%w: failed to connect to seed peer %s: %v", ErrInternal, addr, err)
+		}
+		defer conn.Close()
+
+		resp, err := dfdaemonv2.NewDfdaemonUploadClient(conn).DeleteImage(ctx, deleteImageRequest)
 		if err != nil {
 			return fmt.Errorf("%w: failed to delete image %s: %w", ErrInternal, deleteImageRequest.GetUrl(), err)
 		}
