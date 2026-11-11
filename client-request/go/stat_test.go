@@ -172,18 +172,44 @@ func TestStatImageNormalizesDockerHubReference(t *testing.T) {
 	assert.Equal("https://registry-1.docker.io/v2/library/nginx/manifests/latest", statImageRequest.GetUrl())
 }
 
-func TestStatImageInvalidReference(t *testing.T) {
-	assert := assert.New(t)
-	endpoint := setupMockScheduler(t, nil)
+func TestStatImageInvalidArgument(t *testing.T) {
+	tests := []struct {
+		name   string
+		req    *StatImageRequest
+		expect func(t *testing.T, err error)
+	}{
+		{
+			name: "invalid reference",
+			req:  NewStatImageRequest("INVALID IMAGE"),
+			expect: func(t *testing.T, err error) {
+				assert := assert.New(t)
+				assert.ErrorIs(err, ErrInvalidArgument)
+				assert.ErrorContains(err, "invalid image reference")
+			},
+		},
+		{
+			name: "invalid platform",
+			req:  NewStatImageRequest("docker.io/library/nginx:latest", WithStatImageRequestPlatform("linux-amd64")),
+			expect: func(t *testing.T, err error) {
+				assert := assert.New(t)
+				assert.ErrorIs(err, ErrInvalidArgument)
+				assert.ErrorContains(err, "invalid platform format")
+			},
+		},
+	}
 
-	proxy, err := New(context.Background(), endpoint)
-	assert.NoError(err)
-	defer proxy.Close()
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			endpoint := setupMockScheduler(t, nil)
 
-	req := NewStatImageRequest("INVALID IMAGE")
+			proxy, err := New(context.Background(), endpoint)
+			assert.NoError(t, err)
+			defer proxy.Close()
 
-	_, err = proxy.StatImage(context.Background(), req)
-	assert.ErrorIs(err, ErrInvalidArgument)
+			_, err = proxy.StatImage(context.Background(), tc.req)
+			tc.expect(t, err)
+		})
+	}
 }
 
 func TestStatImageSchedulerInvalidArgument(t *testing.T) {

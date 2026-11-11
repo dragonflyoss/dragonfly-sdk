@@ -35,6 +35,10 @@ import (
 // resolve the image manifest and collect the cached layers on each peer. It
 // only queries the seed peers.
 func (p *Proxy) StatImage(ctx context.Context, req *StatImageRequest) (*StatImageResponse, error) {
+	if err := req.validate(); err != nil {
+		return nil, err
+	}
+
 	ctx, cancel := context.WithTimeout(ctx, req.timeout)
 	defer cancel()
 

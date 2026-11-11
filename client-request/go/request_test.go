@@ -79,6 +79,7 @@ type mockSeedPeer struct {
 	dfdaemonv2.UnimplementedDfdaemonUploadServer
 	downloadTaskErr error
 	onDownloadTask  func()
+	downloadTask    func(*dfdaemonv2.DownloadTaskRequest)
 	deleteTaskErr   error
 	onDeleteTask    func()
 	deleteImage     func(*dfdaemonv2.DeleteImageRequest) (*dfdaemonv2.DeleteImageResponse, error)
@@ -87,6 +88,10 @@ type mockSeedPeer struct {
 func (s *mockSeedPeer) DownloadTask(req *dfdaemonv2.DownloadTaskRequest, stream dfdaemonv2.DfdaemonUpload_DownloadTaskServer) error {
 	if s.onDownloadTask != nil {
 		s.onDownloadTask()
+	}
+
+	if s.downloadTask != nil {
+		s.downloadTask(req)
 	}
 
 	if s.downloadTaskErr != nil {
@@ -228,6 +233,7 @@ func TestNewRequestDefaults(t *testing.T) {
 	deleteImage := NewDeleteImageRequest("docker.io/library/nginx:latest")
 	assert.Nil(deleteImage.platform)
 	assert.Equal(defaultRequestTimeout, deleteImage.timeout)
+	assert.Equal(500, deleteImage.concurrentPeerCount)
 }
 
 func setupBenchProxy(b *testing.B, body []byte) (*Proxy, string) {

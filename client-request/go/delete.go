@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"slices"
 	"strconv"
 	"time"
 
@@ -29,6 +30,7 @@ import (
 	"d7y.io/dragonfly/v2/pkg/idgen"
 	"d7y.io/dragonfly/v2/pkg/net/ip"
 	"d7y.io/dragonfly/v2/pkg/oci"
+	"github.com/containerd/platforms"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -77,8 +79,8 @@ func (p *Proxy) Delete(ctx context.Context, req *DeleteRequest) error {
 
 // DeleteImage deletes a preheated OCI image from every healthy seed peer by the
 // dfdaemon delete image API, for all its platforms or the specified one. A task
-// still referenced by another image or platform is retained. It fails if any
-// seed peer fails.
+// still referenced by another image or platform is retained. A seed peer that
+// fails is left out of the response.
 func (p *Proxy) DeleteImage(ctx context.Context, req *DeleteImageRequest) (*DeleteImageResponse, error) {
 	if err := req.validate(); err != nil {
 		return nil, err
@@ -95,13 +97,24 @@ func (p *Proxy) DeleteImage(ctx context.Context, req *DeleteImageRequest) (*Dele
 		return nil, fmt.Errorf("%w: failed to select seed peers: %v", ErrInternal, err)
 	}
 
-	// Construct the delete image request.
+	// Construct the delete image request, the platform is normalized as the
+	// preheat records it.
 	remoteIP := ip.IPv4.String()
-	deleteImageRequest := &dfdaemonv2.DeleteImageRequest{Url: ref.ManifestURL(), Platform: req.platform, RemoteIp: &remoteIP}
+	deleteImageRequest := &dfdaemonv2.DeleteImageRequest{Url: ref.ManifestURL(), RemoteIp: &remoteIP}
+	if req.platform != nil {
+		spec, err := platforms.Parse(*req.platform)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+		}
+
+		platform := fmt.Sprintf("%s/%s", spec.OS, spec.Architecture)
+		deleteImageRequest.Platform = &platform
+	}
 
 	// Delete the image from every seed peer concurrently.
 	peers := make([]*PeerDeletedImage, len(seedPeers))
-	g, ctx := errgroup.WithContext(ctx)
+	var g errgroup.Group
+	g.SetLimit(req.concurrentPeerCount)
 	for i, peer := range seedPeers {
 		g.Go(func() error {
 			resp, err := p.deleteImage(ctx, peer, deleteImageRequest, req.timeout)
@@ -120,11 +133,10 @@ func (p *Proxy) DeleteImage(ctx context.Context, req *DeleteImageRequest) (*Dele
 		})
 	}
 
-	if err := g.Wait(); err != nil {
-		return nil, err
-	}
+	// A seed peer that fails is left out of the response.
+	_ = g.Wait()
 
-	return &DeleteImageResponse{Peers: peers}, nil
+	return &DeleteImageResponse{Peers: slices.DeleteFunc(peers, func(peer *PeerDeletedImage) bool { return peer == nil })}, nil
 }
 
 // deleteTask has the seed peer delete the task, retrying a transient failure on

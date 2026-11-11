@@ -18,14 +18,19 @@ package request
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	commonv2 "d7y.io/api/v2/pkg/apis/common/v2"
+	dfdaemonv2 "d7y.io/api/v2/pkg/apis/dfdaemon/v2"
+	"d7y.io/dragonfly/v2/pkg/net/ip"
 	"github.com/cenkalti/backoff/v5"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc/codes"
@@ -246,31 +251,247 @@ func TestPreheatRetriesOnlyTransientDownloadFailures(t *testing.T) {
 	}
 }
 
-func TestPreheatImageInvalidReference(t *testing.T) {
-	assert := assert.New(t)
-	endpoint := setupMockScheduler(t, nil)
+func TestPreheatImageInvalidArgument(t *testing.T) {
+	tests := []struct {
+		name   string
+		req    *PreheatImageRequest
+		expect func(t *testing.T, err error)
+	}{
+		{
+			name: "invalid reference",
+			req:  NewPreheatImageRequest("invalid image reference!!"),
+			expect: func(t *testing.T, err error) {
+				assert := assert.New(t)
+				assert.ErrorIs(err, ErrInvalidArgument)
+				assert.ErrorContains(err, "invalid image reference")
+			},
+		},
+		{
+			name: "invalid platform",
+			req:  NewPreheatImageRequest("docker.io/library/nginx:latest", WithPreheatImageRequestPlatform("linux-amd64")),
+			expect: func(t *testing.T, err error) {
+				assert := assert.New(t)
+				assert.ErrorIs(err, ErrInvalidArgument)
+				assert.ErrorContains(err, "invalid platform format")
+			},
+		},
+	}
 
-	proxy, err := New(context.Background(), endpoint)
-	assert.NoError(err)
-	defer proxy.Close()
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			endpoint := setupMockScheduler(t, nil)
 
-	req := NewPreheatImageRequest("invalid image reference!!")
-	err = proxy.PreheatImage(context.Background(), req)
-	assert.ErrorContains(err, "invalid image reference")
+			proxy, err := New(context.Background(), endpoint)
+			assert.NoError(t, err)
+			defer proxy.Close()
+
+			err = proxy.PreheatImage(context.Background(), tc.req)
+			tc.expect(t, err)
+		})
+	}
 }
 
-func TestPreheatImageInvalidPlatform(t *testing.T) {
-	assert := assert.New(t)
-	endpoint := setupMockScheduler(t, nil)
+func TestPreheatImageDownloadsManifestsAndBlobs(t *testing.T) {
+	amd64Manifest := `{
+		"schemaVersion": 2,
+		"mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+		"config": {
+			"mediaType": "application/vnd.docker.container.image.v1+json",
+			"size": 7023,
+			"digest": "sha256:b5b2b2c507a0944348e0303114d8d93aaaa081732b86451d9bce1f432a537bc7"
+		},
+		"layers": [
+			{
+				"mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip",
+				"size": 32654,
+				"digest": "sha256:e692418e4cbaf90ca69d05a66403747baa33ee08806650b51fab815ad7fc331f"
+			}
+		]
+	}`
+	arm64Manifest := `{
+		"schemaVersion": 2,
+		"mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+		"config": {
+			"mediaType": "application/vnd.docker.container.image.v1+json",
+			"size": 7023,
+			"digest": "sha256:c5b2b2c507a0944348e0303114d8d93aaaa081732b86451d9bce1f432a537bc7"
+		},
+		"layers": [
+			{
+				"mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip",
+				"size": 32654,
+				"digest": "sha256:e692418e4cbaf90ca69d05a66403747baa33ee08806650b51fab815ad7fc331f"
+			}
+		]
+	}`
+	amd64ManifestDigest := fmt.Sprintf("sha256:%x", sha256.Sum256([]byte(amd64Manifest)))
+	arm64ManifestDigest := fmt.Sprintf("sha256:%x", sha256.Sum256([]byte(arm64Manifest)))
+	manifestList := fmt.Sprintf(`{
+		"schemaVersion": 2,
+		"mediaType": "application/vnd.docker.distribution.manifest.list.v2+json",
+		"manifests": [
+			{
+				"mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+				"size": %d,
+				"digest": "%s",
+				"platform": {
+					"architecture": "amd64",
+					"os": "linux"
+				}
+			},
+			{
+				"mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+				"size": %d,
+				"digest": "%s",
+				"platform": {
+					"architecture": "arm64",
+					"os": "linux"
+				}
+			},
+			{
+				"mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+				"size": %d,
+				"digest": "%s",
+				"platform": {
+					"architecture": "arm64",
+					"os": "linux",
+					"variant": "v8"
+				}
+			}
+		]
+	}`, len(amd64Manifest), amd64ManifestDigest, len(arm64Manifest), arm64ManifestDigest, len(arm64Manifest), arm64ManifestDigest)
 
-	proxy, err := New(context.Background(), endpoint)
-	assert.NoError(err)
-	defer proxy.Close()
+	listener, err := net.Listen("tcp", net.JoinHostPort(ip.IPv4.String(), "0"))
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	req := NewPreheatImageRequest("docker.io/library/nginx:latest", WithPreheatImageRequestPlatform("linux-amd64"))
-	err = proxy.PreheatImage(context.Background(), req)
-	assert.ErrorIs(err, ErrInvalidArgument)
-	assert.ErrorContains(err, "invalid platform format")
+	registry := listener.Addr().String()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v2/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer test-token" {
+			w.Header().Set("WWW-Authenticate", fmt.Sprintf("Bearer realm=%q,service=\"registry\"", "https://"+registry+"/token"))
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"token":"test-token"}`)
+	})
+	mux.HandleFunc("/v2/foo/bar/manifests/1.0", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.docker.distribution.manifest.list.v2+json")
+		fmt.Fprint(w, manifestList)
+	})
+	mux.HandleFunc("/v2/foo/bar/manifests/"+amd64ManifestDigest, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.docker.distribution.manifest.v2+json")
+		fmt.Fprint(w, amd64Manifest)
+	})
+	mux.HandleFunc("/v2/foo/bar/manifests/"+arm64ManifestDigest, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.docker.distribution.manifest.v2+json")
+		fmt.Fprint(w, arm64Manifest)
+	})
+	server := httptest.NewUnstartedServer(mux)
+	server.Listener.Close()
+	server.Listener = listener
+	server.StartTLS()
+	defer server.Close()
+
+	tests := []struct {
+		name   string
+		req    *PreheatImageRequest
+		expect func(t *testing.T, downloads []*commonv2.Download, err error)
+	}{
+		{
+			name: "all platforms",
+			req:  NewPreheatImageRequest(registry+"/foo/bar:1.0", WithPreheatImageRequestReplicas(1)),
+			expect: func(t *testing.T, downloads []*commonv2.Download, err error) {
+				assert := assert.New(t)
+				assert.NoError(err)
+
+				var urls []string
+				for _, download := range downloads {
+					assert.Equal(registry+"/foo/bar:1.0", download.GetImage().GetReference())
+					urls = append(urls, download.GetImage().GetPlatform()+" "+download.GetUrl())
+				}
+
+				assert.ElementsMatch([]string{
+					fmt.Sprintf("linux/amd64 https://%s/v2/foo/bar/manifests/%s", registry, amd64ManifestDigest),
+					fmt.Sprintf("linux/amd64 https://%s/v2/foo/bar/blobs/sha256:b5b2b2c507a0944348e0303114d8d93aaaa081732b86451d9bce1f432a537bc7", registry),
+					fmt.Sprintf("linux/amd64 https://%s/v2/foo/bar/blobs/sha256:e692418e4cbaf90ca69d05a66403747baa33ee08806650b51fab815ad7fc331f", registry),
+					fmt.Sprintf("linux/arm64 https://%s/v2/foo/bar/manifests/%s", registry, arm64ManifestDigest),
+					fmt.Sprintf("linux/arm64 https://%s/v2/foo/bar/blobs/sha256:c5b2b2c507a0944348e0303114d8d93aaaa081732b86451d9bce1f432a537bc7", registry),
+					fmt.Sprintf("linux/arm64 https://%s/v2/foo/bar/blobs/sha256:e692418e4cbaf90ca69d05a66403747baa33ee08806650b51fab815ad7fc331f", registry),
+				}, urls)
+			},
+		},
+		{
+			name: "platform",
+			req:  NewPreheatImageRequest(registry+"/foo/bar:1.0", WithPreheatImageRequestPlatform("linux/arm64"), WithPreheatImageRequestReplicas(1)),
+			expect: func(t *testing.T, downloads []*commonv2.Download, err error) {
+				assert := assert.New(t)
+				assert.NoError(err)
+
+				var urls []string
+				for _, download := range downloads {
+					assert.Equal(registry+"/foo/bar:1.0", download.GetImage().GetReference())
+					urls = append(urls, download.GetImage().GetPlatform()+" "+download.GetUrl())
+				}
+
+				assert.ElementsMatch([]string{
+					fmt.Sprintf("linux/arm64 https://%s/v2/foo/bar/manifests/%s", registry, arm64ManifestDigest),
+					fmt.Sprintf("linux/arm64 https://%s/v2/foo/bar/blobs/sha256:c5b2b2c507a0944348e0303114d8d93aaaa081732b86451d9bce1f432a537bc7", registry),
+					fmt.Sprintf("linux/arm64 https://%s/v2/foo/bar/blobs/sha256:e692418e4cbaf90ca69d05a66403747baa33ee08806650b51fab815ad7fc331f", registry),
+				}, urls)
+			},
+		},
+		{
+			name: "manifest digest",
+			req:  NewPreheatImageRequest(registry+"/foo/bar@"+amd64ManifestDigest, WithPreheatImageRequestReplicas(1)),
+			expect: func(t *testing.T, downloads []*commonv2.Download, err error) {
+				assert := assert.New(t)
+				assert.NoError(err)
+
+				var urls []string
+				for _, download := range downloads {
+					assert.Equal(registry+"/foo/bar@"+amd64ManifestDigest, download.GetImage().GetReference())
+					assert.Nil(download.GetImage().Platform)
+					urls = append(urls, download.GetUrl())
+				}
+
+				assert.ElementsMatch([]string{
+					fmt.Sprintf("https://%s/v2/foo/bar/manifests/%s", registry, amd64ManifestDigest),
+					fmt.Sprintf("https://%s/v2/foo/bar/blobs/sha256:b5b2b2c507a0944348e0303114d8d93aaaa081732b86451d9bce1f432a537bc7", registry),
+					fmt.Sprintf("https://%s/v2/foo/bar/blobs/sha256:e692418e4cbaf90ca69d05a66403747baa33ee08806650b51fab815ad7fc331f", registry),
+				}, urls)
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			downloadTaskRequests := make(chan *dfdaemonv2.DownloadTaskRequest, 8)
+			port := setupMockSeedPeerServer(t, &mockSeedPeer{
+				downloadTask: func(req *dfdaemonv2.DownloadTaskRequest) { downloadTaskRequests <- req },
+			})
+			endpoint := setupMockScheduler(t, []*commonv2.Host{createSeedPeerHost("seed-peer-1", port, 0)})
+
+			proxy, err := New(context.Background(), endpoint)
+			assert.NoError(t, err)
+			defer proxy.Close()
+
+			err = proxy.PreheatImage(context.Background(), tc.req)
+			close(downloadTaskRequests)
+
+			var downloads []*commonv2.Download
+			for downloadTaskRequest := range downloadTaskRequests {
+				downloads = append(downloads, downloadTaskRequest.GetDownload())
+			}
+			tc.expect(t, downloads, err)
+		})
+	}
 }
 
 func TestPreheatImageUnreachableRegistry(t *testing.T) {

@@ -200,7 +200,8 @@ needing the `preheat` feature. A file delete should carry the parameters the
 preheat used, such as the replicas and the scope, so it addresses the same task
 and seed peers, and a seed peer answering `NotFound` counts as deleted. An image
 is deleted from all healthy seed peers, for all its platforms unless a platform
-is set, and a task still referenced by another image is retained:
+is set, a task still referenced by another image or platform is retained, and
+a seed peer that fails is left out of the response:
 
 ```rust
 proxy
@@ -229,9 +230,10 @@ for peer in response.peers {
 ```
 
 Since 1.13.0 a breaking change: `preheat_image` preheats all the platforms
-unless a platform is set, `delete_image` takes only the platform and the timeout
-and returns the tasks deleted and retained, and `PeerImage` is renamed to
-`PeerStatedImage`. The seed peers must run dfdaemon v1.5.12 or later.
+unless a platform is set, `delete_image` no longer takes the options of the
+preheat and returns the tasks deleted and retained, and `PeerImage` is renamed
+to `PeerStatedImage`. The seed peers must run dfdaemon v1.5.12 or later, and
+`stat_image` stats all the platforms only with scheduler v2.5.4 or later.
 
 See [examples](./examples) for runnable examples.
 

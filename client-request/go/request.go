@@ -45,6 +45,9 @@ const defaultRequestTimeout = 10 * 60 * time.Second
 // concurrently.
 const defaultConcurrentTaskCount = 4
 
+// defaultConcurrentPeerCount is the default number of seed peers to address concurrently.
+const defaultConcurrentPeerCount = 500
+
 // defaultReplicas is the default number of seed peers serving a task.
 const defaultReplicas = 2
 
@@ -123,7 +126,7 @@ type Request interface {
 	// DeleteImage deletes a preheated OCI image: has every healthy seed peer
 	// delete its tasks, all the platforms unless a platform is set, retaining
 	// the tasks other images or platforms reference. It returns the tasks
-	// deleted and retained.
+	// deleted and retained, a seed peer that fails is left out.
 	DeleteImage(ctx context.Context, req *DeleteImageRequest) (*DeleteImageResponse, error)
 
 	// LookupEndpoints returns the proxy endpoints of the seed peers that would
@@ -600,9 +603,9 @@ func (r *PreheatRequest) validate() error {
 }
 
 // PreheatImageRequest represents a request to preheat an OCI image through
-// the Dragonfly seed client. The preheat downloads all blobs (config and
-// layers) of the specified image via the Dragonfly proxy. Construct it with
-// NewPreheatImageRequest and set the optional parameters with
+// the Dragonfly seed client. The preheat downloads the manifests and blobs
+// (config and layers) of the specified image to the seed peers. Construct it
+// with NewPreheatImageRequest and set the optional parameters with
 // PreheatImageRequestOption.
 type PreheatImageRequest struct {
 	// image is the OCI image reference (e.g., "docker.io/library/nginx:latest").
@@ -900,6 +903,17 @@ func NewStatImageRequest(image string, opts ...StatImageRequestOption) *StatImag
 	return r
 }
 
+// validate validates the request parameters.
+func (r *StatImageRequest) validate() error {
+	if r.platform != nil {
+		if _, err := platforms.Parse(*r.platform); err != nil {
+			return fmt.Errorf("%w: invalid platform format %q, expected \"os/arch\" (e.g., \"linux/amd64\"): %v", ErrInvalidArgument, *r.platform, err)
+		}
+	}
+
+	return nil
+}
+
 // StatImageResponse represents the distribution of an OCI image in the
 // Dragonfly.
 type StatImageResponse struct {
@@ -1068,6 +1082,10 @@ type DeleteImageRequest struct {
 
 	// timeout is the timeout of each attempt of an image delete.
 	timeout time.Duration
+
+	// concurrentPeerCount is the number of seed peers to delete the image from
+	// concurrently.
+	concurrentPeerCount int
 }
 
 // DeleteImageRequestOption configures the DeleteImageRequest.
@@ -1086,12 +1104,19 @@ func WithDeleteImageRequestTimeout(timeout time.Duration) DeleteImageRequestOpti
 	return func(r *DeleteImageRequest) { r.timeout = timeout }
 }
 
+// WithDeleteImageRequestConcurrentPeerCount sets the number of seed peers to
+// delete the image from concurrently, default is 500.
+func WithDeleteImageRequestConcurrentPeerCount(count int) DeleteImageRequestOption {
+	return func(r *DeleteImageRequest) { r.concurrentPeerCount = count }
+}
+
 // NewDeleteImageRequest returns a DeleteImageRequest for the image with default
 // values.
 func NewDeleteImageRequest(image string, opts ...DeleteImageRequestOption) *DeleteImageRequest {
 	r := &DeleteImageRequest{
-		image:   image,
-		timeout: defaultRequestTimeout,
+		image:               image,
+		timeout:             defaultRequestTimeout,
+		concurrentPeerCount: defaultConcurrentPeerCount,
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -1102,6 +1127,10 @@ func NewDeleteImageRequest(image string, opts ...DeleteImageRequestOption) *Dele
 
 // validate validates the request parameters.
 func (r *DeleteImageRequest) validate() error {
+	if r.concurrentPeerCount <= 0 {
+		return fmt.Errorf("%w: concurrent peer count must be positive", ErrInvalidArgument)
+	}
+
 	if r.platform != nil {
 		if _, err := platforms.Parse(*r.platform); err != nil {
 			return fmt.Errorf("%w: invalid platform format %q, expected \"os/arch\" (e.g., \"linux/amd64\"): %v", ErrInvalidArgument, *r.platform, err)

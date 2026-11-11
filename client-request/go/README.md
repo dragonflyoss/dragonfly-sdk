@@ -114,8 +114,9 @@ Delete a preheated file or an OCI image from the seed peers. A file delete
 should carry the parameters the preheat used, such as the replicas and the
 scope, so it addresses the same task and seed peers, and a seed peer answering
 `NotFound` counts as deleted. An image is deleted from all healthy seed peers,
-for all its platforms unless a platform is set, and a task still referenced by
-another image is retained:
+for all its platforms unless a platform is set, a task still referenced by
+another image or platform is retained, and a seed peer that fails is left out
+of the response:
 
 ```go
 if err := proxy.Delete(ctx, request.NewDeleteRequest("https://example.com/file.txt")); err != nil {
@@ -133,9 +134,10 @@ for _, peer := range resp.Peers {
 ```
 
 Since 1.13.0 a breaking change: `PreheatImage` preheats all the platforms unless
-a platform is set, `DeleteImage` takes only the platform and the timeout and
+a platform is set, `DeleteImage` no longer takes the options of the preheat and
 returns the tasks deleted and retained, and `PeerImage` is renamed to
-`PeerStatedImage`. The seed peers must run dfdaemon v1.5.12 or later.
+`PeerStatedImage`. The seed peers must run dfdaemon v1.5.12 or later, and
+`StatImage` stats all the platforms only with scheduler v2.5.4 or later.
 
 Preheat with multiple replicas and scatter downloads across them. Preheating
 writes the file to the given number of distinct seed peers, and downloading

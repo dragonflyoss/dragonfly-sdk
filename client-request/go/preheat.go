@@ -171,6 +171,12 @@ func (p *Proxy) PreheatImage(ctx context.Context, req *PreheatImageRequest) erro
 			image.Platform = &manifest.Platform
 		}
 
+		if slices.ContainsFunc(targets, func(t target) bool {
+			return t.url == manifest.URL && t.image.GetPlatform() == manifest.Platform
+		}) {
+			continue
+		}
+
 		targets = append(targets, target{url: manifest.URL, header: manifestHeader, image: image})
 		for _, blobURL := range manifest.BlobURLs {
 			if !slices.ContainsFunc(targets, func(t target) bool {
