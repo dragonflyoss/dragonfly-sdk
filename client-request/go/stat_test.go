@@ -172,7 +172,7 @@ func TestStatImageNormalizesDockerHubReference(t *testing.T) {
 	assert.Equal("https://registry-1.docker.io/v2/library/nginx/manifests/latest", statImageRequest.GetUrl())
 }
 
-func TestStatImageInvalidImageReference(t *testing.T) {
+func TestStatImageInvalidReference(t *testing.T) {
 	assert := assert.New(t)
 	endpoint := setupMockScheduler(t, nil)
 

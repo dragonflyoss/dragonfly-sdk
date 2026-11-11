@@ -27,22 +27,22 @@
 //! driver lookup-endpoints --scheduler <endpoint> <url>
 //! driver get --scheduler <endpoint> [--endpoint <endpoint>]... [--header <key: value>]... --output <path> <url>
 //! driver preheat --scheduler <endpoint> [--scope <scope>] <url>
-//! driver preheat-image --scheduler <endpoint> [--scope <scope>] <image>
+//! driver preheat-image --scheduler <endpoint> [--scope <scope>] [--platform <platform>] <image>
 //! driver delete --scheduler <endpoint> [--scope <scope>] <url>
-//! driver delete-image --scheduler <endpoint> [--scope <scope>] <image>
+//! driver delete-image --scheduler <endpoint> [--platform <platform>] <image>
 //! ```
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use dragonfly_client_request::{
     DeleteImageRequest, DeleteRequest, GetRequest, PreheatImageRequest, PreheatRequest, Proxy,
     ProxyWithEndpoints, Request, RequestWithEndpoints, Scope,
 };
 use futures::TryStreamExt;
 use http::header::{HeaderMap, HeaderName, HeaderValue};
-use serde::Serialize;
+use serde_json::json;
 use tokio::io::AsyncWriteExt;
 
 /// The result of the driver commands.
@@ -98,23 +98,29 @@ enum Command {
         #[arg(long)]
         scheduler: String,
 
-        /// Seed peers to address, "default" or "all_seed_peers".
-        #[arg(long, default_value = SCOPE_DEFAULT)]
-        scope: String,
+        /// Seed peers to address.
+        #[arg(long, value_enum, default_value_t = ScopeArg::Default)]
+        scope: ScopeArg,
 
         /// Url to preheat.
         url: String,
     },
 
-    /// Preheats the image to the seed peers.
+    /// Preheats the image to the seed peers, all its platforms unless the platform
+    /// is given.
     PreheatImage {
         /// Scheduler endpoint.
         #[arg(long)]
         scheduler: String,
 
-        /// Seed peers to address, "default" or "all_seed_peers".
-        #[arg(long, default_value = SCOPE_DEFAULT)]
-        scope: String,
+        /// Seed peers to address.
+        #[arg(long, value_enum, default_value_t = ScopeArg::Default)]
+        scope: ScopeArg,
+
+        /// Platform of the image in the format "os/arch", all the platforms by
+        /// default.
+        #[arg(long)]
+        platform: Option<String>,
 
         /// Image reference, e.g., "docker.io/library/busybox:latest".
         image: String,
@@ -126,51 +132,50 @@ enum Command {
         #[arg(long)]
         scheduler: String,
 
-        /// Seed peers to address, "default" or "all_seed_peers".
-        #[arg(long, default_value = SCOPE_DEFAULT)]
-        scope: String,
+        /// Seed peers to address.
+        #[arg(long, value_enum, default_value_t = ScopeArg::Default)]
+        scope: ScopeArg,
 
         /// Url to preheat.
         url: String,
     },
 
-    /// Deletes the preheated image from the seed peers.
+    /// Deletes the preheated image from all seed peers, all its platforms unless
+    /// the platform is given.
     DeleteImage {
         /// Scheduler endpoint.
         #[arg(long)]
         scheduler: String,
 
-        /// Seed peers to address, "default" or "all_seed_peers".
-        #[arg(long, default_value = SCOPE_DEFAULT)]
-        scope: String,
+        /// Platform of the image in the format "os/arch", all the platforms by
+        /// default.
+        #[arg(long)]
+        platform: Option<String>,
 
         /// Image reference, e.g., "docker.io/library/busybox:latest".
         image: String,
     },
 }
 
-/// The scope flag value addressing the replicas of the task, the same as the Go
-/// driver.
-const SCOPE_DEFAULT: &str = "default";
+/// The values of the scope flag, the same as the Go driver.
+#[derive(Clone, Copy, ValueEnum)]
+#[value(rename_all = "snake_case")]
+enum ScopeArg {
+    /// The replicas of the task.
+    Default,
 
-/// The scope flag value addressing all seed peers, the same as the Go driver.
-const SCOPE_ALL_SEED_PEERS: &str = "all_seed_peers";
-
-/// The JSON output of the lookup-endpoints command.
-#[derive(Serialize)]
-struct LookupEndpointsResponse {
-    /// The proxy endpoints of the seed peers serving the url.
-    endpoints: Vec<String>,
+    /// All seed peers.
+    AllSeedPeers,
 }
 
-/// The JSON output of the get command.
-#[derive(Serialize)]
-struct GetResponse {
-    /// The status code of the response.
-    status_code: u16,
-
-    /// The headers of the response, with lower case keys.
-    header: BTreeMap<String, String>,
+/// Converts the scope flag to the scope of the SDK.
+impl From<ScopeArg> for Scope {
+    fn from(scope: ScopeArg) -> Self {
+        match scope {
+            ScopeArg::Default => Scope::Default,
+            ScopeArg::AllSeedPeers => Scope::AllSeedPeers,
+        }
+    }
 }
 
 #[tokio::main]
@@ -190,39 +195,40 @@ async fn main() -> Result<()> {
             scheduler,
             scope,
             url,
-        } => preheat(scheduler, parse_scope(&scope)?, url).await,
+        } => preheat(scheduler, scope.into(), url).await,
         Command::PreheatImage {
             scheduler,
             scope,
+            platform,
             image,
-        } => preheat_image(scheduler, parse_scope(&scope)?, image).await,
+        } => preheat_image(scheduler, scope.into(), platform, image).await,
         Command::Delete {
             scheduler,
             scope,
             url,
-        } => delete(scheduler, parse_scope(&scope)?, url).await,
+        } => delete(scheduler, scope.into(), url).await,
         Command::DeleteImage {
             scheduler,
-            scope,
+            platform,
             image,
-        } => delete_image(scheduler, parse_scope(&scope)?, image).await,
+        } => delete_image(scheduler, platform, image).await,
     }
 }
 
 /// Looks up the proxy endpoints of the seed peers serving the url and prints
 /// them.
 async fn lookup_endpoints(scheduler_endpoint: String, url: String) -> Result<()> {
-    let proxy = new_proxy(scheduler_endpoint).await?;
+    let proxy = Proxy::builder()
+        .scheduler_endpoint(scheduler_endpoint)
+        .build()
+        .await?;
     let endpoints = proxy
         .lookup_endpoints(&GetRequest {
             url,
             ..Default::default()
         })
         .await?;
-    println!(
-        "{}",
-        serde_json::to_string(&LookupEndpointsResponse { endpoints })?
-    );
+    println!("{}", json!({ "endpoints": endpoints }));
 
     Ok(())
 }
@@ -237,14 +243,28 @@ async fn get(
     output: PathBuf,
     url: String,
 ) -> Result<()> {
+    let mut request_header = HeaderMap::with_capacity(header.len());
+    for value in &header {
+        let (key, val) = value
+            .split_once(':')
+            .ok_or_else(|| format!("invalid header {value:?}, expected \"Key: Value\""))?;
+        request_header.append(
+            HeaderName::from_bytes(key.trim().as_bytes())?,
+            HeaderValue::from_str(val.trim())?,
+        );
+    }
+
     let request = GetRequest {
         url,
-        header: parse_header(&header)?,
+        header: request_header,
         ..Default::default()
     };
 
     let response = if endpoints.is_empty() {
-        let proxy = new_proxy(scheduler_endpoint.ok_or("--scheduler is required")?).await?;
+        let proxy = Proxy::builder()
+            .scheduler_endpoint(scheduler_endpoint.ok_or("--scheduler is required")?)
+            .build()
+            .await?;
         proxy.get(&request).await?
     } else {
         let proxy_with_endpoints = ProxyWithEndpoints::builder()
@@ -261,15 +281,22 @@ async fn get(
     }
     file.flush().await?;
 
+    // Flatten the header to a map with lower case keys, the last value wins for
+    // duplicate keys, matching the Go driver.
+    let status_code = response.status_code.ok_or("missing response status code")?;
+    let header: BTreeMap<String, String> = response
+        .header
+        .iter()
+        .filter_map(|(key, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (key.as_str().to_string(), value.to_string()))
+        })
+        .collect();
     println!(
         "{}",
-        serde_json::to_string(&GetResponse {
-            status_code: response
-                .status_code
-                .ok_or("missing response status code")?
-                .as_u16(),
-            header: lower_header(&response.header),
-        })?
+        json!({ "status_code": status_code.as_u16(), "header": header })
     );
 
     Ok(())
@@ -277,7 +304,10 @@ async fn get(
 
 /// Preheats the url to the seed peers.
 async fn preheat(scheduler_endpoint: String, scope: Scope, url: String) -> Result<()> {
-    let proxy = new_proxy(scheduler_endpoint).await?;
+    let proxy = Proxy::builder()
+        .scheduler_endpoint(scheduler_endpoint)
+        .build()
+        .await?;
     proxy
         .preheat(&PreheatRequest {
             url,
@@ -289,12 +319,22 @@ async fn preheat(scheduler_endpoint: String, scope: Scope, url: String) -> Resul
     Ok(())
 }
 
-/// Preheats the image to the seed peers.
-async fn preheat_image(scheduler_endpoint: String, scope: Scope, image: String) -> Result<()> {
-    let proxy = new_proxy(scheduler_endpoint).await?;
+/// Preheats the image to the seed peers, all its platforms unless the platform
+/// is given.
+async fn preheat_image(
+    scheduler_endpoint: String,
+    scope: Scope,
+    platform: Option<String>,
+    image: String,
+) -> Result<()> {
+    let proxy = Proxy::builder()
+        .scheduler_endpoint(scheduler_endpoint)
+        .build()
+        .await?;
     proxy
         .preheat_image(&PreheatImageRequest {
             image,
+            platform,
             scope,
             ..Default::default()
         })
@@ -305,7 +345,10 @@ async fn preheat_image(scheduler_endpoint: String, scope: Scope, image: String) 
 
 /// Deletes the preheated url from the seed peers.
 async fn delete(scheduler_endpoint: String, scope: Scope, url: String) -> Result<()> {
-    let proxy = new_proxy(scheduler_endpoint).await?;
+    let proxy = Proxy::builder()
+        .scheduler_endpoint(scheduler_endpoint)
+        .build()
+        .await?;
     proxy
         .delete(&DeleteRequest {
             url,
@@ -317,66 +360,37 @@ async fn delete(scheduler_endpoint: String, scope: Scope, url: String) -> Result
     Ok(())
 }
 
-/// Deletes the preheated image from the seed peers.
-async fn delete_image(scheduler_endpoint: String, scope: Scope, image: String) -> Result<()> {
-    let proxy = new_proxy(scheduler_endpoint).await?;
-    proxy
+/// Deletes the preheated image from all seed peers, all its platforms unless the
+/// platform is given, and prints the tasks every seed peer deleted and retained.
+async fn delete_image(
+    scheduler_endpoint: String,
+    platform: Option<String>,
+    image: String,
+) -> Result<()> {
+    let proxy = Proxy::builder()
+        .scheduler_endpoint(scheduler_endpoint)
+        .build()
+        .await?;
+    let response = proxy
         .delete_image(&DeleteImageRequest {
             image,
-            scope,
+            platform,
             ..Default::default()
         })
         .await?;
+    let peers: Vec<_> = response
+        .peers
+        .iter()
+        .map(|peer| {
+            json!({
+                "ip": peer.ip,
+                "hostname": peer.hostname,
+                "deleted_task_ids": peer.deleted_task_ids,
+                "retained_task_ids": peer.retained_task_ids,
+            })
+        })
+        .collect();
+    println!("{}", json!({ "peers": peers }));
 
     Ok(())
-}
-
-/// Parses the scope flag.
-fn parse_scope(value: &str) -> Result<Scope> {
-    match value {
-        SCOPE_DEFAULT => Ok(Scope::Default),
-        SCOPE_ALL_SEED_PEERS => Ok(Scope::AllSeedPeers),
-        _ => Err(format!(
-            "invalid scope {value:?}, expected {SCOPE_DEFAULT:?} or {SCOPE_ALL_SEED_PEERS:?}"
-        )
-        .into()),
-    }
-}
-
-/// Creates a Proxy connected to the scheduler.
-async fn new_proxy(scheduler_endpoint: String) -> Result<Proxy> {
-    Ok(Proxy::builder()
-        .scheduler_endpoint(scheduler_endpoint)
-        .build()
-        .await?)
-}
-
-/// Parses the repeatable "Key: Value" header flags.
-fn parse_header(values: &[String]) -> Result<HeaderMap> {
-    let mut header = HeaderMap::with_capacity(values.len());
-    for value in values {
-        let (key, val) = value
-            .split_once(':')
-            .ok_or_else(|| format!("invalid header {value:?}, expected \"Key: Value\""))?;
-        header.append(
-            HeaderName::from_bytes(key.trim().as_bytes())?,
-            HeaderValue::from_str(val.trim())?,
-        );
-    }
-
-    Ok(header)
-}
-
-/// Flattens the header to a map with lower case keys, the last value wins for
-/// duplicate keys, matching the Go driver.
-fn lower_header(header: &HeaderMap) -> BTreeMap<String, String> {
-    header
-        .iter()
-        .filter_map(|(key, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|value| (key.as_str().to_string(), value.to_string()))
-        })
-        .collect()
 }

@@ -23,9 +23,9 @@
 //	driver lookup-endpoints --scheduler <endpoint> <url>
 //	driver get --scheduler <endpoint> [--endpoint <endpoint>]... [--header <key: value>]... --output <path> <url>
 //	driver preheat --scheduler <endpoint> [--scope <scope>] <url>
-//	driver preheat-image --scheduler <endpoint> [--scope <scope>] <image>
+//	driver preheat-image --scheduler <endpoint> [--scope <scope>] [--platform <platform>] <image>
 //	driver delete --scheduler <endpoint> [--scope <scope>] <url>
-//	driver delete-image --scheduler <endpoint> [--scope <scope>] <image>
+//	driver delete-image --scheduler <endpoint> [--platform <platform>] <image>
 package main
 
 import (
@@ -57,6 +57,28 @@ type getResponse struct {
 
 	// Header is the headers of the response, with lower case keys.
 	Header map[string]string `json:"header"`
+}
+
+// deleteImageResponse is the JSON output of the delete-image command.
+type deleteImageResponse struct {
+	// Peers is the seed peers the image is deleted from.
+	Peers []peerDeletedImage `json:"peers"`
+}
+
+// peerDeletedImage is a seed peer and the tasks of the image it has deleted and
+// retained.
+type peerDeletedImage struct {
+	// IP is the IP address of the seed peer.
+	IP string `json:"ip"`
+
+	// Hostname is the hostname of the seed peer.
+	Hostname string `json:"hostname"`
+
+	// DeletedTaskIDs is the ids of the deleted tasks.
+	DeletedTaskIDs []string `json:"deleted_task_ids"`
+
+	// RetainedTaskIDs is the ids of the retained tasks.
+	RetainedTaskIDs []string `json:"retained_task_ids"`
 }
 
 // stringSliceFlag collects the values of a repeatable flag.
@@ -159,9 +181,14 @@ func get(ctx context.Context, args []string) error {
 		return errors.New("--output is required")
 	}
 
-	h, err := parseHeader(header)
-	if err != nil {
-		return err
+	requestHeader := make(http.Header, len(header))
+	for _, value := range header {
+		key, val, ok := strings.Cut(value, ":")
+		if !ok {
+			return fmt.Errorf("invalid header %q, expected \"Key: Value\"", value)
+		}
+
+		requestHeader.Add(strings.TrimSpace(key), strings.TrimSpace(val))
 	}
 
 	var proxy request.RequestWithEndpoints
@@ -182,7 +209,7 @@ func get(ctx context.Context, args []string) error {
 		proxy = p
 	}
 
-	resp, err := proxy.Get(ctx, request.NewGetRequest(flags.Arg(0), request.WithGetRequestHeader(h)))
+	resp, err := proxy.Get(ctx, request.NewGetRequest(flags.Arg(0), request.WithGetRequestHeader(requestHeader)))
 	if err != nil {
 		return err
 	}
@@ -198,9 +225,16 @@ func get(ctx context.Context, args []string) error {
 		return err
 	}
 
+	// Flatten the header to a map with lower case keys, the last value wins for
+	// duplicate keys, matching the Rust driver.
+	responseHeader := make(map[string]string, len(resp.Header))
+	for key, values := range resp.Header {
+		responseHeader[strings.ToLower(key)] = values[len(values)-1]
+	}
+
 	return json.NewEncoder(os.Stdout).Encode(getResponse{
 		StatusCode: resp.StatusCode,
-		Header:     lowerHeader(resp.Header),
+		Header:     responseHeader,
 	})
 }
 
@@ -226,11 +260,13 @@ func preheat(ctx context.Context, args []string) error {
 	return proxy.Preheat(ctx, request.NewPreheatRequest(flags.Arg(0), request.WithPreheatRequestScope(request.Scope(*scope))))
 }
 
-// preheatImage preheats the image to the seed peers.
+// preheatImage preheats the image to the seed peers, all its platforms unless
+// the platform is given.
 func preheatImage(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("preheat-image", flag.ExitOnError)
 	schedulerEndpoint := flags.String("scheduler", "", "scheduler endpoint")
 	scope := flags.String("scope", string(request.ScopeDefault), "seed peers to address, default or all_seed_peers")
+	platform := flags.String("platform", "", "platform of the image in the format os/arch, all the platforms by default")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -245,7 +281,12 @@ func preheatImage(ctx context.Context, args []string) error {
 	}
 	defer proxy.Close()
 
-	return proxy.PreheatImage(ctx, request.NewPreheatImageRequest(flags.Arg(0), request.WithPreheatImageRequestScope(request.Scope(*scope))))
+	opts := []request.PreheatImageRequestOption{request.WithPreheatImageRequestScope(request.Scope(*scope))}
+	if *platform != "" {
+		opts = append(opts, request.WithPreheatImageRequestPlatform(*platform))
+	}
+
+	return proxy.PreheatImage(ctx, request.NewPreheatImageRequest(flags.Arg(0), opts...))
 }
 
 // delete deletes the preheated url from the seed peers.
@@ -270,11 +311,13 @@ func delete(ctx context.Context, args []string) error {
 	return proxy.Delete(ctx, request.NewDeleteRequest(flags.Arg(0), request.WithDeleteRequestScope(request.Scope(*scope))))
 }
 
-// deleteImage deletes the preheated image from the seed peers.
+// deleteImage deletes the preheated image from all seed peers, all its platforms
+// unless the platform is given, and prints the tasks every seed peer deleted
+// and retained.
 func deleteImage(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("delete-image", flag.ExitOnError)
 	schedulerEndpoint := flags.String("scheduler", "", "scheduler endpoint")
-	scope := flags.String("scope", string(request.ScopeDefault), "seed peers to address, default or all_seed_peers")
+	platform := flags.String("platform", "", "platform of the image in the format os/arch, all the platforms by default")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -289,31 +332,25 @@ func deleteImage(ctx context.Context, args []string) error {
 	}
 	defer proxy.Close()
 
-	return proxy.DeleteImage(ctx, request.NewDeleteImageRequest(flags.Arg(0), request.WithDeleteImageRequestScope(request.Scope(*scope))))
-}
-
-// parseHeader parses the repeatable "Key: Value" header flags.
-func parseHeader(values []string) (http.Header, error) {
-	header := make(http.Header, len(values))
-	for _, value := range values {
-		key, val, ok := strings.Cut(value, ":")
-		if !ok {
-			return nil, fmt.Errorf("invalid header %q, expected \"Key: Value\"", value)
-		}
-
-		header.Add(strings.TrimSpace(key), strings.TrimSpace(val))
+	var opts []request.DeleteImageRequestOption
+	if *platform != "" {
+		opts = append(opts, request.WithDeleteImageRequestPlatform(*platform))
 	}
 
-	return header, nil
-}
-
-// lowerHeader flattens the header to a map with lower case keys, the last
-// value wins for duplicate keys, matching the Rust driver.
-func lowerHeader(header http.Header) map[string]string {
-	m := make(map[string]string, len(header))
-	for key, values := range header {
-		m[strings.ToLower(key)] = values[len(values)-1]
+	resp, err := proxy.DeleteImage(ctx, request.NewDeleteImageRequest(flags.Arg(0), opts...))
+	if err != nil {
+		return err
 	}
 
-	return m
+	peers := make([]peerDeletedImage, 0, len(resp.Peers))
+	for _, peer := range resp.Peers {
+		peers = append(peers, peerDeletedImage{
+			IP:              peer.IP,
+			Hostname:        peer.Hostname,
+			DeletedTaskIDs:  append([]string{}, peer.DeletedTaskIDs...),
+			RetainedTaskIDs: append([]string{}, peer.RetainedTaskIDs...),
+		})
+	}
+
+	return json.NewEncoder(os.Stdout).Encode(deleteImageResponse{Peers: peers})
 }

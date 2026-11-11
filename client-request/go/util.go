@@ -18,15 +18,7 @@ package request
 
 import (
 	"net/http"
-	"slices"
 )
-
-// uniqueURLs sorts the urls and removes the duplicates, so a blob referenced
-// from several layers or platform manifests yields one task.
-func uniqueURLs(urls []string) []string {
-	slices.Sort(urls)
-	return slices.Compact(urls)
-}
 
 // headerToMap converts an http.Header to a map, the last value wins for
 // duplicate keys.

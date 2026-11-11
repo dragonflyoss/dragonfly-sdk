@@ -170,11 +170,13 @@ moving to another seed peer, and a seed peer answering its health check with
 The `preheat` feature enables preheating OCI images by resolving manifests from
 the registry and triggering seed peers to download each blob, querying the
 distribution of an OCI image with the layers cached by each seed peer, and
-deleting a preheated OCI image from the seed peers:
+deleting a preheated OCI image from the seed peers. An image is preheated for
+all its platforms unless a platform is set, and the seed peers record its tasks
+by the image and the platform:
 
 ```toml
 [dependencies]
-dragonfly-client-request = { version = "1.12.0", features = ["preheat"] }
+dragonfly-client-request = { version = "1.13.0", features = ["preheat"] }
 ```
 
 ```rust
@@ -194,10 +196,11 @@ let response = proxy
 ```
 
 Delete a preheated file or an OCI image from the seed peers, `delete_image`
-needing the `preheat` feature. The request should carry the parameters the
-preheat used, such as the replicas, the scope and the platform, so the delete
-addresses the same tasks and seed peers. A seed peer answering `NotFound` for a
-task counts as deleted:
+needing the `preheat` feature. A file delete should carry the parameters the
+preheat used, such as the replicas and the scope, so it addresses the same task
+and seed peers, and a seed peer answering `NotFound` counts as deleted. An image
+is deleted from all healthy seed peers, for all its platforms unless a platform
+is set, and a task still referenced by another image is retained:
 
 ```rust
 proxy
@@ -207,13 +210,28 @@ proxy
     })
     .await?;
 
-proxy
+let response = proxy
     .delete_image(&DeleteImageRequest {
         image: "docker.io/library/nginx:latest".to_string(),
         ..Default::default()
     })
     .await?;
+
+for peer in response.peers {
+    println!(
+        "peer {} ({}) deleted {} tasks and retained {} tasks",
+        peer.hostname,
+        peer.ip,
+        peer.deleted_task_ids.len(),
+        peer.retained_task_ids.len()
+    );
+}
 ```
+
+Since 1.13.0 a breaking change: `preheat_image` preheats all the platforms
+unless a platform is set, `delete_image` takes only the platform and the timeout
+and returns the tasks deleted and retained, and `PeerImage` is renamed to
+`PeerStatedImage`. The seed peers must run dfdaemon v1.5.12 or later.
 
 See [examples](./examples) for runnable examples.
 

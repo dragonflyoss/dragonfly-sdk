@@ -48,6 +48,7 @@ func (p *Proxy) StatImage(ctx context.Context, req *StatImageRequest) (*StatImag
 		PieceLength:                 req.pieceLength,
 		FilteredQueryParams:         req.filteredQueryParams,
 		Timeout:                     durationpb.New(req.timeout),
+		Platform:                    req.platform,
 		Scope:                       managertypes.AllSeedPeersScope,
 		EnableTaskIdBasedBlobDigest: req.enableTaskIDBasedBlobDigest,
 	}
@@ -68,10 +69,6 @@ func (p *Proxy) StatImage(ctx context.Context, req *StatImageRequest) (*StatImag
 		statImageRequest.Password = &req.password
 	}
 
-	if req.platform != "" {
-		statImageRequest.Platform = &req.platform
-	}
-
 	resp, err := p.scheduler.Client().StatImage(ctx, statImageRequest,
 		grpc.MaxCallRecvMsgSize(math.MaxInt32),
 		grpc.MaxCallSendMsgSize(math.MaxInt32),
@@ -89,7 +86,7 @@ func (p *Proxy) StatImage(ctx context.Context, req *StatImageRequest) (*StatImag
 		layers = append(layers, layer.GetUrl())
 	}
 
-	peers := make([]*PeerImage, 0, len(resp.GetPeers()))
+	peers := make([]*PeerStatedImage, 0, len(resp.GetPeers()))
 	for _, peer := range resp.GetPeers() {
 		cachedLayers := make([]*Layer, 0, len(peer.GetCachedLayers()))
 		for _, layer := range peer.GetCachedLayers() {
@@ -99,7 +96,7 @@ func (p *Proxy) StatImage(ctx context.Context, req *StatImageRequest) (*StatImag
 			})
 		}
 
-		peers = append(peers, &PeerImage{
+		peers = append(peers, &PeerStatedImage{
 			IP:           peer.GetIp(),
 			Hostname:     peer.GetHostname(),
 			CachedLayers: cachedLayers,

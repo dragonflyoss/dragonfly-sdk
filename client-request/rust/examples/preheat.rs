@@ -55,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .await?
         }
-        _ => {
+        "image" => {
             proxy
                 .preheat_image(&PreheatImageRequest {
                     image: args[3].clone(),
@@ -64,6 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .await?
         }
+        _ => unreachable!(),
     }
 
     Ok(())

@@ -575,9 +575,9 @@ dependencies = [
 
 [[package]]
 name = "dragonfly-api"
-version = "2.3.6"
+version = "2.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "857f8df2f06356c2486a67d9179e603d570aa2ce757c9b82cc9f028f73670a1d"
+checksum = "d135bdd4d856946953e4c2bd007d69a8f8841e53401bec8b4f48daf39b0515de"
 dependencies = [
  "prost",
  "prost-types",
@@ -591,7 +591,7 @@ dependencies = [
 
 [[package]]
 name = "dragonfly-client-request"
-version = "1.12.0"
+version = "1.13.0"
 dependencies = [
  "async-trait",
  "backon",
@@ -607,7 +607,6 @@ dependencies = [
  "local-ip-address",
  "mocktail",
  "oci-client",
- "oci-spec",
  "percent-encoding",
  "prost-wkt-types",
  "rand 0.9.5",

@@ -34,14 +34,15 @@ import (
 
 	managertypes "d7y.io/dragonfly/v2/manager/types"
 	"d7y.io/dragonfly/v2/pkg/idgen"
+	"github.com/containerd/platforms"
 	"golang.org/x/net/http/httpguts"
 )
 
 // defaultRequestTimeout is the default timeout for requests.
 const defaultRequestTimeout = 10 * 60 * time.Second
 
-// defaultConcurrentTaskCount is the default number of blobs to preheat or
-// delete concurrently.
+// defaultConcurrentTaskCount is the default number of blobs to preheat
+// concurrently.
 const defaultConcurrentTaskCount = 4
 
 // defaultReplicas is the default number of seed peers serving a task.
@@ -103,9 +104,9 @@ type Request interface {
 	// task's replicas are healthy than the replicas of the request.
 	Preheat(ctx context.Context, req *PreheatRequest) error
 
-	// PreheatImage preheats an OCI image: resolves its manifest, multi-platform
-	// indexes included, and has the seed peers download every config and layer
-	// blob without streaming them back.
+	// PreheatImage preheats an OCI image: resolves its manifests, all the
+	// platforms unless a platform is set, and has the seed peers download every
+	// manifest and blob, recorded by the image for DeleteImage.
 	PreheatImage(ctx context.Context, req *PreheatImageRequest) error
 
 	// StatImage reports which seed peers hold which layers of an OCI image, as
@@ -119,11 +120,11 @@ type Request interface {
 	// deleted.
 	Delete(ctx context.Context, req *DeleteRequest) error
 
-	// DeleteImage deletes a preheated OCI image: resolves its manifest,
-	// multi-platform indexes included, and has the replica seed peers delete
-	// every manifest, config and layer blob task. A seed peer answering NotFound
-	// counts as deleted.
-	DeleteImage(ctx context.Context, req *DeleteImageRequest) error
+	// DeleteImage deletes a preheated OCI image: has every healthy seed peer
+	// delete its tasks, all the platforms unless a platform is set, retaining
+	// the tasks other images or platforms reference. It returns the tasks
+	// deleted and retained.
+	DeleteImage(ctx context.Context, req *DeleteImageRequest) (*DeleteImageResponse, error)
 
 	// LookupEndpoints returns the proxy endpoints of the seed peers that would
 	// serve the request, in consistent hash ring order for its task id, up to
@@ -613,8 +614,9 @@ type PreheatImageRequest struct {
 	// password is the password for registry authentication.
 	password string
 
-	// platform specifies the target platform in the format "os/arch".
-	platform string
+	// platform specifies the target platform in the format "os/arch", all the
+	// platforms of the image if it is nil.
+	platform *string
 
 	// pieceLength is the task piece length.
 	pieceLength *uint64
@@ -669,9 +671,10 @@ func WithPreheatImageRequestAuth(username, password string) PreheatImageRequestO
 
 // WithPreheatImageRequestPlatform sets the target platform in the format "os/arch"
 // (e.g., "linux/amd64", "linux/arm64"). This is used to select the correct
-// manifest from a multi-platform image index, default is current platform.
+// manifest from a multi-platform image index, default is all the platforms of
+// the image.
 func WithPreheatImageRequestPlatform(platform string) PreheatImageRequestOption {
-	return func(r *PreheatImageRequest) { r.platform = platform }
+	return func(r *PreheatImageRequest) { r.platform = &platform }
 }
 
 // WithPreheatImageRequestPieceLength sets the task piece length.
@@ -777,6 +780,12 @@ func (r *PreheatImageRequest) validate() error {
 		return fmt.Errorf("%w: concurrent task count must be positive", ErrInvalidArgument)
 	}
 
+	if r.platform != nil {
+		if _, err := platforms.Parse(*r.platform); err != nil {
+			return fmt.Errorf("%w: invalid platform format %q, expected \"os/arch\" (e.g., \"linux/amd64\"): %v", ErrInvalidArgument, *r.platform, err)
+		}
+	}
+
 	return nil
 }
 
@@ -793,8 +802,9 @@ type StatImageRequest struct {
 	// password is the password for registry authentication.
 	password string
 
-	// platform specifies the target platform in the format "os/arch".
-	platform string
+	// platform specifies the target platform in the format "os/arch", all the
+	// platforms of the image if it is nil.
+	platform *string
 
 	// pieceLength is the task piece length.
 	pieceLength *uint64
@@ -832,11 +842,11 @@ func WithStatImageRequestAuth(username, password string) StatImageRequestOption 
 
 // WithStatImageRequestPlatform sets the target platform in the format "os/arch"
 // (e.g., "linux/amd64", "linux/arm64"). This is used by the scheduler to select the
-// correct manifest from a multi-platform image index, default is the scheduler's
-// platform. It should be consistent with the platform used when the image was
-// preheated, otherwise the layers can not be found on the peers.
+// correct manifest from a multi-platform image index, default is all the
+// platforms of the image. It should be consistent with the platform used when
+// the image was preheated, otherwise the layers can not be found on the peers.
 func WithStatImageRequestPlatform(platform string) StatImageRequestOption {
-	return func(r *StatImageRequest) { r.platform = platform }
+	return func(r *StatImageRequest) { r.platform = &platform }
 }
 
 // WithStatImageRequestPieceLength sets the task piece length.
@@ -897,11 +907,11 @@ type StatImageResponse struct {
 	Layers []string
 
 	// Peers is the peers that have cached layers of the image.
-	Peers []*PeerImage
+	Peers []*PeerStatedImage
 }
 
-// PeerImage represents a peer and the image layers it has cached.
-type PeerImage struct {
+// PeerStatedImage represents a peer and the image layers it has cached.
+type PeerStatedImage struct {
 	// IP is the IP address of the peer.
 	IP string
 
@@ -1046,147 +1056,42 @@ func (r *DeleteRequest) validate() error {
 }
 
 // DeleteImageRequest represents a request to delete a preheated OCI image from
-// the Dragonfly seed peers. The delete removes the manifests and blobs (config
-// and layers) of the specified image from the seed peers serving them.
-// Construct it with NewDeleteImageRequest and set the optional parameters with
-// DeleteImageRequestOption.
+// the Dragonfly seed peers. Construct it with NewDeleteImageRequest and set the
+// optional parameters with DeleteImageRequestOption.
 type DeleteImageRequest struct {
 	// image is the OCI image reference (e.g., "docker.io/library/nginx:latest").
 	image string
 
-	// username is the username for registry authentication.
-	username string
+	// platform specifies the target platform in the format "os/arch", all the
+	// platforms of the image if it is nil.
+	platform *string
 
-	// password is the password for registry authentication.
-	password string
-
-	// platform specifies the target platform in the format "os/arch".
-	platform string
-
-	// pieceLength is the task piece length.
-	pieceLength *uint64
-
-	// tag identifies different tasks for the same url.
-	tag string
-
-	// application identifies different tasks for the same url.
-	application string
-
-	// filteredQueryParams is the filtered query params to generate the task id.
-	filteredQueryParams []string
-
-	// contentForCalculatingTaskID is the content for calculating the task id.
-	contentForCalculatingTaskID string
-
-	// enableTaskIDBasedBlobDigest indicates whether to use the blob digest for
-	// task id calculation when the url is an OCI blob url.
-	enableTaskIDBasedBlobDigest bool
-
-	// replicas is the number of seed peers serving each task.
-	replicas int
-
-	// scope is the seed peers to delete each task from.
-	scope Scope
-
-	// timeout is the timeout of each attempt of a task delete.
+	// timeout is the timeout of each attempt of an image delete.
 	timeout time.Duration
-
-	// concurrentTaskCount is the number of blobs to delete concurrently.
-	concurrentTaskCount int
 }
 
 // DeleteImageRequestOption configures the DeleteImageRequest.
 type DeleteImageRequestOption func(r *DeleteImageRequest)
 
-// WithDeleteImageRequestAuth sets the username and password for registry
-// authentication. If not provided, anonymous access is used.
-func WithDeleteImageRequestAuth(username, password string) DeleteImageRequestOption {
-	return func(r *DeleteImageRequest) {
-		r.username = username
-		r.password = password
-	}
-}
-
 // WithDeleteImageRequestPlatform sets the target platform in the format "os/arch"
-// (e.g., "linux/amd64", "linux/arm64"). It should be consistent with the platform
-// used when the image was preheated, default is current platform.
+// (e.g., "linux/amd64", "linux/arm64"). Only the tasks of the platform are
+// deleted, default is all the platforms of the image.
 func WithDeleteImageRequestPlatform(platform string) DeleteImageRequestOption {
-	return func(r *DeleteImageRequest) { r.platform = platform }
+	return func(r *DeleteImageRequest) { r.platform = &platform }
 }
 
-// WithDeleteImageRequestPieceLength sets the task piece length.
-func WithDeleteImageRequestPieceLength(pieceLength uint64) DeleteImageRequestOption {
-	return func(r *DeleteImageRequest) { r.pieceLength = &pieceLength }
-}
-
-// WithDeleteImageRequestTag sets the tag that identifies different tasks for the
-// same url.
-func WithDeleteImageRequestTag(tag string) DeleteImageRequestOption {
-	return func(r *DeleteImageRequest) { r.tag = tag }
-}
-
-// WithDeleteImageRequestApplication sets the application that identifies different
-// tasks for the same url.
-func WithDeleteImageRequestApplication(application string) DeleteImageRequestOption {
-	return func(r *DeleteImageRequest) { r.application = application }
-}
-
-// WithDeleteImageRequestFilteredQueryParams sets the filtered query params to
-// generate the task id.
-func WithDeleteImageRequestFilteredQueryParams(params []string) DeleteImageRequestOption {
-	return func(r *DeleteImageRequest) { r.filteredQueryParams = params }
-}
-
-// WithDeleteImageRequestContentForCalculatingTaskID sets the content for calculating
-// the task id.
-func WithDeleteImageRequestContentForCalculatingTaskID(content string) DeleteImageRequestOption {
-	return func(r *DeleteImageRequest) { r.contentForCalculatingTaskID = content }
-}
-
-// WithDeleteImageRequestEnableTaskIDBasedBlobDigest sets whether to use the blob
-// digest for task id calculation when the url is an OCI blob url. It should be
-// consistent with the value used when the image was preheated, default is true.
-func WithDeleteImageRequestEnableTaskIDBasedBlobDigest(enable bool) DeleteImageRequestOption {
-	return func(r *DeleteImageRequest) { r.enableTaskIDBasedBlobDigest = enable }
-}
-
-// WithDeleteImageRequestReplicas sets the number of seed peers serving each
-// task, consistent with the replicas used when the image was preheated, default
-// is 2.
-func WithDeleteImageRequestReplicas(replicas int) DeleteImageRequestOption {
-	return func(r *DeleteImageRequest) { r.replicas = replicas }
-}
-
-// WithDeleteImageRequestScope sets the seed peers to delete each task from,
-// consistent with the scope used when the image was preheated, default is
-// ScopeDefault.
-func WithDeleteImageRequestScope(scope Scope) DeleteImageRequestOption {
-	return func(r *DeleteImageRequest) { r.scope = scope }
-}
-
-// WithDeleteImageRequestTimeout sets the timeout of each attempt of a task
+// WithDeleteImageRequestTimeout sets the timeout of each attempt of an image
 // delete.
 func WithDeleteImageRequestTimeout(timeout time.Duration) DeleteImageRequestOption {
 	return func(r *DeleteImageRequest) { r.timeout = timeout }
-}
-
-// WithDeleteImageRequestConcurrentTaskCount sets the number of blobs to delete
-// concurrently, default is 4.
-func WithDeleteImageRequestConcurrentTaskCount(count int) DeleteImageRequestOption {
-	return func(r *DeleteImageRequest) { r.concurrentTaskCount = count }
 }
 
 // NewDeleteImageRequest returns a DeleteImageRequest for the image with default
 // values.
 func NewDeleteImageRequest(image string, opts ...DeleteImageRequestOption) *DeleteImageRequest {
 	r := &DeleteImageRequest{
-		image:                       image,
-		filteredQueryParams:         idgen.DefaultFilteredQueryParams,
-		enableTaskIDBasedBlobDigest: true,
-		replicas:                    defaultReplicas,
-		scope:                       ScopeDefault,
-		timeout:                     defaultRequestTimeout,
-		concurrentTaskCount:         defaultConcurrentTaskCount,
+		image:   image,
+		timeout: defaultRequestTimeout,
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -1197,17 +1102,35 @@ func NewDeleteImageRequest(image string, opts ...DeleteImageRequestOption) *Dele
 
 // validate validates the request parameters.
 func (r *DeleteImageRequest) validate() error {
-	if r.replicas <= 0 {
-		return fmt.Errorf("%w: replicas must be positive", ErrInvalidArgument)
-	}
-
-	if err := r.scope.validate(); err != nil {
-		return err
-	}
-
-	if r.concurrentTaskCount <= 0 {
-		return fmt.Errorf("%w: concurrent task count must be positive", ErrInvalidArgument)
+	if r.platform != nil {
+		if _, err := platforms.Parse(*r.platform); err != nil {
+			return fmt.Errorf("%w: invalid platform format %q, expected \"os/arch\" (e.g., \"linux/amd64\"): %v", ErrInvalidArgument, *r.platform, err)
+		}
 	}
 
 	return nil
+}
+
+// DeleteImageResponse represents the tasks of an OCI image deleted from and
+// retained by the seed peers.
+type DeleteImageResponse struct {
+	// Peers is the seed peers the image is deleted from.
+	Peers []*PeerDeletedImage
+}
+
+// PeerDeletedImage represents a seed peer and the tasks of the image it has
+// deleted and retained.
+type PeerDeletedImage struct {
+	// IP is the IP address of the seed peer.
+	IP string
+
+	// Hostname is the hostname of the seed peer.
+	Hostname string
+
+	// DeletedTaskIDs is the ids of the deleted tasks.
+	DeletedTaskIDs []string
+
+	// RetainedTaskIDs is the ids of the tasks retained for other images or
+	// platforms.
+	RetainedTaskIDs []string
 }

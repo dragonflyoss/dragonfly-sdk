@@ -15,8 +15,9 @@
  */
 
 // Command delete deletes a preheated file or an OCI image from the seed peers
-// via the Dragonfly, from the replicas of the task by default or from all seed
-// peers with the all_seed_peers scope.
+// via the Dragonfly. A file is deleted from the replicas of the task by default
+// or from all seed peers with the all_seed_peers scope, an image is deleted
+// from all healthy seed peers.
 package main
 
 import (
@@ -35,7 +36,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Address the replicas of the task unless the scope is given.
+	// Address the replicas of the task unless the scope is given, the scope only
+	// applies to a file.
 	scope := request.ScopeDefault
 	if len(os.Args) == 5 {
 		scope = request.Scope(os.Args[4])
@@ -55,7 +57,13 @@ func main() {
 	case "file":
 		err = proxy.Delete(ctx, request.NewDeleteRequest(os.Args[3], request.WithDeleteRequestScope(scope)))
 	case "image":
-		err = proxy.DeleteImage(ctx, request.NewDeleteImageRequest(os.Args[3], request.WithDeleteImageRequestScope(scope)))
+		var resp *request.DeleteImageResponse
+		resp, err = proxy.DeleteImage(ctx, request.NewDeleteImageRequest(os.Args[3]))
+		if err == nil {
+			for _, peer := range resp.Peers {
+				fmt.Printf("peer %s (%s) deleted %d tasks and retained %d tasks\n", peer.Hostname, peer.IP, len(peer.DeletedTaskIDs), len(peer.RetainedTaskIDs))
+			}
+		}
 	}
 
 	if err != nil {

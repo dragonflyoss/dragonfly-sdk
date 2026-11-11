@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net/http"
 	"os/exec"
+	"slices"
 )
 
 const (
@@ -68,6 +69,57 @@ type GetResponse struct {
 	Header map[string]string `json:"header"`
 }
 
+// DeleteImageResponse is the output of the delete-image command of the drivers.
+type DeleteImageResponse struct {
+	// Peers is the seed peers the image is deleted from.
+	Peers []*PeerDeletedImage `json:"peers"`
+}
+
+// PeerDeletedImage is a seed peer and the tasks of the image it has deleted and
+// retained.
+type PeerDeletedImage struct {
+	// IP is the IP address of the seed peer.
+	IP string `json:"ip"`
+
+	// Hostname is the hostname of the seed peer.
+	Hostname string `json:"hostname"`
+
+	// DeletedTaskIDs is the ids of the deleted tasks.
+	DeletedTaskIDs []string `json:"deleted_task_ids"`
+
+	// RetainedTaskIDs is the ids of the retained tasks.
+	RetainedTaskIDs []string `json:"retained_task_ids"`
+}
+
+// GetDeletedTaskIDs returns the distinct ids of the tasks the seed peers deleted.
+func (r *DeleteImageResponse) GetDeletedTaskIDs() []string {
+	var taskIDs []string
+	for _, peer := range r.Peers {
+		for _, taskID := range peer.DeletedTaskIDs {
+			if !slices.Contains(taskIDs, taskID) {
+				taskIDs = append(taskIDs, taskID)
+			}
+		}
+	}
+
+	return taskIDs
+}
+
+// GetRetainedTaskIDs returns the distinct ids of the tasks the seed peers
+// retained.
+func (r *DeleteImageResponse) GetRetainedTaskIDs() []string {
+	var taskIDs []string
+	for _, peer := range r.Peers {
+		for _, taskID := range peer.RetainedTaskIDs {
+			if !slices.Contains(taskIDs, taskID) {
+				taskIDs = append(taskIDs, taskID)
+			}
+		}
+	}
+
+	return taskIDs
+}
+
 // LookupEndpoints looks up the proxy endpoints of the seed peers serving the
 // url through the SDK.
 func (s *SDK) LookupEndpoints(url string) ([]string, error) {
@@ -88,7 +140,11 @@ func (s *SDK) Get(url, output string, endpoints []string, header http.Header) (*
 	for _, endpoint := range endpoints {
 		args = append(args, "--endpoint", endpoint)
 	}
-	args = append(args, headerArgs(header)...)
+	for key, values := range header {
+		for _, value := range values {
+			args = append(args, "--header", fmt.Sprintf("%s: %s", key, value))
+		}
+	}
 	args = append(args, url)
 
 	var resp GetResponse
@@ -102,36 +158,55 @@ func (s *SDK) Get(url, output string, endpoints []string, header http.Header) (*
 // Preheat preheats the url to the seed peers through the SDK, to the default
 // replicas or to the scope when given.
 func (s *SDK) Preheat(url, scope string) error {
-	return s.run(nil, append(scopeArgs("preheat", scope), url)...)
+	args := []string{"preheat", "--scheduler", SchedulerEndpoint}
+	if scope != "" {
+		args = append(args, "--scope", scope)
+	}
+
+	return s.run(nil, append(args, url)...)
 }
 
 // PreheatImage preheats the image to the seed peers through the SDK, to the
-// default replicas or to the scope when given.
-func (s *SDK) PreheatImage(image, scope string) error {
-	return s.run(nil, append(scopeArgs("preheat-image", scope), image)...)
+// default replicas or to the scope when given, for all the platforms of the
+// image or for the platform when given.
+func (s *SDK) PreheatImage(image, scope, platform string) error {
+	args := []string{"preheat-image", "--scheduler", SchedulerEndpoint}
+	if scope != "" {
+		args = append(args, "--scope", scope)
+	}
+
+	if platform != "" {
+		args = append(args, "--platform", platform)
+	}
+
+	return s.run(nil, append(args, image)...)
 }
 
 // Delete deletes the preheated url from the seed peers through the SDK, from
 // the default replicas or from the scope when given.
 func (s *SDK) Delete(url, scope string) error {
-	return s.run(nil, append(scopeArgs("delete", scope), url)...)
-}
-
-// DeleteImage deletes the preheated image from the seed peers through the SDK,
-// from the default replicas or from the scope when given.
-func (s *SDK) DeleteImage(image, scope string) error {
-	return s.run(nil, append(scopeArgs("delete-image", scope), image)...)
-}
-
-// scopeArgs returns the arguments of the command with the scheduler and the
-// scope flag when given.
-func scopeArgs(command, scope string) []string {
-	args := []string{command, "--scheduler", SchedulerEndpoint}
+	args := []string{"delete", "--scheduler", SchedulerEndpoint}
 	if scope != "" {
 		args = append(args, "--scope", scope)
 	}
 
-	return args
+	return s.run(nil, append(args, url)...)
+}
+
+// DeleteImage deletes the preheated image from all seed peers through the SDK,
+// for all the platforms of the image or for the platform when given.
+func (s *SDK) DeleteImage(image, platform string) (*DeleteImageResponse, error) {
+	args := []string{"delete-image", "--scheduler", SchedulerEndpoint}
+	if platform != "" {
+		args = append(args, "--platform", platform)
+	}
+
+	var resp DeleteImageResponse
+	if err := s.run(&resp, append(args, image)...); err != nil {
+		return nil, err
+	}
+
+	return &resp, nil
 }
 
 // run runs the driver in the runner pod and decodes its JSON output into out
@@ -158,16 +233,4 @@ func (s *SDK) run(out any, args ...string) error {
 	}
 
 	return nil
-}
-
-// headerArgs converts the header to the repeated `--header "Key: Value"` args.
-func headerArgs(header http.Header) []string {
-	var args []string
-	for key, values := range header {
-		for _, value := range values {
-			args = append(args, "--header", fmt.Sprintf("%s: %s", key, value))
-		}
-	}
-
-	return args
 }

@@ -4,13 +4,13 @@ go 1.25.0
 
 require (
 	d7y.io/dragonfly-sdk/client-request/go v0.0.0
-	d7y.io/dragonfly/v2 v2.5.3
+	d7y.io/dragonfly/v2 v2.5.4-rc.0
 	github.com/onsi/ginkgo/v2 v2.34.0
 	github.com/onsi/gomega v1.43.1
 )
 
 require (
-	d7y.io/api/v2 v2.3.8 // indirect
+	d7y.io/api/v2 v2.3.10 // indirect
 	d7y.io/hashring v0.3.0 // indirect
 	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/Masterminds/semver/v3 v3.4.0 // indirect
@@ -92,7 +92,7 @@ require (
 	golang.org/x/text v0.41.0 // indirect
 	golang.org/x/tools v0.48.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260819154853-08b0e4226688 // indirect
-	google.golang.org/grpc v1.83.1 // indirect
+	google.golang.org/grpc v1.84.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect

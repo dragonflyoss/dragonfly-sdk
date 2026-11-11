@@ -83,7 +83,7 @@ func TestPreheatAllSeedPeers(t *testing.T) {
 	preheated := make(map[string]bool)
 	var hosts []*commonv2.Host
 	for _, name := range []string{"seed-peer-1", "seed-peer-2", "seed-peer-3"} {
-		port := setupMockSeedPeerServer(t, &mockSeedPeer{onDownload: func() {
+		port := setupMockSeedPeerServer(t, &mockSeedPeer{onDownloadTask: func() {
 			mu.Lock()
 			preheated[name] = true
 			mu.Unlock()
@@ -138,10 +138,10 @@ func TestPreheatRetriesOnTheSameSeedPeer(t *testing.T) {
 
 	var failingHits, healthyHits atomic.Int32
 	failingPort := setupMockSeedPeerServer(t, &mockSeedPeer{
-		downloadErr: status.Error(codes.Unavailable, "seed peer is busy"),
-		onDownload:  func() { failingHits.Add(1) },
+		downloadTaskErr: status.Error(codes.Unavailable, "seed peer is busy"),
+		onDownloadTask:  func() { failingHits.Add(1) },
 	})
-	healthyPort := setupMockSeedPeerServer(t, &mockSeedPeer{onDownload: func() { healthyHits.Add(1) }})
+	healthyPort := setupMockSeedPeerServer(t, &mockSeedPeer{onDownloadTask: func() { healthyHits.Add(1) }})
 	endpoint := setupMockScheduler(t, []*commonv2.Host{
 		createSeedPeerHost("seed-peer-1", failingPort, 0),
 		createSeedPeerHost("seed-peer-2", healthyPort, 0),
@@ -230,8 +230,8 @@ func TestPreheatRetriesOnlyTransientDownloadFailures(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var hits atomic.Int32
 			port := setupMockSeedPeerServer(t, &mockSeedPeer{
-				downloadErr: status.Error(tc.code, "download failed"),
-				onDownload:  func() { hits.Add(1) },
+				downloadTaskErr: status.Error(tc.code, "download failed"),
+				onDownloadTask:  func() { hits.Add(1) },
 			})
 			endpoint := setupMockScheduler(t, []*commonv2.Host{createSeedPeerHost("seed-peer-1", port, 0)})
 
@@ -269,7 +269,8 @@ func TestPreheatImageInvalidPlatform(t *testing.T) {
 
 	req := NewPreheatImageRequest("docker.io/library/nginx:latest", WithPreheatImageRequestPlatform("linux-amd64"))
 	err = proxy.PreheatImage(context.Background(), req)
-	assert.Error(err)
+	assert.ErrorIs(err, ErrInvalidArgument)
+	assert.ErrorContains(err, "invalid platform format")
 }
 
 func TestPreheatImageUnreachableRegistry(t *testing.T) {
@@ -297,7 +298,7 @@ func TestPreheatAndGetHitSameSeedPeers(t *testing.T) {
 
 	var hosts []*commonv2.Host
 	for _, name := range []string{"seed-peer-1", "seed-peer-2", "seed-peer-3"} {
-		port := setupMockSeedPeerServer(t, &mockSeedPeer{onDownload: func() {
+		port := setupMockSeedPeerServer(t, &mockSeedPeer{onDownloadTask: func() {
 			mu.Lock()
 			preheated[name] = true
 			mu.Unlock()

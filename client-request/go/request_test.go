@@ -77,19 +77,20 @@ func setupMockSchedulerServer(t testing.TB, scheduler *mockScheduler) string {
 
 type mockSeedPeer struct {
 	dfdaemonv2.UnimplementedDfdaemonUploadServer
-	downloadErr error
-	onDownload  func()
-	deleteErr   error
-	onDelete    func()
+	downloadTaskErr error
+	onDownloadTask  func()
+	deleteTaskErr   error
+	onDeleteTask    func()
+	deleteImage     func(*dfdaemonv2.DeleteImageRequest) (*dfdaemonv2.DeleteImageResponse, error)
 }
 
 func (s *mockSeedPeer) DownloadTask(req *dfdaemonv2.DownloadTaskRequest, stream dfdaemonv2.DfdaemonUpload_DownloadTaskServer) error {
-	if s.onDownload != nil {
-		s.onDownload()
+	if s.onDownloadTask != nil {
+		s.onDownloadTask()
 	}
 
-	if s.downloadErr != nil {
-		return s.downloadErr
+	if s.downloadTaskErr != nil {
+		return s.downloadTaskErr
 	}
 
 	for range 2 {
@@ -106,19 +107,27 @@ func (s *mockSeedPeer) DownloadTask(req *dfdaemonv2.DownloadTaskRequest, stream 
 }
 
 func (s *mockSeedPeer) DeleteTask(ctx context.Context, req *dfdaemonv2.DeleteTaskRequest) (*emptypb.Empty, error) {
-	if s.onDelete != nil {
-		s.onDelete()
+	if s.onDeleteTask != nil {
+		s.onDeleteTask()
 	}
 
-	if s.deleteErr != nil {
-		return nil, s.deleteErr
+	if s.deleteTaskErr != nil {
+		return nil, s.deleteTaskErr
 	}
 
 	return &emptypb.Empty{}, nil
 }
 
-func setupMockSeedPeer(t testing.TB, downloadErr error) int32 {
-	return setupMockSeedPeerServer(t, &mockSeedPeer{downloadErr: downloadErr})
+func (s *mockSeedPeer) DeleteImage(ctx context.Context, req *dfdaemonv2.DeleteImageRequest) (*dfdaemonv2.DeleteImageResponse, error) {
+	if s.deleteImage != nil {
+		return s.deleteImage(req)
+	}
+
+	return s.UnimplementedDfdaemonUploadServer.DeleteImage(ctx, req)
+}
+
+func setupMockSeedPeer(t testing.TB, downloadTaskErr error) int32 {
+	return setupMockSeedPeerServer(t, &mockSeedPeer{downloadTaskErr: downloadTaskErr})
 }
 
 func setupMockSeedPeerServer(t testing.TB, peer *mockSeedPeer) int32 {
@@ -199,11 +208,13 @@ func TestNewRequestDefaults(t *testing.T) {
 	assert.Equal(defaultRequestTimeout, preheat.timeout)
 
 	image := NewPreheatImageRequest("docker.io/library/nginx:latest")
+	assert.Nil(image.platform)
 	assert.Equal(2, image.replicas)
 	assert.Equal(4, image.concurrentTaskCount)
 	assert.Equal(defaultRequestTimeout, image.timeout)
 
 	stat := NewStatImageRequest("docker.io/library/nginx:latest")
+	assert.Nil(stat.platform)
 	assert.NotEmpty(stat.filteredQueryParams)
 	assert.True(stat.enableTaskIDBasedBlobDigest)
 	assert.Equal(defaultRequestTimeout, stat.timeout)
@@ -215,10 +226,7 @@ func TestNewRequestDefaults(t *testing.T) {
 	assert.Equal(defaultRequestTimeout, del.timeout)
 
 	deleteImage := NewDeleteImageRequest("docker.io/library/nginx:latest")
-	assert.NotEmpty(deleteImage.filteredQueryParams)
-	assert.True(deleteImage.enableTaskIDBasedBlobDigest)
-	assert.Equal(2, deleteImage.replicas)
-	assert.Equal(4, deleteImage.concurrentTaskCount)
+	assert.Nil(deleteImage.platform)
 	assert.Equal(defaultRequestTimeout, deleteImage.timeout)
 }
 

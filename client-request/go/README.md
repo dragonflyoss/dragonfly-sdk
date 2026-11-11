@@ -81,7 +81,9 @@ proxy, err := request.New(ctx, "http://127.0.0.1:8002",
 )
 ```
 
-Preheat a file or an OCI image to the seed peers:
+Preheat a file or an OCI image to the seed peers. An image is preheated for all
+its platforms unless a platform is set, and the seed peers record its tasks by
+the image and the platform:
 
 ```go
 if err := proxy.Preheat(ctx, request.NewPreheatRequest("https://example.com/file.txt")); err != nil {
@@ -108,20 +110,32 @@ for _, peer := range resp.Peers {
 }
 ```
 
-Delete a preheated file or an OCI image from the seed peers. The request
-should carry the parameters the preheat used, such as the replicas, the scope
-and the platform, so the delete addresses the same tasks and seed peers. A seed
-peer answering `NotFound` for a task counts as deleted:
+Delete a preheated file or an OCI image from the seed peers. A file delete
+should carry the parameters the preheat used, such as the replicas and the
+scope, so it addresses the same task and seed peers, and a seed peer answering
+`NotFound` counts as deleted. An image is deleted from all healthy seed peers,
+for all its platforms unless a platform is set, and a task still referenced by
+another image is retained:
 
 ```go
 if err := proxy.Delete(ctx, request.NewDeleteRequest("https://example.com/file.txt")); err != nil {
     panic(err)
 }
 
-if err := proxy.DeleteImage(ctx, request.NewDeleteImageRequest("docker.io/library/nginx:latest")); err != nil {
+resp, err := proxy.DeleteImage(ctx, request.NewDeleteImageRequest("docker.io/library/nginx:latest"))
+if err != nil {
     panic(err)
 }
+
+for _, peer := range resp.Peers {
+    fmt.Printf("peer %s (%s) deleted %d tasks and retained %d tasks\n", peer.Hostname, peer.IP, len(peer.DeletedTaskIDs), len(peer.RetainedTaskIDs))
+}
 ```
+
+Since 1.13.0 a breaking change: `PreheatImage` preheats all the platforms unless
+a platform is set, `DeleteImage` takes only the platform and the timeout and
+returns the tasks deleted and retained, and `PeerImage` is renamed to
+`PeerStatedImage`. The seed peers must run dfdaemon v1.5.12 or later.
 
 Preheat with multiple replicas and scatter downloads across them. Preheating
 writes the file to the given number of distinct seed peers, and downloading
