@@ -82,8 +82,7 @@ proxy, err := request.New(ctx, "http://127.0.0.1:8002",
 ```
 
 Preheat a file or an OCI image to the seed peers. An image is preheated for all
-its platforms unless a platform is set, and the seed peers record its tasks by
-the image and the platform:
+its platforms unless a platform is set:
 
 ```go
 if err := proxy.Preheat(ctx, request.NewPreheatRequest("https://example.com/file.txt")); err != nil {
@@ -114,9 +113,8 @@ Delete a preheated file or an OCI image from the seed peers. A file delete
 should carry the parameters the preheat used, such as the replicas and the
 scope, so it addresses the same task and seed peers, and a seed peer answering
 `NotFound` counts as deleted. An image is deleted from all healthy seed peers,
-for all its platforms unless a platform is set, a task still referenced by
-another image or platform is retained, and a seed peer that fails is left out
-of the response:
+for all its platforms unless a platform is set, and a task still referenced by
+another image or platform is retained:
 
 ```go
 if err := proxy.Delete(ctx, request.NewDeleteRequest("https://example.com/file.txt")); err != nil {
@@ -132,12 +130,6 @@ for _, peer := range resp.Peers {
     fmt.Printf("peer %s (%s) deleted %d tasks and retained %d tasks\n", peer.Hostname, peer.IP, len(peer.DeletedTaskIDs), len(peer.RetainedTaskIDs))
 }
 ```
-
-Since 1.13.0 a breaking change: `PreheatImage` preheats all the platforms unless
-a platform is set, `StatImage` resolves the image itself and asks the seed peers
-instead of the scheduler, `DeleteImage` no longer takes the options of the
-preheat and returns the tasks deleted and retained, and `PeerImage` is renamed
-to `PeerStatedImage`. The seed peers must run dfdaemon v1.5.12 or later.
 
 Preheat with multiple replicas and scatter downloads across them. Preheating
 writes the file to the given number of distinct seed peers, and downloading
@@ -240,11 +232,6 @@ if err != nil {
 }
 proxy.UpdateSeedPeers(seedPeers)
 ```
-
-Since 1.11.0 a proxy created with the scheduler endpoint selects the same way, a
-breaking change: a task whose replicas are all unhealthy fails rather than
-moving to another seed peer, and a seed peer answering its health check with
-`NOT_SERVING` counts as unhealthy.
 
 See [examples](./examples) for runnable examples.
 

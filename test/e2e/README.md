@@ -19,18 +19,6 @@ the task, or the manifest and any blob, afterwards. With the all seed peers
 scope, they check a preheat lands the task on every seed peer and a delete
 removes it from every one of them.
 
-For a multi-platform image, they check a preheat lands the manifests and blobs
-of all the platforms, or only of the given platform, and a delete with the
-platform only removes the manifest and blobs of that platform. The delete is
-image-aware: deleting an image retains the tasks another image references, a
-digest reference of a platform or another tag sharing a blob, until that image
-is deleted too. An image preheated by one SDK is deleted by the other, so both
-SDKs record and address the image the same way.
-
-They also stat a preheated image and check it reports the layers on the seed
-peers the preheat landed them on, only the layers of the platform when given,
-and no seed peer after the image is deleted.
-
 ## Run locally
 
 Requirements: Docker, kind, kubectl, helm, Go, Rust, protoc and

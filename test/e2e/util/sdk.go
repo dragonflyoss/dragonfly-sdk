@@ -156,7 +156,7 @@ func (s *SDK) LookupEndpoints(url string) ([]string, error) {
 	var out struct {
 		Endpoints []string `json:"endpoints"`
 	}
-	if err := s.run(&out, "lookup-endpoints", "--scheduler", SchedulerEndpoint, url); err != nil {
+	if err := s.run(&out, "lookup-endpoints", url); err != nil {
 		return nil, err
 	}
 
@@ -166,7 +166,7 @@ func (s *SDK) LookupEndpoints(url string) ([]string, error) {
 // Get downloads the url into the output path in the runner pod through the
 // SDK, via the seed peers the scheduler picks or via the endpoints when given.
 func (s *SDK) Get(url, output string, endpoints []string, header http.Header) (*GetResponse, error) {
-	args := []string{"get", "--scheduler", SchedulerEndpoint, "--output", output}
+	args := []string{"--output", output}
 	for _, endpoint := range endpoints {
 		args = append(args, "--endpoint", endpoint)
 	}
@@ -178,7 +178,7 @@ func (s *SDK) Get(url, output string, endpoints []string, header http.Header) (*
 	args = append(args, url)
 
 	var resp GetResponse
-	if err := s.run(&resp, args...); err != nil {
+	if err := s.run(&resp, "get", args...); err != nil {
 		return nil, err
 	}
 
@@ -188,19 +188,19 @@ func (s *SDK) Get(url, output string, endpoints []string, header http.Header) (*
 // Preheat preheats the url to the seed peers through the SDK, to the default
 // replicas or to the scope when given.
 func (s *SDK) Preheat(url, scope string) error {
-	args := []string{"preheat", "--scheduler", SchedulerEndpoint}
+	var args []string
 	if scope != "" {
 		args = append(args, "--scope", scope)
 	}
 
-	return s.run(nil, append(args, url)...)
+	return s.run(nil, "preheat", append(args, url)...)
 }
 
 // PreheatImage preheats the image to the seed peers through the SDK, to the
 // default replicas or to the scope when given, for all the platforms of the
 // image or for the platform when given.
 func (s *SDK) PreheatImage(image, scope, platform string) error {
-	args := []string{"preheat-image", "--scheduler", SchedulerEndpoint}
+	var args []string
 	if scope != "" {
 		args = append(args, "--scope", scope)
 	}
@@ -209,19 +209,19 @@ func (s *SDK) PreheatImage(image, scope, platform string) error {
 		args = append(args, "--platform", platform)
 	}
 
-	return s.run(nil, append(args, image)...)
+	return s.run(nil, "preheat-image", append(args, image)...)
 }
 
 // StatImage queries the layers of the image cached by the seed peers through
 // the SDK, for all the platforms of the image or for the platform when given.
 func (s *SDK) StatImage(image, platform string) (*StatImageResponse, error) {
-	args := []string{"stat-image", "--scheduler", SchedulerEndpoint}
+	var args []string
 	if platform != "" {
 		args = append(args, "--platform", platform)
 	}
 
 	var resp StatImageResponse
-	if err := s.run(&resp, append(args, image)...); err != nil {
+	if err := s.run(&resp, "stat-image", append(args, image)...); err != nil {
 		return nil, err
 	}
 
@@ -231,51 +231,51 @@ func (s *SDK) StatImage(image, platform string) (*StatImageResponse, error) {
 // Delete deletes the preheated url from the seed peers through the SDK, from
 // the default replicas or from the scope when given.
 func (s *SDK) Delete(url, scope string) error {
-	args := []string{"delete", "--scheduler", SchedulerEndpoint}
+	var args []string
 	if scope != "" {
 		args = append(args, "--scope", scope)
 	}
 
-	return s.run(nil, append(args, url)...)
+	return s.run(nil, "delete", append(args, url)...)
 }
 
 // DeleteImage deletes the preheated image from all seed peers through the SDK,
 // for all the platforms of the image or for the platform when given.
 func (s *SDK) DeleteImage(image, platform string) (*DeleteImageResponse, error) {
-	args := []string{"delete-image", "--scheduler", SchedulerEndpoint}
+	var args []string
 	if platform != "" {
 		args = append(args, "--platform", platform)
 	}
 
 	var resp DeleteImageResponse
-	if err := s.run(&resp, append(args, image)...); err != nil {
+	if err := s.run(&resp, "delete-image", append(args, image)...); err != nil {
 		return nil, err
 	}
 
 	return &resp, nil
 }
 
-// run runs the driver in the runner pod and decodes its JSON output into out
-// when out is not nil.
-func (s *SDK) run(out any, args ...string) error {
-	cmd := RunnerExec().Command(append([]string{s.driver}, args...)...)
+// run runs the command of the driver against the scheduler in the runner pod
+// and decodes its JSON output into out when out is not nil.
+func (s *SDK) run(out any, command string, args ...string) error {
+	cmd := RunnerExec().Command(append([]string{s.driver, command, "--scheduler", SchedulerEndpoint}, args...)...)
 	stdout, err := cmd.Output()
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
-			return fmt.Errorf("%s driver %s: %w: %s", s.Name, args[0], err, exitErr.Stderr)
+			return fmt.Errorf("%s driver %s: %w: %s", s.Name, command, err, exitErr.Stderr)
 		}
 
-		return fmt.Errorf("%s driver %s: %w", s.Name, args[0], err)
+		return fmt.Errorf("%s driver %s: %w", s.Name, command, err)
 	}
 
-	fmt.Printf("%s driver %s output: %s", s.Name, args[0], stdout)
+	fmt.Printf("%s driver %s output: %s", s.Name, command, stdout)
 	if out == nil {
 		return nil
 	}
 
 	if err := json.Unmarshal(stdout, out); err != nil {
-		return fmt.Errorf("%s driver %s: decode output %q: %w", s.Name, args[0], stdout, err)
+		return fmt.Errorf("%s driver %s: decode output %q: %w", s.Name, command, stdout, err)
 	}
 
 	return nil
