@@ -41,6 +41,8 @@ seedClient:
     proxy:
       server:
         requestRateLimit: 4000
+    backend:
+      enableCacheTemporaryRedirect: false
 
 client:
   enable: false
