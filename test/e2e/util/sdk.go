@@ -69,6 +69,36 @@ type GetResponse struct {
 	Header map[string]string `json:"header"`
 }
 
+// StatImageResponse is the output of the stat-image command of the drivers.
+type StatImageResponse struct {
+	// Layers is the blob urls of the image.
+	Layers []string `json:"layers"`
+
+	// Peers is the seed peers that have cached layers of the image.
+	Peers []*PeerStatedImage `json:"peers"`
+}
+
+// PeerStatedImage is a seed peer and the image layers it has cached.
+type PeerStatedImage struct {
+	// IP is the IP address of the seed peer.
+	IP string `json:"ip"`
+
+	// Hostname is the hostname of the seed peer.
+	Hostname string `json:"hostname"`
+
+	// CachedLayers is the layers the seed peer has cached.
+	CachedLayers []*Layer `json:"cached_layers"`
+}
+
+// Layer is the download state of an image layer on a seed peer.
+type Layer struct {
+	// URL is the blob url of the layer.
+	URL string `json:"url"`
+
+	// IsFinished indicates whether the seed peer has finished downloading the layer.
+	IsFinished bool `json:"is_finished"`
+}
+
 // DeleteImageResponse is the output of the delete-image command of the drivers.
 type DeleteImageResponse struct {
 	// Peers is the seed peers the image is deleted from.
@@ -180,6 +210,22 @@ func (s *SDK) PreheatImage(image, scope, platform string) error {
 	}
 
 	return s.run(nil, append(args, image)...)
+}
+
+// StatImage queries the layers of the image cached by the seed peers through
+// the SDK, for all the platforms of the image or for the platform when given.
+func (s *SDK) StatImage(image, platform string) (*StatImageResponse, error) {
+	args := []string{"stat-image", "--scheduler", SchedulerEndpoint}
+	if platform != "" {
+		args = append(args, "--platform", platform)
+	}
+
+	var resp StatImageResponse
+	if err := s.run(&resp, append(args, image)...); err != nil {
+		return nil, err
+	}
+
+	return &resp, nil
 }
 
 // Delete deletes the preheated url from the seed peers through the SDK, from

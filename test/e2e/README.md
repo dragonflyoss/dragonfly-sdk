@@ -27,6 +27,10 @@ digest reference of a platform or another tag sharing a blob, until that image
 is deleted too. An image preheated by one SDK is deleted by the other, so both
 SDKs record and address the image the same way.
 
+They also stat a preheated image and check it reports the layers on the seed
+peers the preheat landed them on, only the layers of the platform when given,
+and no seed peer after the image is deleted.
+
 ## Run locally
 
 Requirements: Docker, kind, kubectl, helm, Go, Rust, protoc and

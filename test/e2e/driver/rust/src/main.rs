@@ -28,6 +28,7 @@
 //! driver get --scheduler <endpoint> [--endpoint <endpoint>]... [--header <key: value>]... --output <path> <url>
 //! driver preheat --scheduler <endpoint> [--scope <scope>] <url>
 //! driver preheat-image --scheduler <endpoint> [--scope <scope>] [--platform <platform>] <image>
+//! driver stat-image --scheduler <endpoint> [--platform <platform>] <image>
 //! driver delete --scheduler <endpoint> [--scope <scope>] <url>
 //! driver delete-image --scheduler <endpoint> [--platform <platform>] <image>
 //! ```
@@ -38,7 +39,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 use dragonfly_client_request::{
     DeleteImageRequest, DeleteRequest, GetRequest, PreheatImageRequest, PreheatRequest, Proxy,
-    ProxyWithEndpoints, Request, RequestWithEndpoints, Scope,
+    ProxyWithEndpoints, Request, RequestWithEndpoints, Scope, StatImageRequest,
 };
 use futures::TryStreamExt;
 use http::header::{HeaderMap, HeaderName, HeaderValue};
@@ -126,6 +127,22 @@ enum Command {
         image: String,
     },
 
+    /// Queries the layers of the image cached by the seed peers, all its platforms
+    /// unless the platform is given.
+    StatImage {
+        /// Scheduler endpoint.
+        #[arg(long)]
+        scheduler: String,
+
+        /// Platform of the image in the format "os/arch", all the platforms by
+        /// default.
+        #[arg(long)]
+        platform: Option<String>,
+
+        /// Image reference, e.g., "docker.io/library/busybox:latest".
+        image: String,
+    },
+
     /// Deletes the preheated url from the seed peers.
     Delete {
         /// Scheduler endpoint.
@@ -202,6 +219,11 @@ async fn main() -> Result<()> {
             platform,
             image,
         } => preheat_image(scheduler, scope.into(), platform, image).await,
+        Command::StatImage {
+            scheduler,
+            platform,
+            image,
+        } => stat_image(scheduler, platform, image).await,
         Command::Delete {
             scheduler,
             scope,
@@ -339,6 +361,45 @@ async fn preheat_image(
             ..Default::default()
         })
         .await?;
+
+    Ok(())
+}
+
+/// Queries the layers of the image cached by the seed peers, all its platforms
+/// unless the platform is given, and prints them.
+async fn stat_image(
+    scheduler_endpoint: String,
+    platform: Option<String>,
+    image: String,
+) -> Result<()> {
+    let proxy = Proxy::builder()
+        .scheduler_endpoint(scheduler_endpoint)
+        .build()
+        .await?;
+    let response = proxy
+        .stat_image(&StatImageRequest {
+            image,
+            platform,
+            ..Default::default()
+        })
+        .await?;
+    let peers: Vec<_> = response
+        .peers
+        .iter()
+        .map(|peer| {
+            let cached_layers: Vec<_> = peer
+                .cached_layers
+                .iter()
+                .map(|layer| json!({ "url": layer.url, "is_finished": layer.is_finished }))
+                .collect();
+            json!({
+                "ip": peer.ip,
+                "hostname": peer.hostname,
+                "cached_layers": cached_layers,
+            })
+        })
+        .collect();
+    println!("{}", json!({ "layers": response.layers, "peers": peers }));
 
     Ok(())
 }

@@ -24,6 +24,7 @@
 //	driver get --scheduler <endpoint> [--endpoint <endpoint>]... [--header <key: value>]... --output <path> <url>
 //	driver preheat --scheduler <endpoint> [--scope <scope>] <url>
 //	driver preheat-image --scheduler <endpoint> [--scope <scope>] [--platform <platform>] <image>
+//	driver stat-image --scheduler <endpoint> [--platform <platform>] <image>
 //	driver delete --scheduler <endpoint> [--scope <scope>] <url>
 //	driver delete-image --scheduler <endpoint> [--platform <platform>] <image>
 package main
@@ -57,6 +58,36 @@ type getResponse struct {
 
 	// Header is the headers of the response, with lower case keys.
 	Header map[string]string `json:"header"`
+}
+
+// statImageResponse is the JSON output of the stat-image command.
+type statImageResponse struct {
+	// Layers is the blob urls of the image.
+	Layers []string `json:"layers"`
+
+	// Peers is the seed peers that have cached layers of the image.
+	Peers []peerStatedImage `json:"peers"`
+}
+
+// peerStatedImage is a seed peer and the image layers it has cached.
+type peerStatedImage struct {
+	// IP is the IP address of the seed peer.
+	IP string `json:"ip"`
+
+	// Hostname is the hostname of the seed peer.
+	Hostname string `json:"hostname"`
+
+	// CachedLayers is the layers the seed peer has cached.
+	CachedLayers []layer `json:"cached_layers"`
+}
+
+// layer is the download state of an image layer on a seed peer.
+type layer struct {
+	// URL is the blob url of the layer.
+	URL string `json:"url"`
+
+	// IsFinished indicates whether the seed peer has finished downloading the layer.
+	IsFinished bool `json:"is_finished"`
 }
 
 // deleteImageResponse is the JSON output of the delete-image command.
@@ -113,6 +144,8 @@ func main() {
 		err = preheat(ctx, os.Args[2:])
 	case "preheat-image":
 		err = preheatImage(ctx, os.Args[2:])
+	case "stat-image":
+		err = statImage(ctx, os.Args[2:])
 	case "delete":
 		err = delete(ctx, os.Args[2:])
 	case "delete-image":
@@ -129,7 +162,7 @@ func main() {
 
 // usage prints the usage and exits.
 func usage() {
-	fmt.Fprintf(os.Stderr, "usage: %s lookup-endpoints|get|preheat|preheat-image|delete|delete-image [flags] <url-or-image>\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "usage: %s lookup-endpoints|get|preheat|preheat-image|stat-image|delete|delete-image [flags] <url-or-image>\n", os.Args[0])
 	os.Exit(1)
 }
 
@@ -287,6 +320,49 @@ func preheatImage(ctx context.Context, args []string) error {
 	}
 
 	return proxy.PreheatImage(ctx, request.NewPreheatImageRequest(flags.Arg(0), opts...))
+}
+
+// statImage queries the layers of the image cached by the seed peers, all its
+// platforms unless the platform is given, and prints them.
+func statImage(ctx context.Context, args []string) error {
+	flags := flag.NewFlagSet("stat-image", flag.ExitOnError)
+	schedulerEndpoint := flags.String("scheduler", "", "scheduler endpoint")
+	platform := flags.String("platform", "", "platform of the image in the format os/arch, all the platforms by default")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+
+	if flags.NArg() != 1 {
+		return errors.New("stat-image takes exactly one image")
+	}
+
+	proxy, err := request.New(ctx, *schedulerEndpoint)
+	if err != nil {
+		return err
+	}
+	defer proxy.Close()
+
+	var opts []request.StatImageRequestOption
+	if *platform != "" {
+		opts = append(opts, request.WithStatImageRequestPlatform(*platform))
+	}
+
+	resp, err := proxy.StatImage(ctx, request.NewStatImageRequest(flags.Arg(0), opts...))
+	if err != nil {
+		return err
+	}
+
+	peers := make([]peerStatedImage, 0, len(resp.Peers))
+	for _, peer := range resp.Peers {
+		cachedLayers := make([]layer, 0, len(peer.CachedLayers))
+		for _, cachedLayer := range peer.CachedLayers {
+			cachedLayers = append(cachedLayers, layer{URL: cachedLayer.URL, IsFinished: cachedLayer.IsFinished})
+		}
+
+		peers = append(peers, peerStatedImage{IP: peer.IP, Hostname: peer.Hostname, CachedLayers: cachedLayers})
+	}
+
+	return json.NewEncoder(os.Stdout).Encode(statImageResponse{Layers: append([]string{}, resp.Layers...), Peers: peers})
 }
 
 // delete deletes the preheated url from the seed peers.

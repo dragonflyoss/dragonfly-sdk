@@ -112,8 +112,9 @@ type Request interface {
 	// manifest and blob, recorded by the image for DeleteImage.
 	PreheatImage(ctx context.Context, req *PreheatImageRequest) error
 
-	// StatImage reports which seed peers hold which layers of an OCI image, as
-	// resolved by the scheduler. Useful to verify a preheat.
+	// StatImage reports which healthy seed peers hold which layers of an OCI
+	// image, all the platforms unless a platform is set. Useful to verify a
+	// preheat.
 	StatImage(ctx context.Context, req *StatImageRequest) (*StatImageResponse, error)
 
 	// Delete deletes a preheated file: has every replica seed peer, or every
@@ -829,6 +830,10 @@ type StatImageRequest struct {
 
 	// timeout is the timeout of the request.
 	timeout time.Duration
+
+	// concurrentPeerCount is the number of seed peers to stat the image on
+	// concurrently.
+	concurrentPeerCount int
 }
 
 // StatImageRequestOption configures the StatImageRequest.
@@ -844,10 +849,9 @@ func WithStatImageRequestAuth(username, password string) StatImageRequestOption 
 }
 
 // WithStatImageRequestPlatform sets the target platform in the format "os/arch"
-// (e.g., "linux/amd64", "linux/arm64"). This is used by the scheduler to select the
-// correct manifest from a multi-platform image index, default is all the
-// platforms of the image. It should be consistent with the platform used when
-// the image was preheated, otherwise the layers can not be found on the peers.
+// (e.g., "linux/amd64", "linux/arm64"). This is used to select the correct
+// manifest from a multi-platform image index, default is all the platforms of
+// the image.
 func WithStatImageRequestPlatform(platform string) StatImageRequestOption {
 	return func(r *StatImageRequest) { r.platform = &platform }
 }
@@ -887,6 +891,12 @@ func WithStatImageRequestTimeout(timeout time.Duration) StatImageRequestOption {
 	return func(r *StatImageRequest) { r.timeout = timeout }
 }
 
+// WithStatImageRequestConcurrentPeerCount sets the number of seed peers to stat
+// the image on concurrently, default is 500.
+func WithStatImageRequestConcurrentPeerCount(count int) StatImageRequestOption {
+	return func(r *StatImageRequest) { r.concurrentPeerCount = count }
+}
+
 // NewStatImageRequest returns a StatImageRequest for the image with default
 // values.
 func NewStatImageRequest(image string, opts ...StatImageRequestOption) *StatImageRequest {
@@ -895,6 +905,7 @@ func NewStatImageRequest(image string, opts ...StatImageRequestOption) *StatImag
 		filteredQueryParams:         idgen.DefaultFilteredQueryParams,
 		enableTaskIDBasedBlobDigest: true,
 		timeout:                     defaultRequestTimeout,
+		concurrentPeerCount:         defaultConcurrentPeerCount,
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -905,6 +916,10 @@ func NewStatImageRequest(image string, opts ...StatImageRequestOption) *StatImag
 
 // validate validates the request parameters.
 func (r *StatImageRequest) validate() error {
+	if r.concurrentPeerCount <= 0 {
+		return fmt.Errorf("%w: concurrent peer count must be positive", ErrInvalidArgument)
+	}
+
 	if r.platform != nil {
 		if _, err := platforms.Parse(*r.platform); err != nil {
 			return fmt.Errorf("%w: invalid platform format %q, expected \"os/arch\" (e.g., \"linux/amd64\"): %v", ErrInvalidArgument, *r.platform, err)

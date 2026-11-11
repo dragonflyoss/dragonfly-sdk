@@ -39,20 +39,11 @@ import (
 
 type mockScheduler struct {
 	schedulerv2.UnimplementedSchedulerServer
-	hosts     []*commonv2.Host
-	statImage func(*schedulerv2.StatImageRequest) (*schedulerv2.StatImageResponse, error)
+	hosts []*commonv2.Host
 }
 
 func (s *mockScheduler) ListHosts(ctx context.Context, req *schedulerv2.ListHostsRequest) (*schedulerv2.ListHostsResponse, error) {
 	return &schedulerv2.ListHostsResponse{Hosts: s.hosts}, nil
-}
-
-func (s *mockScheduler) StatImage(ctx context.Context, req *schedulerv2.StatImageRequest) (*schedulerv2.StatImageResponse, error) {
-	if s.statImage != nil {
-		return s.statImage(req)
-	}
-
-	return s.UnimplementedSchedulerServer.StatImage(ctx, req)
 }
 
 func setupMockScheduler(t testing.TB, hosts []*commonv2.Host) string {
@@ -83,6 +74,7 @@ type mockSeedPeer struct {
 	deleteTaskErr   error
 	onDeleteTask    func()
 	deleteImage     func(*dfdaemonv2.DeleteImageRequest) (*dfdaemonv2.DeleteImageResponse, error)
+	statLocalTask   func(*dfdaemonv2.StatLocalTaskRequest) (*dfdaemonv2.StatLocalTaskResponse, error)
 }
 
 func (s *mockSeedPeer) DownloadTask(req *dfdaemonv2.DownloadTaskRequest, stream dfdaemonv2.DfdaemonUpload_DownloadTaskServer) error {
@@ -129,6 +121,14 @@ func (s *mockSeedPeer) DeleteImage(ctx context.Context, req *dfdaemonv2.DeleteIm
 	}
 
 	return s.UnimplementedDfdaemonUploadServer.DeleteImage(ctx, req)
+}
+
+func (s *mockSeedPeer) StatLocalTask(ctx context.Context, req *dfdaemonv2.StatLocalTaskRequest) (*dfdaemonv2.StatLocalTaskResponse, error) {
+	if s.statLocalTask != nil {
+		return s.statLocalTask(req)
+	}
+
+	return s.UnimplementedDfdaemonUploadServer.StatLocalTask(ctx, req)
 }
 
 func setupMockSeedPeer(t testing.TB, downloadTaskErr error) int32 {
@@ -223,6 +223,7 @@ func TestNewRequestDefaults(t *testing.T) {
 	assert.NotEmpty(stat.filteredQueryParams)
 	assert.True(stat.enableTaskIDBasedBlobDigest)
 	assert.Equal(defaultRequestTimeout, stat.timeout)
+	assert.Equal(500, stat.concurrentPeerCount)
 
 	del := NewDeleteRequest("https://example.com/file.txt")
 	assert.NotEmpty(del.filteredQueryParams)

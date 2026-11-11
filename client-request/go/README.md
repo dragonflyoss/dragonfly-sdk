@@ -134,10 +134,10 @@ for _, peer := range resp.Peers {
 ```
 
 Since 1.13.0 a breaking change: `PreheatImage` preheats all the platforms unless
-a platform is set, `DeleteImage` no longer takes the options of the preheat and
-returns the tasks deleted and retained, and `PeerImage` is renamed to
-`PeerStatedImage`. The seed peers must run dfdaemon v1.5.12 or later, and
-`StatImage` stats all the platforms only with scheduler v2.5.4 or later.
+a platform is set, `StatImage` resolves the image itself and asks the seed peers
+instead of the scheduler, `DeleteImage` no longer takes the options of the
+preheat and returns the tasks deleted and retained, and `PeerImage` is renamed
+to `PeerStatedImage`. The seed peers must run dfdaemon v1.5.12 or later.
 
 Preheat with multiple replicas and scatter downloads across them. Preheating
 writes the file to the given number of distinct seed peers, and downloading

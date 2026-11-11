@@ -53,11 +53,7 @@ use tracing::{debug, warn};
 #[cfg(feature = "preheat")]
 use dragonfly_api::{
     common::v2::Image,
-    dfdaemon::v2::DeleteImageRequest as DfdaemonDeleteImageRequest,
-    scheduler::v2::{
-        scheduler_client::SchedulerClient as SchedulerGRPCClient,
-        StatImageRequest as SchedulerStatImageRequest,
-    },
+    dfdaemon::v2::{DeleteImageRequest as DfdaemonDeleteImageRequest, StatLocalTaskRequest},
 };
 #[cfg(feature = "preheat")]
 use oci::{blob_digests, build_blob_url, build_manifest_url, resolve_registry};
@@ -143,11 +139,6 @@ pub enum Scope {
     AllSeedPeers,
 }
 
-/// The scope that queries only the seed peers for the image distribution, aligned
-/// with the AllSeedPeersScope in the dragonfly manager types.
-#[cfg(feature = "preheat")]
-const STAT_IMAGE_SCOPE_ALL_SEED_PEERS: &str = "all_seed_peers";
-
 /// The media types of the manifests for the accept header, identical to the
 /// MIME_TYPES_DISTRIBUTION_MANIFEST used by the oci-client to pull manifests,
 /// so the registry returns the exact representation matching the digest.
@@ -198,8 +189,8 @@ pub trait Request {
     #[cfg(feature = "preheat")]
     async fn preheat_image(&self, request: &PreheatImageRequest) -> Result<()>;
 
-    /// Reports which seed peers hold which layers of an OCI image, as resolved by
-    /// the scheduler. Useful to verify a preheat.
+    /// Reports which healthy seed peers hold which layers of an OCI image, all the
+    /// platforms unless a platform is set. Useful to verify a preheat.
     #[cfg(feature = "preheat")]
     async fn stat_image(&self, request: &StatImageRequest) -> Result<StatImageResponse>;
 
@@ -711,8 +702,7 @@ impl PreheatRequest {
 }
 
 /// Represents a request to query the distribution of an OCI image in the
-/// Dragonfly. The scheduler resolves the image manifest and collects the
-/// cached layers on each peer.
+/// Dragonfly seed peers.
 #[cfg(feature = "preheat")]
 pub struct StatImageRequest {
     /// The OCI image reference (e.g., "docker.io/library/nginx:latest").
@@ -725,10 +715,9 @@ pub struct StatImageRequest {
     pub password: Option<String>,
 
     /// Platform specifies the target platform in the format "os/arch"
-    /// (e.g., "linux/amd64", "linux/arm64"). This is used by the scheduler to select
-    /// the correct manifest from a multi-platform image index, default is all the
-    /// platforms of the image. It should be consistent with the platform used when
-    /// the image was preheated, otherwise the layers can not be found on the peers.
+    /// (e.g., "linux/amd64", "linux/arm64"). This is used to select the correct
+    /// manifest from a multi-platform image index, default is all the platforms
+    /// of the image.
     pub platform: Option<String>,
 
     /// The optional piece length for the Dragonfly task.
@@ -755,6 +744,9 @@ pub struct StatImageRequest {
 
     /// The timeout for the request, default is 10 minutes.
     pub timeout: Duration,
+
+    /// The number of seed peers to stat the image on concurrently, default is 500.
+    pub concurrent_peer_count: usize,
 }
 
 /// Default implementation for StatImageRequest.
@@ -774,6 +766,7 @@ impl Default for StatImageRequest {
             filtered_query_params: default_proxy_rule_filtered_query_params(),
             enable_task_id_based_blob_digest: true,
             timeout: DEFAULT_REQUEST_TIMEOUT,
+            concurrent_peer_count: 500,
         }
     }
 }
@@ -783,6 +776,12 @@ impl Default for StatImageRequest {
 impl StatImageRequest {
     /// Validates the request parameters.
     fn validate(&self) -> Result<()> {
+        if self.concurrent_peer_count == 0 {
+            return Err(Error::InvalidArgument(
+                "concurrent peer count must be positive".to_string(),
+            ));
+        }
+
         if let Some(platform) = &self.platform {
             if !platform.contains('/') {
                 return Err(Error::InvalidArgument(format!(
@@ -1204,8 +1203,6 @@ impl ProxyBuilder {
         );
 
         let proxy = Proxy {
-            #[cfg(feature = "preheat")]
-            scheduler_endpoint: self.scheduler_endpoint,
             seed_peer_selector,
             retry: self.retry,
             client_pool,
@@ -1246,10 +1243,6 @@ impl ProxyBuilder {
 /// The HTTP proxy client that sends requests via Dragonfly.
 #[derive(Clone)]
 pub struct Proxy {
-    /// The endpoint of the scheduler service.
-    #[cfg(feature = "preheat")]
-    scheduler_endpoint: String,
-
     /// The selector service for selecting seed peers.
     seed_peer_selector: Arc<SeedPeerSelector>,
 
@@ -1675,94 +1668,199 @@ impl Request for Proxy {
     /// Provides detailed status for an OCI image's distribution in the Dragonfly.
     ///
     /// This method is designed for scenarios where clients need to know which peers have
-    /// cached the image layers, such as verifying a preheat. It parses the image reference
-    /// and requests the scheduler to resolve the image manifest and collect the cached
-    /// layers on each peer. It only queries the seed peers.
+    /// cached the image layers, such as verifying a preheat. It resolves the image manifests,
+    /// all the platforms or the specified one, and asks every healthy seed peer for the
+    /// layers it has cached by the dfdaemon stat local task API. A seed peer that fails is
+    /// logged and left out of the response.
     #[cfg(feature = "preheat")]
     async fn stat_image(&self, request: &StatImageRequest) -> Result<StatImageResponse> {
         request.validate()?;
 
+        // Parse image reference.
+        let client = OciClient::new(ClientConfig::default());
         let reference: Reference = request
             .image
             .parse()
             .map_err(|err| Error::InvalidArgument(format!("invalid image reference: {err}")))?;
 
-        let registry = resolve_registry(&reference);
-        let stat_image_request = SchedulerStatImageRequest {
-            url: build_manifest_url(
-                registry,
-                reference.repository(),
-                reference
-                    .digest()
-                    .or_else(|| reference.tag())
-                    .unwrap_or("latest"),
-            ),
-            piece_length: request.piece_length,
-            tag: request.tag.clone(),
-            application: request.application.clone(),
-            filtered_query_params: request.filtered_query_params.clone(),
-            username: request.username.clone(),
-            password: request.password.clone(),
-            platform: request.platform.clone(),
-            timeout: Some(
-                prost_wkt_types::Duration::try_from(request.timeout).map_err(|err| {
-                    Error::InvalidArgument(format!("invalid request timeout: {err}"))
-                })?,
-            ),
-            scope: STAT_IMAGE_SCOPE_ALL_SEED_PEERS.to_string(),
-            enable_task_id_based_blob_digest: request.enable_task_id_based_blob_digest,
-            ..Default::default()
+        // Create registry authentication.
+        let auth = match (&request.username, &request.password) {
+            (Some(username), Some(password)) => {
+                RegistryAuth::Basic(username.clone(), password.clone())
+            }
+            _ => RegistryAuth::Anonymous,
         };
 
-        let channel = Channel::from_shared(self.scheduler_endpoint.clone())
-            .map_err(|err| Error::InvalidArgument(err.to_string()))?
-            .connect_timeout(request.timeout)
-            .timeout(request.timeout)
-            .connect()
+        // Pull the image manifests, all the platforms of a multi-platform image
+        // index unless the platform is specified.
+        let (manifest, _) = client
+            .pull_manifest(&reference, &auth)
             .await
-            .map_err(|err| {
-                Error::Internal(format!(
-                    "failed to connect to scheduler {}: {}",
-                    self.scheduler_endpoint, err
-                ))
-            })?;
+            .map_err(|err| Error::Internal(format!("failed to pull image manifest: {err}")))?;
 
-        let response = SchedulerGRPCClient::new(channel)
-            .max_decoding_message_size(i32::MAX as usize)
-            .max_encoding_message_size(i32::MAX as usize)
-            .stat_image(stat_image_request)
+        let manifests = match manifest {
+            OciManifest::Image(manifest) => vec![manifest],
+            OciManifest::ImageIndex(index) => {
+                let mut manifests = Vec::with_capacity(index.manifests.len());
+                for entry in index.manifests {
+                    let platform = entry
+                        .platform
+                        .map(|platform| format!("{}/{}", platform.os, platform.architecture));
+
+                    if request.platform.is_some() && platform != request.platform {
+                        continue;
+                    }
+
+                    let (manifest, _) = client
+                        .pull_image_manifest(&reference.clone_with_digest(entry.digest), &auth)
+                        .await
+                        .map_err(|err| {
+                            Error::Internal(format!("failed to pull image manifest: {err}"))
+                        })?;
+
+                    manifests.push(manifest);
+                }
+
+                manifests
+            }
+        };
+
+        if manifests.is_empty() {
+            return Err(Error::Internal(format!(
+                "no matching manifest for platform {}",
+                request.platform.as_deref().unwrap_or("all")
+            )));
+        }
+
+        // Collect the layers of the matched platforms. A layer shared by several
+        // platforms is stated once.
+        let registry = resolve_registry(&reference);
+        let repository = reference.repository();
+        let mut layers: Vec<String> = Vec::new();
+        for manifest in &manifests {
+            for descriptor in std::iter::once(&manifest.config).chain(manifest.layers.iter()) {
+                let url = build_blob_url(registry, repository, &descriptor.digest);
+                if !layers.contains(&url) {
+                    layers.push(url);
+                }
+            }
+        }
+
+        // Construct the stat local task requests of the layers.
+        let mut stat_local_task_requests = Vec::with_capacity(layers.len());
+        for layer in &layers {
+            stat_local_task_requests.push(StatLocalTaskRequest {
+                task_id: self.task_id(
+                    layer,
+                    request.piece_length,
+                    request.tag.clone(),
+                    request.application.clone(),
+                    request.filtered_query_params.clone(),
+                    None,
+                    request.enable_task_id_based_blob_digest,
+                )?,
+                remote_ip: preferred_local_ip().map(|ip| ip.to_string()),
+            });
+        }
+
+        // Select all seed peers.
+        let seed_peers = self
+            .seed_peer_selector
+            .select_all()
             .await
-            .map_err(|err| match err.code() {
-                tonic::Code::InvalidArgument => Error::InvalidArgument(format!(
-                    "failed to stat image {}: {}",
-                    request.image, err
-                )),
-                _ => Error::Internal(format!("failed to stat image {}: {}", request.image, err)),
-            })?
-            .into_inner();
+            .map_err(|err| Error::Internal(format!("failed to select seed peers: {err}")))?;
+        debug!(
+            "image {} selected seed peers: {:?}",
+            request.image, seed_peers
+        );
 
-        Ok(StatImageResponse {
-            layers: response
-                .image
-                .map(|image| image.layers.into_iter().map(|layer| layer.url).collect())
-                .unwrap_or_default(),
-            peers: response
-                .peers
-                .into_iter()
-                .map(|peer| PeerStatedImage {
-                    ip: peer.ip,
-                    hostname: peer.hostname,
-                    cached_layers: peer
-                        .cached_layers
-                        .into_iter()
-                        .map(|layer| Layer {
-                            url: layer.url,
-                            is_finished: layer.is_finished.unwrap_or_default(),
+        // Stat the layers on every seed peer concurrently.
+        let semaphore = Arc::new(Semaphore::new(request.concurrent_peer_count));
+        let mut join_set: JoinSet<Result<Option<PeerStatedImage>>> = JoinSet::new();
+        for peer in seed_peers.iter() {
+            let addr = format_url(
+                "http",
+                IpAddr::from_str(&peer.ip).map_err(|err| Error::Internal(err.to_string()))?,
+                peer.port as u16,
+            );
+
+            let semaphore = semaphore.clone();
+            let ip = peer.ip.clone();
+            let hostname = peer.hostname.clone();
+            let layers = layers.clone();
+            let stat_local_task_requests = stat_local_task_requests.clone();
+            let timeout = request.timeout;
+            let retry_policy = self.retry;
+            join_set.spawn(
+                async move {
+                    let _permit = semaphore
+                        .acquire()
+                        .await
+                        .map_err(|err| Error::Internal(err.to_string()))?;
+
+                    retry_policy
+                        .run(|| async {
+                            let channel = Channel::from_shared(addr.clone())
+                                .map_err(|err| Error::InvalidArgument(err.to_string()))?
+                                .connect_timeout(timeout)
+                                .timeout(timeout)
+                                .connect()
+                                .await
+                                .map_err(|err| {
+                                    Error::Internal(format!(
+                                        "failed to connect to seed peer {addr}: {err}"
+                                    ))
+                                })?;
+
+                            let mut client = DfdaemonUploadGRPCClient::new(channel)
+                                .max_decoding_message_size(usize::MAX)
+                                .max_encoding_message_size(usize::MAX);
+
+                            // A NotFound answer means the seed peer has not cached the layer.
+                            let mut cached_layers = Vec::new();
+                            for (layer, stat_local_task_request) in
+                                layers.iter().zip(&stat_local_task_requests)
+                            {
+                                match client
+                                    .stat_local_task(stat_local_task_request.clone())
+                                    .await
+                                {
+                                    Ok(response) => cached_layers.push(Layer {
+                                        url: layer.clone(),
+                                        is_finished: response.into_inner().finished_at.is_some(),
+                                    }),
+                                    Err(status) if status.code() == tonic::Code::NotFound => {}
+                                    Err(status) => return Err(Error::from_status(status)),
+                                }
+                            }
+
+                            Ok((!cached_layers.is_empty()).then(|| PeerStatedImage {
+                                ip: ip.clone(),
+                                hostname: hostname.clone(),
+                                cached_layers,
+                            }))
                         })
-                        .collect(),
-                })
-                .collect(),
-        })
+                        .await
+                        .inspect_err(|err| {
+                            error!(
+                                "failed to stat image on seed peer {} ({}): {}",
+                                hostname, ip, err
+                            )
+                        })
+                }
+                .in_current_span(),
+            );
+        }
+
+        // Wait for the stats on every seed peer to finish.
+        let mut peers = Vec::with_capacity(seed_peers.len());
+        while let Some(result) = join_set.join_next().await {
+            if let Ok(Some(peer)) = result.map_err(|err| Error::Internal(err.to_string()))? {
+                peers.push(peer);
+            }
+        }
+
+        Ok(StatImageResponse { layers, peers })
     }
 
     /// Deletes a preheated OCI image from the seed peers via the Dragonfly.
@@ -4911,220 +5009,6 @@ mod tests {
 
     #[cfg(feature = "preheat")]
     #[tokio::test]
-    async fn stat_image_queries_seed_peers() {
-        use dragonfly_api::scheduler::v2::{
-            Image as ApiImage, Layer as ApiLayer, PeerImage as ApiPeerImage,
-            StatImageResponse as ApiStatImageResponse,
-        };
-
-        let mut mocks = MockSet::new();
-        mocks.mock(|when, then| {
-            when.path("/scheduler.v2.Scheduler/StatImage")
-                .pb(SchedulerStatImageRequest {
-                    url: "https://example.com/v2/foo/bar/manifests/1.0".to_string(),
-                    piece_length: Some(4194304),
-                    tag: Some("stat".to_string()),
-                    application: Some("dfctl".to_string()),
-                    filtered_query_params: default_proxy_rule_filtered_query_params(),
-                    username: Some("user".to_string()),
-                    password: Some("pass".to_string()),
-                    platform: Some("linux/amd64".to_string()),
-                    timeout: Some(
-                        prost_wkt_types::Duration::try_from(DEFAULT_REQUEST_TIMEOUT).unwrap(),
-                    ),
-                    scope: STAT_IMAGE_SCOPE_ALL_SEED_PEERS.to_string(),
-                    enable_task_id_based_blob_digest: true,
-                    ..Default::default()
-                });
-            then.pb(ApiStatImageResponse {
-                image: Some(ApiImage {
-                    layers: vec![
-                        ApiLayer {
-                            url: "https://example.com/v2/foo/bar/blobs/sha256:b5f4dfca35398b36f61baa60e2bf2c242401c9d7db3de9168dcf780a2feedd2d".to_string(),
-                            ..Default::default()
-                        },
-                        ApiLayer {
-                            url: "https://example.com/v2/foo/bar/blobs/sha256:150b7321c0794448817b19fab51e415ff406ac8663c4f53d64c3590454dee201".to_string(),
-                            ..Default::default()
-                        },
-                    ],
-                }),
-                peers: vec![ApiPeerImage {
-                    ip: "127.0.0.1".to_string(),
-                    hostname: "seed-peer-1".to_string(),
-                    cached_layers: vec![
-                        ApiLayer {
-                            url: "https://example.com/v2/foo/bar/blobs/sha256:b5f4dfca35398b36f61baa60e2bf2c242401c9d7db3de9168dcf780a2feedd2d".to_string(),
-                            is_finished: Some(true),
-                        },
-                        ApiLayer {
-                            url: "https://example.com/v2/foo/bar/blobs/sha256:150b7321c0794448817b19fab51e415ff406ac8663c4f53d64c3590454dee201".to_string(),
-                            ..Default::default()
-                        },
-                    ],
-                }],
-            });
-        });
-
-        let mock_scheduler = setup_mock_scheduler_with_mocks(vec![], mocks)
-            .await
-            .unwrap();
-        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
-        let proxy = Proxy::builder()
-            .scheduler_endpoint(scheduler_endpoint)
-            .build()
-            .await
-            .unwrap();
-
-        let request = StatImageRequest {
-            image: "example.com/foo/bar:1.0".to_string(),
-            username: Some("user".to_string()),
-            password: Some("pass".to_string()),
-            platform: Some("linux/amd64".to_string()),
-            piece_length: Some(4194304),
-            tag: Some("stat".to_string()),
-            application: Some("dfctl".to_string()),
-            ..Default::default()
-        };
-
-        let response = proxy.stat_image(&request).await.unwrap();
-        assert_eq!(response.layers.len(), 2);
-        assert_eq!(response.peers.len(), 1);
-        assert_eq!(response.peers[0].ip, "127.0.0.1");
-        assert_eq!(response.peers[0].hostname, "seed-peer-1");
-        assert_eq!(response.peers[0].cached_layers.len(), 2);
-        assert!(response.peers[0].cached_layers[0].is_finished);
-        assert!(!response.peers[0].cached_layers[1].is_finished);
-    }
-
-    #[cfg(feature = "preheat")]
-    #[tokio::test]
-    async fn stat_image_omits_empty_optional_fields() {
-        use dragonfly_api::scheduler::v2::StatImageResponse as ApiStatImageResponse;
-        let mut mocks = MockSet::new();
-        mocks.mock(|when, then| {
-            when.path("/scheduler.v2.Scheduler/StatImage")
-                .pb(SchedulerStatImageRequest {
-                    url: "https://example.com/v2/foo/bar/manifests/1.0".to_string(),
-                    filtered_query_params: default_proxy_rule_filtered_query_params(),
-                    timeout: Some(
-                        prost_wkt_types::Duration::try_from(DEFAULT_REQUEST_TIMEOUT).unwrap(),
-                    ),
-                    scope: STAT_IMAGE_SCOPE_ALL_SEED_PEERS.to_string(),
-                    enable_task_id_based_blob_digest: true,
-                    ..Default::default()
-                });
-            then.pb(ApiStatImageResponse::default());
-        });
-
-        let mock_scheduler = setup_mock_scheduler_with_mocks(vec![], mocks)
-            .await
-            .unwrap();
-        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
-        let proxy = Proxy::builder()
-            .scheduler_endpoint(scheduler_endpoint)
-            .build()
-            .await
-            .unwrap();
-
-        let request = StatImageRequest {
-            image: "example.com/foo/bar:1.0".to_string(),
-            ..Default::default()
-        };
-
-        let response = proxy.stat_image(&request).await.unwrap();
-        assert!(response.layers.is_empty());
-        assert!(response.peers.is_empty());
-    }
-
-    #[cfg(feature = "preheat")]
-    #[tokio::test]
-    async fn stat_image_with_digest_reference() {
-        use dragonfly_api::scheduler::v2::StatImageResponse as ApiStatImageResponse;
-
-        let mut mocks = MockSet::new();
-        mocks.mock(|when, then| {
-            when.path("/scheduler.v2.Scheduler/StatImage")
-                .pb(SchedulerStatImageRequest {
-                    url: "https://example.com/v2/foo/bar/manifests/sha256:b5f4dfca35398b36f61baa60e2bf2c242401c9d7db3de9168dcf780a2feedd2d".to_string(),
-                    filtered_query_params: default_proxy_rule_filtered_query_params(),
-                    timeout: Some(
-                        prost_wkt_types::Duration::try_from(DEFAULT_REQUEST_TIMEOUT).unwrap(),
-                    ),
-                    scope: STAT_IMAGE_SCOPE_ALL_SEED_PEERS.to_string(),
-                    enable_task_id_based_blob_digest: true,
-                    ..Default::default()
-                });
-            then.pb(ApiStatImageResponse::default());
-        });
-
-        let mock_scheduler = setup_mock_scheduler_with_mocks(vec![], mocks)
-            .await
-            .unwrap();
-        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
-        let proxy = Proxy::builder()
-            .scheduler_endpoint(scheduler_endpoint)
-            .build()
-            .await
-            .unwrap();
-
-        let request = StatImageRequest {
-            image: "example.com/foo/bar@sha256:b5f4dfca35398b36f61baa60e2bf2c242401c9d7db3de9168dcf780a2feedd2d"
-                .to_string(),
-            ..Default::default()
-        };
-
-        let response = proxy.stat_image(&request).await.unwrap();
-        assert!(response.layers.is_empty());
-        assert!(response.peers.is_empty());
-    }
-
-    #[cfg(feature = "preheat")]
-    #[tokio::test]
-    async fn stat_image_normalizes_docker_hub_reference() {
-        use dragonfly_api::scheduler::v2::StatImageResponse as ApiStatImageResponse;
-
-        // The manifest url must be identical to the one generated by the Go
-        // implementation for the same image reference.
-        let mut mocks = MockSet::new();
-        mocks.mock(|when, then| {
-            when.path("/scheduler.v2.Scheduler/StatImage")
-                .pb(SchedulerStatImageRequest {
-                    url: "https://registry-1.docker.io/v2/library/nginx/manifests/latest"
-                        .to_string(),
-                    filtered_query_params: default_proxy_rule_filtered_query_params(),
-                    timeout: Some(
-                        prost_wkt_types::Duration::try_from(DEFAULT_REQUEST_TIMEOUT).unwrap(),
-                    ),
-                    scope: STAT_IMAGE_SCOPE_ALL_SEED_PEERS.to_string(),
-                    enable_task_id_based_blob_digest: true,
-                    ..Default::default()
-                });
-            then.pb(ApiStatImageResponse::default());
-        });
-
-        let mock_scheduler = setup_mock_scheduler_with_mocks(vec![], mocks)
-            .await
-            .unwrap();
-        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
-        let proxy = Proxy::builder()
-            .scheduler_endpoint(scheduler_endpoint)
-            .build()
-            .await
-            .unwrap();
-
-        let request = StatImageRequest {
-            image: "nginx".to_string(),
-            ..Default::default()
-        };
-
-        let response = proxy.stat_image(&request).await.unwrap();
-        assert!(response.layers.is_empty());
-        assert!(response.peers.is_empty());
-    }
-
-    #[cfg(feature = "preheat")]
-    #[tokio::test]
     async fn stat_image_invalid_argument() {
         let test_cases = vec![
             (
@@ -5141,6 +5025,14 @@ mod tests {
                     ..Default::default()
                 },
                 "invalid platform format",
+            ),
+            (
+                StatImageRequest {
+                    image: "docker.io/library/nginx:latest".to_string(),
+                    concurrent_peer_count: 0,
+                    ..Default::default()
+                },
+                "concurrent peer count must be positive",
             ),
         ];
 
@@ -5163,7 +5055,7 @@ mod tests {
 
     #[cfg(feature = "preheat")]
     #[tokio::test]
-    async fn stat_image_scheduler_error() {
+    async fn stat_image_unreachable_registry() {
         let mock_server = setup_mock_scheduler(vec![]).await.unwrap();
         let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_server.port().unwrap());
         let proxy = Proxy::builder()
@@ -5173,44 +5065,13 @@ mod tests {
             .unwrap();
 
         let request = StatImageRequest {
-            image: "example.com/foo/bar:1.0".to_string(),
-            timeout: Duration::from_secs(5),
+            image: "127.0.0.1:1/library/nginx:latest".to_string(),
             ..Default::default()
         };
 
         let result = proxy.stat_image(&request).await;
         assert!(
-            matches!(result, Err(Error::Internal(message)) if message.contains("failed to stat image"))
-        );
-    }
-
-    #[cfg(feature = "preheat")]
-    #[tokio::test]
-    async fn stat_image_scheduler_invalid_argument() {
-        let mut mocks = MockSet::new();
-        mocks.mock(|when, then| {
-            when.path("/scheduler.v2.Scheduler/StatImage");
-            then.unprocessable_content();
-        });
-
-        let mock_scheduler = setup_mock_scheduler_with_mocks(vec![], mocks)
-            .await
-            .unwrap();
-        let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
-        let proxy = Proxy::builder()
-            .scheduler_endpoint(scheduler_endpoint)
-            .build()
-            .await
-            .unwrap();
-
-        let request = StatImageRequest {
-            image: "example.com/foo/bar:1.0".to_string(),
-            ..Default::default()
-        };
-
-        let result = proxy.stat_image(&request).await;
-        assert!(
-            matches!(result, Err(Error::InvalidArgument(message)) if message.contains("failed to stat image"))
+            matches!(result, Err(Error::Internal(message)) if message.contains("failed to pull image manifest"))
         );
     }
 

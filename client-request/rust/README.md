@@ -230,10 +230,10 @@ for peer in response.peers {
 ```
 
 Since 1.13.0 a breaking change: `preheat_image` preheats all the platforms
-unless a platform is set, `delete_image` no longer takes the options of the
-preheat and returns the tasks deleted and retained, and `PeerImage` is renamed
-to `PeerStatedImage`. The seed peers must run dfdaemon v1.5.12 or later, and
-`stat_image` stats all the platforms only with scheduler v2.5.4 or later.
+unless a platform is set, `stat_image` resolves the image itself and asks the
+seed peers instead of the scheduler, `delete_image` no longer takes the options
+of the preheat and returns the tasks deleted and retained, and `PeerImage` is
+renamed to `PeerStatedImage`. The seed peers must run dfdaemon v1.5.12 or later.
 
 See [examples](./examples) for runnable examples.
 
