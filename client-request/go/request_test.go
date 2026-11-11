@@ -39,20 +39,11 @@ import (
 
 type mockScheduler struct {
 	schedulerv2.UnimplementedSchedulerServer
-	hosts     []*commonv2.Host
-	statImage func(*schedulerv2.StatImageRequest) (*schedulerv2.StatImageResponse, error)
+	hosts []*commonv2.Host
 }
 
 func (s *mockScheduler) ListHosts(ctx context.Context, req *schedulerv2.ListHostsRequest) (*schedulerv2.ListHostsResponse, error) {
 	return &schedulerv2.ListHostsResponse{Hosts: s.hosts}, nil
-}
-
-func (s *mockScheduler) StatImage(ctx context.Context, req *schedulerv2.StatImageRequest) (*schedulerv2.StatImageResponse, error) {
-	if s.statImage != nil {
-		return s.statImage(req)
-	}
-
-	return s.UnimplementedSchedulerServer.StatImage(ctx, req)
 }
 
 func setupMockScheduler(t testing.TB, hosts []*commonv2.Host) string {
@@ -77,19 +68,26 @@ func setupMockSchedulerServer(t testing.TB, scheduler *mockScheduler) string {
 
 type mockSeedPeer struct {
 	dfdaemonv2.UnimplementedDfdaemonUploadServer
-	downloadErr error
-	onDownload  func()
-	deleteErr   error
-	onDelete    func()
+	downloadTaskErr error
+	onDownloadTask  func()
+	downloadTask    func(*dfdaemonv2.DownloadTaskRequest)
+	deleteTaskErr   error
+	onDeleteTask    func()
+	deleteImage     func(*dfdaemonv2.DeleteImageRequest) (*dfdaemonv2.DeleteImageResponse, error)
+	statLocalTask   func(*dfdaemonv2.StatLocalTaskRequest) (*dfdaemonv2.StatLocalTaskResponse, error)
 }
 
 func (s *mockSeedPeer) DownloadTask(req *dfdaemonv2.DownloadTaskRequest, stream dfdaemonv2.DfdaemonUpload_DownloadTaskServer) error {
-	if s.onDownload != nil {
-		s.onDownload()
+	if s.onDownloadTask != nil {
+		s.onDownloadTask()
 	}
 
-	if s.downloadErr != nil {
-		return s.downloadErr
+	if s.downloadTask != nil {
+		s.downloadTask(req)
+	}
+
+	if s.downloadTaskErr != nil {
+		return s.downloadTaskErr
 	}
 
 	for range 2 {
@@ -106,19 +104,35 @@ func (s *mockSeedPeer) DownloadTask(req *dfdaemonv2.DownloadTaskRequest, stream 
 }
 
 func (s *mockSeedPeer) DeleteTask(ctx context.Context, req *dfdaemonv2.DeleteTaskRequest) (*emptypb.Empty, error) {
-	if s.onDelete != nil {
-		s.onDelete()
+	if s.onDeleteTask != nil {
+		s.onDeleteTask()
 	}
 
-	if s.deleteErr != nil {
-		return nil, s.deleteErr
+	if s.deleteTaskErr != nil {
+		return nil, s.deleteTaskErr
 	}
 
 	return &emptypb.Empty{}, nil
 }
 
-func setupMockSeedPeer(t testing.TB, downloadErr error) int32 {
-	return setupMockSeedPeerServer(t, &mockSeedPeer{downloadErr: downloadErr})
+func (s *mockSeedPeer) DeleteImage(ctx context.Context, req *dfdaemonv2.DeleteImageRequest) (*dfdaemonv2.DeleteImageResponse, error) {
+	if s.deleteImage != nil {
+		return s.deleteImage(req)
+	}
+
+	return s.UnimplementedDfdaemonUploadServer.DeleteImage(ctx, req)
+}
+
+func (s *mockSeedPeer) StatLocalTask(ctx context.Context, req *dfdaemonv2.StatLocalTaskRequest) (*dfdaemonv2.StatLocalTaskResponse, error) {
+	if s.statLocalTask != nil {
+		return s.statLocalTask(req)
+	}
+
+	return s.UnimplementedDfdaemonUploadServer.StatLocalTask(ctx, req)
+}
+
+func setupMockSeedPeer(t testing.TB, downloadTaskErr error) int32 {
+	return setupMockSeedPeerServer(t, &mockSeedPeer{downloadTaskErr: downloadTaskErr})
 }
 
 func setupMockSeedPeerServer(t testing.TB, peer *mockSeedPeer) int32 {
@@ -199,14 +213,17 @@ func TestNewRequestDefaults(t *testing.T) {
 	assert.Equal(defaultRequestTimeout, preheat.timeout)
 
 	image := NewPreheatImageRequest("docker.io/library/nginx:latest")
+	assert.Nil(image.platform)
 	assert.Equal(2, image.replicas)
 	assert.Equal(4, image.concurrentTaskCount)
 	assert.Equal(defaultRequestTimeout, image.timeout)
 
 	stat := NewStatImageRequest("docker.io/library/nginx:latest")
+	assert.Nil(stat.platform)
 	assert.NotEmpty(stat.filteredQueryParams)
 	assert.True(stat.enableTaskIDBasedBlobDigest)
 	assert.Equal(defaultRequestTimeout, stat.timeout)
+	assert.Equal(500, stat.concurrentPeerCount)
 
 	del := NewDeleteRequest("https://example.com/file.txt")
 	assert.NotEmpty(del.filteredQueryParams)
@@ -215,11 +232,9 @@ func TestNewRequestDefaults(t *testing.T) {
 	assert.Equal(defaultRequestTimeout, del.timeout)
 
 	deleteImage := NewDeleteImageRequest("docker.io/library/nginx:latest")
-	assert.NotEmpty(deleteImage.filteredQueryParams)
-	assert.True(deleteImage.enableTaskIDBasedBlobDigest)
-	assert.Equal(2, deleteImage.replicas)
-	assert.Equal(4, deleteImage.concurrentTaskCount)
+	assert.Nil(deleteImage.platform)
 	assert.Equal(defaultRequestTimeout, deleteImage.timeout)
+	assert.Equal(500, deleteImage.concurrentPeerCount)
 }
 
 func setupBenchProxy(b *testing.B, body []byte) (*Proxy, string) {

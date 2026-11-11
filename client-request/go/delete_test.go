@@ -25,59 +25,63 @@ import (
 	"time"
 
 	commonv2 "d7y.io/api/v2/pkg/apis/common/v2"
+	dfdaemonv2 "d7y.io/api/v2/pkg/apis/dfdaemon/v2"
 	"github.com/cenkalti/backoff/v5"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
-func TestDeleteImageInvalidReference(t *testing.T) {
-	assert := assert.New(t)
-	endpoint := setupMockScheduler(t, nil)
-
-	proxy, err := New(context.Background(), endpoint)
-	assert.NoError(err)
-	defer proxy.Close()
-
-	err = proxy.DeleteImage(context.Background(), NewDeleteImageRequest("invalid image reference!!"))
-	assert.ErrorIs(err, ErrInvalidArgument)
-	assert.ErrorContains(err, "invalid image reference")
-}
-
-func TestDeleteImageInvalidArguments(t *testing.T) {
+func TestDeleteImageInvalidArgument(t *testing.T) {
 	tests := []struct {
-		name string
-		req  *DeleteImageRequest
+		name   string
+		req    *DeleteImageRequest
+		expect func(t *testing.T, err error)
 	}{
 		{
-			name: "zero replicas",
-			req:  NewDeleteImageRequest("docker.io/library/nginx:latest", WithDeleteImageRequestReplicas(0)),
+			name: "invalid reference",
+			req:  NewDeleteImageRequest("invalid image reference!!"),
+			expect: func(t *testing.T, err error) {
+				assert := assert.New(t)
+				assert.ErrorIs(err, ErrInvalidArgument)
+				assert.ErrorContains(err, "invalid image reference")
+			},
 		},
 		{
-			name: "zero concurrent task count",
-			req:  NewDeleteImageRequest("docker.io/library/nginx:latest", WithDeleteImageRequestConcurrentTaskCount(0)),
+			name: "invalid platform",
+			req:  NewDeleteImageRequest("docker.io/library/nginx:latest", WithDeleteImageRequestPlatform("linux-amd64")),
+			expect: func(t *testing.T, err error) {
+				assert := assert.New(t)
+				assert.ErrorIs(err, ErrInvalidArgument)
+				assert.ErrorContains(err, "invalid platform format")
+			},
 		},
 		{
-			name: "invalid scope",
-			req:  NewDeleteImageRequest("docker.io/library/nginx:latest", WithDeleteImageRequestScope(Scope("all_peers"))),
+			name: "invalid concurrent peer count",
+			req:  NewDeleteImageRequest("docker.io/library/nginx:latest", WithDeleteImageRequestConcurrentPeerCount(0)),
+			expect: func(t *testing.T, err error) {
+				assert := assert.New(t)
+				assert.ErrorIs(err, ErrInvalidArgument)
+				assert.ErrorContains(err, "concurrent peer count must be positive")
+			},
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			assert := assert.New(t)
 			endpoint := setupMockScheduler(t, nil)
 
 			proxy, err := New(context.Background(), endpoint)
-			assert.NoError(err)
+			assert.NoError(t, err)
 			defer proxy.Close()
 
-			assert.ErrorIs(proxy.DeleteImage(context.Background(), tc.req), ErrInvalidArgument)
+			_, err = proxy.DeleteImage(context.Background(), tc.req)
+			tc.expect(t, err)
 		})
 	}
 }
 
-func TestDeleteImageInvalidPlatform(t *testing.T) {
+func TestDeleteImageNoAvailableSeedPeers(t *testing.T) {
 	assert := assert.New(t)
 	endpoint := setupMockScheduler(t, nil)
 
@@ -85,22 +89,222 @@ func TestDeleteImageInvalidPlatform(t *testing.T) {
 	assert.NoError(err)
 	defer proxy.Close()
 
-	req := NewDeleteImageRequest("docker.io/library/nginx:latest", WithDeleteImageRequestPlatform("linux-amd64"))
-	err = proxy.DeleteImage(context.Background(), req)
-	assert.ErrorContains(err, "invalid platform format")
+	_, err = proxy.DeleteImage(context.Background(), NewDeleteImageRequest("example.com/foo/bar:1.0"))
+	assert.ErrorIs(err, ErrInternal)
+	assert.ErrorContains(err, "failed to select seed peers")
 }
 
-func TestDeleteImageUnreachableRegistry(t *testing.T) {
-	assert := assert.New(t)
-	endpoint := setupMockScheduler(t, nil)
+func TestDeleteImageAllSeedPeers(t *testing.T) {
+	tests := []struct {
+		name   string
+		failed string
+		expect func(t *testing.T, resp *DeleteImageResponse, err error)
+	}{
+		{
+			name: "every seed peer deletes the image",
+			expect: func(t *testing.T, resp *DeleteImageResponse, err error) {
+				assert := assert.New(t)
+				assert.NoError(err)
+				assert.ElementsMatch([]*PeerDeletedImage{
+					{IP: "127.0.0.1", Hostname: "seed-peer-1", DeletedTaskIDs: []string{"seed-peer-1-deleted"}, RetainedTaskIDs: []string{"seed-peer-1-retained"}},
+					{IP: "127.0.0.1", Hostname: "seed-peer-2", DeletedTaskIDs: []string{"seed-peer-2-deleted"}, RetainedTaskIDs: []string{"seed-peer-2-retained"}},
+					{IP: "127.0.0.1", Hostname: "seed-peer-3", DeletedTaskIDs: []string{"seed-peer-3-deleted"}, RetainedTaskIDs: []string{"seed-peer-3-retained"}},
+				}, resp.Peers)
+			},
+		},
+		{
+			name:   "failed seed peer is left out",
+			failed: "seed-peer-2",
+			expect: func(t *testing.T, resp *DeleteImageResponse, err error) {
+				assert := assert.New(t)
+				assert.NoError(err)
+				assert.ElementsMatch([]*PeerDeletedImage{
+					{IP: "127.0.0.1", Hostname: "seed-peer-1", DeletedTaskIDs: []string{"seed-peer-1-deleted"}, RetainedTaskIDs: []string{"seed-peer-1-retained"}},
+					{IP: "127.0.0.1", Hostname: "seed-peer-3", DeletedTaskIDs: []string{"seed-peer-3-deleted"}, RetainedTaskIDs: []string{"seed-peer-3-retained"}},
+				}, resp.Peers)
+			},
+		},
+	}
 
-	proxy, err := New(context.Background(), endpoint)
-	assert.NoError(err)
-	defer proxy.Close()
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var hosts []*commonv2.Host
+			for _, name := range []string{"seed-peer-1", "seed-peer-2", "seed-peer-3"} {
+				port := setupMockSeedPeerServer(t, &mockSeedPeer{
+					deleteImage: func(*dfdaemonv2.DeleteImageRequest) (*dfdaemonv2.DeleteImageResponse, error) {
+						if name == tc.failed {
+							return nil, status.Error(codes.PermissionDenied, "delete failed")
+						}
 
-	req := NewDeleteImageRequest("127.0.0.1:1/library/nginx:latest", WithDeleteImageRequestTimeout(5*time.Second))
-	err = proxy.DeleteImage(context.Background(), req)
-	assert.ErrorIs(err, ErrInternal)
+						return &dfdaemonv2.DeleteImageResponse{
+							DeletedTaskIds:  []string{name + "-deleted"},
+							RetainedTaskIds: []string{name + "-retained"},
+						}, nil
+					},
+				})
+				hosts = append(hosts, createSeedPeerHost(name, port, 0))
+			}
+			endpoint := setupMockScheduler(t, hosts)
+
+			proxy, err := New(context.Background(), endpoint)
+			assert.NoError(t, err)
+			defer proxy.Close()
+
+			resp, err := proxy.DeleteImage(context.Background(), NewDeleteImageRequest("example.com/foo/bar:1.0"))
+			tc.expect(t, resp, err)
+		})
+	}
+}
+
+func TestDeleteImageDeletesByManifestURL(t *testing.T) {
+	tests := []struct {
+		name   string
+		req    *DeleteImageRequest
+		expect func(t *testing.T, deleteImageRequest *dfdaemonv2.DeleteImageRequest)
+	}{
+		{
+			name: "tag reference",
+			req:  NewDeleteImageRequest("example.com/foo/bar:1.0"),
+			expect: func(t *testing.T, deleteImageRequest *dfdaemonv2.DeleteImageRequest) {
+				assert := assert.New(t)
+				assert.Equal("https://example.com/v2/foo/bar/manifests/1.0", deleteImageRequest.GetUrl())
+				assert.Nil(deleteImageRequest.Platform)
+			},
+		},
+		{
+			name: "digest reference",
+			req:  NewDeleteImageRequest("example.com/foo/bar@sha256:b5f4dfca35398b36f61baa60e2bf2c242401c9d7db3de9168dcf780a2feedd2d"),
+			expect: func(t *testing.T, deleteImageRequest *dfdaemonv2.DeleteImageRequest) {
+				assert := assert.New(t)
+				assert.Equal("https://example.com/v2/foo/bar/manifests/sha256:b5f4dfca35398b36f61baa60e2bf2c242401c9d7db3de9168dcf780a2feedd2d", deleteImageRequest.GetUrl())
+				assert.Nil(deleteImageRequest.Platform)
+			},
+		},
+		{
+			name: "docker hub reference",
+			req:  NewDeleteImageRequest("nginx"),
+			expect: func(t *testing.T, deleteImageRequest *dfdaemonv2.DeleteImageRequest) {
+				assert := assert.New(t)
+				assert.Equal("https://registry-1.docker.io/v2/library/nginx/manifests/latest", deleteImageRequest.GetUrl())
+				assert.Nil(deleteImageRequest.Platform)
+			},
+		},
+		{
+			name: "platform",
+			req:  NewDeleteImageRequest("example.com/foo/bar:1.0", WithDeleteImageRequestPlatform("linux/arm64")),
+			expect: func(t *testing.T, deleteImageRequest *dfdaemonv2.DeleteImageRequest) {
+				assert := assert.New(t)
+				assert.Equal("https://example.com/v2/foo/bar/manifests/1.0", deleteImageRequest.GetUrl())
+				assert.Equal("linux/arm64", deleteImageRequest.GetPlatform())
+			},
+		},
+		{
+			name: "platform is normalized",
+			req:  NewDeleteImageRequest("example.com/foo/bar:1.0", WithDeleteImageRequestPlatform("linux/aarch64")),
+			expect: func(t *testing.T, deleteImageRequest *dfdaemonv2.DeleteImageRequest) {
+				assert := assert.New(t)
+				assert.Equal("https://example.com/v2/foo/bar/manifests/1.0", deleteImageRequest.GetUrl())
+				assert.Equal("linux/arm64", deleteImageRequest.GetPlatform())
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			deleteImageRequests := make(chan *dfdaemonv2.DeleteImageRequest, 1)
+			port := setupMockSeedPeerServer(t, &mockSeedPeer{
+				deleteImage: func(req *dfdaemonv2.DeleteImageRequest) (*dfdaemonv2.DeleteImageResponse, error) {
+					deleteImageRequests <- req
+					return &dfdaemonv2.DeleteImageResponse{}, nil
+				},
+			})
+			endpoint := setupMockScheduler(t, []*commonv2.Host{createSeedPeerHost("seed-peer-1", port, 0)})
+
+			proxy, err := New(context.Background(), endpoint)
+			assert.NoError(t, err)
+			defer proxy.Close()
+
+			resp, err := proxy.DeleteImage(context.Background(), tc.req)
+			assert.NoError(t, err)
+			assert.Len(t, resp.Peers, 1)
+			tc.expect(t, <-deleteImageRequests)
+		})
+	}
+}
+
+func TestDeleteImageRetriesOnlyTransientDeleteFailures(t *testing.T) {
+	tests := []struct {
+		name       string
+		code       codes.Code
+		maxRetries uint8
+		expect     func(t *testing.T, hits int32, resp *DeleteImageResponse, err error)
+	}{
+		{
+			name:       "internal",
+			code:       codes.Internal,
+			maxRetries: 1,
+			expect: func(t *testing.T, hits int32, resp *DeleteImageResponse, err error) {
+				assert := assert.New(t)
+				assert.NoError(err)
+				assert.Empty(resp.Peers)
+				assert.Equal(int32(2), hits)
+			},
+		},
+		{
+			name:       "unavailable",
+			code:       codes.Unavailable,
+			maxRetries: 2,
+			expect: func(t *testing.T, hits int32, resp *DeleteImageResponse, err error) {
+				assert := assert.New(t)
+				assert.NoError(err)
+				assert.Empty(resp.Peers)
+				assert.Equal(int32(3), hits)
+			},
+		},
+		{
+			name:       "not found",
+			code:       codes.NotFound,
+			maxRetries: 3,
+			expect: func(t *testing.T, hits int32, resp *DeleteImageResponse, err error) {
+				assert := assert.New(t)
+				assert.NoError(err)
+				assert.Empty(resp.Peers)
+				assert.Equal(int32(1), hits)
+			},
+		},
+		{
+			name:       "permission denied",
+			code:       codes.PermissionDenied,
+			maxRetries: 3,
+			expect: func(t *testing.T, hits int32, resp *DeleteImageResponse, err error) {
+				assert := assert.New(t)
+				assert.NoError(err)
+				assert.Empty(resp.Peers)
+				assert.Equal(int32(1), hits)
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var hits atomic.Int32
+			port := setupMockSeedPeerServer(t, &mockSeedPeer{
+				deleteImage: func(*dfdaemonv2.DeleteImageRequest) (*dfdaemonv2.DeleteImageResponse, error) {
+					hits.Add(1)
+					return nil, status.Error(tc.code, "delete failed")
+				},
+			})
+			endpoint := setupMockScheduler(t, []*commonv2.Host{createSeedPeerHost("seed-peer-1", port, 0)})
+
+			exponential := &backoff.ExponentialBackOff{InitialInterval: time.Millisecond, Multiplier: 2, MaxInterval: 2 * time.Millisecond}
+			proxy, err := New(context.Background(), endpoint, WithProxyMaxRetries(tc.maxRetries), WithProxyBackoff(exponential))
+			assert.NoError(t, err)
+			defer proxy.Close()
+
+			resp, err := proxy.DeleteImage(context.Background(), NewDeleteImageRequest("example.com/foo/bar:1.0"))
+			tc.expect(t, hits.Load(), resp, err)
+		})
+	}
 }
 
 func TestDeleteNoAvailableSeedPeers(t *testing.T) {
@@ -124,12 +328,12 @@ func TestPreheatAndDeleteHitSameSeedPeers(t *testing.T) {
 	var hosts []*commonv2.Host
 	for _, name := range []string{"seed-peer-1", "seed-peer-2", "seed-peer-3"} {
 		port := setupMockSeedPeerServer(t, &mockSeedPeer{
-			onDownload: func() {
+			onDownloadTask: func() {
 				mu.Lock()
 				preheated[name] = true
 				mu.Unlock()
 			},
-			onDelete: func() {
+			onDeleteTask: func() {
 				mu.Lock()
 				deleted[name] = true
 				mu.Unlock()
@@ -184,12 +388,12 @@ func TestPreheatAndDeleteAllSeedPeers(t *testing.T) {
 	var hosts []*commonv2.Host
 	for _, name := range []string{"seed-peer-1", "seed-peer-2", "seed-peer-3"} {
 		port := setupMockSeedPeerServer(t, &mockSeedPeer{
-			onDownload: func() {
+			onDownloadTask: func() {
 				mu.Lock()
 				preheated[name] = true
 				mu.Unlock()
 			},
-			onDelete: func() {
+			onDeleteTask: func() {
 				mu.Lock()
 				deleted[name] = true
 				mu.Unlock()
@@ -267,8 +471,8 @@ func TestDeleteRetriesOnlyTransientDeleteFailures(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var hits atomic.Int32
 			port := setupMockSeedPeerServer(t, &mockSeedPeer{
-				deleteErr: status.Error(tc.code, "delete failed"),
-				onDelete:  func() { hits.Add(1) },
+				deleteTaskErr: status.Error(tc.code, "delete failed"),
+				onDeleteTask:  func() { hits.Add(1) },
 			})
 			endpoint := setupMockScheduler(t, []*commonv2.Host{createSeedPeerHost("seed-peer-1", port, 0)})
 

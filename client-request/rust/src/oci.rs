@@ -14,17 +14,9 @@
  * limitations under the License.
  */
 
-use crate::errors::Error;
-use crate::Result;
-use oci_client::client::{current_platform_resolver, ClientConfig};
-use oci_client::manifest::{ImageIndexEntry, OciImageManifest};
-use oci_client::{Client, Reference};
-use oci_spec::image::{Arch, Os};
+use oci_client::manifest::OciImageManifest;
+use oci_client::Reference;
 use std::collections::BTreeSet;
-
-/// The type alias for the resolver that selects the digest of the matching manifest
-/// from a multi-platform image index.
-type PlatformResolver = Box<dyn Fn(&[ImageIndexEntry]) -> Option<String> + Send + Sync>;
 
 /// Builds the blob URL for the given registry, repository and digest.
 pub(crate) fn build_blob_url(registry: &str, repository: &str, digest: &str) -> String {
@@ -56,50 +48,10 @@ pub(crate) fn resolve_registry(reference: &Reference) -> &str {
     }
 }
 
-/// Builds a platform resolver that selects the digest of the manifest matching
-/// the requested platform in the format "os/arch" (e.g., 'linux/amd64') from a
-/// multi-platform image index.
-fn platform_resolver(platform: &str) -> Result<PlatformResolver> {
-    let (os, arch) = platform
-        .split_once('/')
-        .map(|(os, arch)| (Os::from(os), Arch::from(arch)))
-        .ok_or_else(|| {
-            Error::InvalidArgument(format!(
-                "invalid platform format '{platform}', expected 'os/arch' (e.g., 'linux/amd64')"
-            ))
-        })?;
-
-    Ok(Box::new(move |manifests: &[ImageIndexEntry]| {
-        manifests
-            .iter()
-            .find(|entry| {
-                entry
-                    .platform
-                    .as_ref()
-                    .is_some_and(|platform| platform.os == os && platform.architecture == arch)
-            })
-            .map(|entry| entry.digest.clone())
-    }))
-}
-
-/// Builds an OCI client with a platform resolver that matches the requested os/arch,
-/// defaulting to the current platform when the platform is not specified.
-pub(crate) fn oci_client(platform: Option<String>) -> Result<Client> {
-    let oci_config = ClientConfig {
-        platform_resolver: match platform {
-            Some(platform) => Some(platform_resolver(&platform)?),
-            None => Some(Box::new(current_platform_resolver)),
-        },
-        ..ClientConfig::default()
-    };
-
-    Ok(Client::new(oci_config))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oci_client::manifest::{OciDescriptor, IMAGE_MANIFEST_MEDIA_TYPE};
+    use oci_client::manifest::OciDescriptor;
 
     #[test]
     fn build_blob_url_uses_https_by_default() {
@@ -154,61 +106,6 @@ mod tests {
         for (image, expected) in test_cases {
             let reference: Reference = image.parse().unwrap();
             assert_eq!(resolve_registry(&reference), expected);
-        }
-    }
-
-    #[test]
-    fn platform_resolver_matches_manifests() {
-        let manifests = vec![
-            image_index_entry("sha256:amd64", Some((Os::Linux, Arch::Amd64))),
-            image_index_entry("sha256:arm64", Some((Os::Linux, Arch::ARM64))),
-            image_index_entry("sha256:no-platform", None),
-        ];
-
-        let test_cases = vec![
-            ("linux/amd64", Ok(Some("sha256:amd64"))),
-            ("linux/arm64", Ok(Some("sha256:arm64"))),
-            ("windows/amd64", Ok(None)),
-            ("linux/riscv64", Ok(None)),
-            ("linux-amd64", Err("invalid platform format")),
-            ("", Err("invalid platform format")),
-        ];
-
-        for (platform, expected) in test_cases {
-            match expected {
-                Ok(expected_digest) => {
-                    let resolver = platform_resolver(platform).unwrap();
-                    assert_eq!(
-                        resolver(&manifests),
-                        expected_digest.map(|digest| digest.to_string()),
-                        "platform: {platform}"
-                    );
-                }
-                Err(expected_message) => {
-                    assert!(
-                        matches!(platform_resolver(platform), Err(Error::InvalidArgument(message)) if message.contains(expected_message)),
-                        "platform: {platform}"
-                    );
-                }
-            }
-        }
-    }
-
-    fn image_index_entry(digest: &str, platform: Option<(Os, Arch)>) -> ImageIndexEntry {
-        ImageIndexEntry {
-            media_type: IMAGE_MANIFEST_MEDIA_TYPE.to_string(),
-            digest: digest.to_string(),
-            size: 0,
-            platform: platform.map(|(os, architecture)| oci_client::manifest::Platform {
-                architecture,
-                os,
-                os_version: None,
-                os_features: None,
-                variant: None,
-                features: None,
-            }),
-            annotations: None,
-            artifact_type: None,
         }
     }
 }

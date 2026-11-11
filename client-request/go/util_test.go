@@ -23,42 +23,6 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestUniqueURLs(t *testing.T) {
-	tests := []struct {
-		name   string
-		urls   []string
-		expect []string
-	}{
-		{
-			name:   "empty",
-			urls:   nil,
-			expect: nil,
-		},
-		{
-			name: "duplicate layers",
-			urls: []string{
-				"https://example.com/v2/foo/bar/blobs/sha256:cccc",
-				"https://example.com/v2/foo/bar/blobs/sha256:bbbb",
-				"https://example.com/v2/foo/bar/blobs/sha256:aaaa",
-				"https://example.com/v2/foo/bar/blobs/sha256:bbbb",
-				"https://example.com/v2/foo/bar/blobs/sha256:cccc",
-			},
-			expect: []string{
-				"https://example.com/v2/foo/bar/blobs/sha256:aaaa",
-				"https://example.com/v2/foo/bar/blobs/sha256:bbbb",
-				"https://example.com/v2/foo/bar/blobs/sha256:cccc",
-			},
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			assert := assert.New(t)
-			assert.Equal(tc.expect, uniqueURLs(tc.urls))
-		})
-	}
-}
-
 func TestHeaderToMap(t *testing.T) {
 	tests := []struct {
 		name   string

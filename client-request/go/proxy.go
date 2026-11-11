@@ -28,6 +28,7 @@ import (
 	"syscall"
 	"time"
 
+	commonv2 "d7y.io/api/v2/pkg/apis/common/v2"
 	"d7y.io/dragonfly/v2/pkg/idgen"
 	"github.com/cenkalti/backoff/v5"
 
@@ -398,6 +399,16 @@ func (p *Proxy) lookupProxyEndpoints(req *GetRequest) ([]string, error) {
 	}
 
 	return endpoints, nil
+}
+
+// selectSeedPeers selects the seed peers the scope addresses for the task: the
+// replicas in the consistent hash ring order, or all seed peers.
+func (p *Proxy) selectSeedPeers(id string, scope Scope, replicas int) ([]*commonv2.Host, error) {
+	if scope == ScopeAllSeedPeers {
+		return p.seedPeerSelector.SelectAll()
+	}
+
+	return p.seedPeerSelector.Select(id, uint32(replicas))
 }
 
 // sendTo sends the request once to the seed peer proxy at endpoint through its

@@ -14,9 +14,10 @@
  * limitations under the License.
  */
 
-//! Deletes a preheated file or an OCI image from the seed peers via the Dragonfly,
-//! from the replicas of the task by default or from all seed peers with the
-//! `all_seed_peers` scope.
+//! Deletes a preheated file or an OCI image from the seed peers via the Dragonfly.
+//! A file is deleted from the replicas of the task by default or from all seed
+//! peers with the `all_seed_peers` scope, an image is deleted from all healthy
+//! seed peers.
 //!
 //! Usage: cargo run --example delete --features preheat -- <scheduler-endpoint> file|image <url-or-image> [default|all_seed_peers]
 
@@ -33,7 +34,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    // Address the replicas of the task unless the scope is given.
+    // Address the replicas of the task unless the scope is given, the scope only
+    // applies to a file.
     let scope = match args.get(4).map(String::as_str) {
         None | Some("default") => Scope::Default,
         Some("all_seed_peers") => Scope::AllSeedPeers,
@@ -55,15 +57,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .await?
         }
-        _ => {
-            proxy
+        "image" => {
+            let response = proxy
                 .delete_image(&DeleteImageRequest {
                     image: args[3].clone(),
-                    scope,
                     ..Default::default()
                 })
-                .await?
+                .await?;
+
+            for peer in response.peers.iter() {
+                println!(
+                    "peer {} ({}) deleted {} tasks and retained {} tasks",
+                    peer.hostname,
+                    peer.ip,
+                    peer.deleted_task_ids.len(),
+                    peer.retained_task_ids.len()
+                );
+            }
         }
+        _ => unreachable!(),
     }
 
     Ok(())

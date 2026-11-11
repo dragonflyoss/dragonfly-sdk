@@ -30,6 +30,7 @@ import (
 	"d7y.io/dragonfly/v2/pkg/idgen"
 	"d7y.io/dragonfly/v2/pkg/net/ip"
 	"d7y.io/dragonfly/v2/pkg/oci"
+	"github.com/containerd/platforms"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -69,67 +70,79 @@ func (p *Proxy) Delete(ctx context.Context, req *DeleteRequest) error {
 	g, ctx := errgroup.WithContext(ctx)
 	for _, peer := range seedPeers {
 		g.Go(func() error {
-			return p.delete(ctx, peer, deleteTaskRequest, req.timeout)
+			return p.deleteTask(ctx, peer, deleteTaskRequest, req.timeout)
 		})
 	}
 
 	return g.Wait()
 }
 
-// DeleteImage deletes a preheated OCI image from the seed peers via the
-// Dragonfly. It resolves the image like PreheatImage and has the replica seed
-// peers serving each matched platform manifest and each blob (config and
-// layers) delete the task by the dfdaemon delete task API. A seed peer
-// answering NotFound for a task counts as deleted.
-func (p *Proxy) DeleteImage(ctx context.Context, req *DeleteImageRequest) error {
+// DeleteImage deletes a preheated OCI image from every healthy seed peer by the
+// dfdaemon delete image API, for all its platforms or the specified one. A task
+// still referenced by another image or platform is retained. A seed peer that
+// fails is left out of the response.
+func (p *Proxy) DeleteImage(ctx context.Context, req *DeleteImageRequest) (*DeleteImageResponse, error) {
 	if err := req.validate(); err != nil {
-		return err
+		return nil, err
 	}
 
 	ref, err := oci.ParseImage(req.image)
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+		return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
 	}
 
-	manifestURLs, blobURLs, _, err := oci.Resolve(ctx, ref,
-		oci.WithAuth(req.username, req.password),
-		oci.WithPlatform(req.platform),
-		oci.WithHTTPClient(oci.DefaultHTTPClient()),
-	)
+	// Select all seed peers.
+	seedPeers, err := p.seedPeerSelector.SelectAll()
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrInternal, err)
+		return nil, fmt.Errorf("%w: failed to select seed peers: %v", ErrInternal, err)
 	}
 
-	// Delete the manifests and blobs concurrently, limited by the concurrent
-	// task count.
-	g, ctx := errgroup.WithContext(ctx)
-	g.SetLimit(req.concurrentTaskCount)
-	for _, url := range uniqueURLs(slices.Concat(manifestURLs, blobURLs)) {
+	// Construct the delete image request, the platform is normalized as the
+	// preheat records it.
+	remoteIP := ip.IPv4.String()
+	deleteImageRequest := &dfdaemonv2.DeleteImageRequest{Url: ref.ManifestURL(), RemoteIp: &remoteIP}
+	if req.platform != nil {
+		spec, err := platforms.Parse(*req.platform)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+		}
+
+		platform := fmt.Sprintf("%s/%s", spec.OS, spec.Architecture)
+		deleteImageRequest.Platform = &platform
+	}
+
+	// Delete the image from every seed peer concurrently.
+	peers := make([]*PeerDeletedImage, len(seedPeers))
+	var g errgroup.Group
+	g.SetLimit(req.concurrentPeerCount)
+	for i, peer := range seedPeers {
 		g.Go(func() error {
-			deleteReq := &DeleteRequest{
-				url:                         url,
-				pieceLength:                 req.pieceLength,
-				tag:                         req.tag,
-				application:                 req.application,
-				filteredQueryParams:         req.filteredQueryParams,
-				contentForCalculatingTaskID: req.contentForCalculatingTaskID,
-				enableTaskIDBasedBlobDigest: req.enableTaskIDBasedBlobDigest,
-				replicas:                    req.replicas,
-				scope:                       req.scope,
-				timeout:                     req.timeout,
+			resp, err := p.deleteImage(ctx, peer, deleteImageRequest, req.timeout)
+			if err != nil {
+				return err
 			}
 
-			return p.Delete(ctx, deleteReq)
+			peers[i] = &PeerDeletedImage{
+				IP:              peer.Ip,
+				Hostname:        peer.Hostname,
+				DeletedTaskIDs:  resp.GetDeletedTaskIds(),
+				RetainedTaskIDs: resp.GetRetainedTaskIds(),
+			}
+
+			return nil
 		})
 	}
 
-	return g.Wait()
+	// A seed peer that fails is left out of the response.
+	_ = g.Wait()
+
+	return &DeleteImageResponse{Peers: slices.DeleteFunc(peers, func(peer *PeerDeletedImage) bool { return peer == nil })}, nil
 }
 
-// delete has the seed peer delete the task, retrying a transient failure on
+// deleteTask has the seed peer delete the task, retrying a transient failure on
 // the same seed peer. Each attempt runs under the timeout. A NotFound answer
 // counts as deleted, aligned with the delete task job of the scheduler.
-func (p *Proxy) delete(ctx context.Context, peer *commonv2.Host, deleteTaskRequest *dfdaemonv2.DeleteTaskRequest, timeout time.Duration) error {
+func (p *Proxy) deleteTask(ctx context.Context, peer *commonv2.Host, deleteTaskRequest *dfdaemonv2.DeleteTaskRequest, timeout time.Duration) error {
 	addr := net.JoinHostPort(peer.Ip, strconv.Itoa(int(peer.Port)))
 	conn, err := grpc.NewClient(
 		addr,
@@ -155,4 +168,41 @@ func (p *Proxy) delete(ctx context.Context, peer *commonv2.Host, deleteTaskReque
 
 		return nil
 	})
+}
+
+// deleteImage has the seed peer delete the tasks of the image, retrying a
+// transient failure on the same seed peer. Each attempt runs under the timeout.
+func (p *Proxy) deleteImage(ctx context.Context, peer *commonv2.Host, deleteImageRequest *dfdaemonv2.DeleteImageRequest, timeout time.Duration) (*dfdaemonv2.DeleteImageResponse, error) {
+	addr := net.JoinHostPort(peer.Ip, strconv.Itoa(int(peer.Port)))
+	conn, err := grpc.NewClient(
+		addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(math.MaxInt32),
+			grpc.MaxCallSendMsgSize(math.MaxInt32),
+		),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to connect to seed peer %s: %v", ErrInternal, addr, err)
+	}
+	defer conn.Close()
+
+	var deleteImageResponse *dfdaemonv2.DeleteImageResponse
+	client := dfdaemonv2.NewDfdaemonUploadClient(conn)
+	if err := p.retry.run(ctx, func() error {
+		ctx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+
+		resp, err := client.DeleteImage(ctx, deleteImageRequest)
+		if err != nil {
+			return fmt.Errorf("%w: failed to delete image %s: %w", ErrInternal, deleteImageRequest.GetUrl(), err)
+		}
+
+		deleteImageResponse = resp
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	return deleteImageResponse, nil
 }

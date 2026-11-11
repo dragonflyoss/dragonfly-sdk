@@ -546,9 +546,9 @@ dependencies = [
 
 [[package]]
 name = "dragonfly-api"
-version = "2.3.7"
+version = "2.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f89a5ef507116b607b2a2aab6b472b075fe2529e58f62d9954ac4b3ca0eecd9e"
+checksum = "d135bdd4d856946953e4c2bd007d69a8f8841e53401bec8b4f48daf39b0515de"
 dependencies = [
  "prost",
  "prost-types",
@@ -562,7 +562,7 @@ dependencies = [
 
 [[package]]
 name = "dragonfly-client-request"
-version = "1.12.0"
+version = "1.13.0"
 dependencies = [
  "async-trait",
  "backon",
@@ -576,7 +576,6 @@ dependencies = [
  "http",
  "local-ip-address",
  "oci-client",
- "oci-spec",
  "percent-encoding",
  "prost-wkt-types",
  "rand 0.9.5",
@@ -605,7 +604,6 @@ dependencies = [
  "futures",
  "http",
  "rustls",
- "serde",
  "serde_json",
  "tokio",
 ]
@@ -2820,9 +2818,9 @@ dependencies = [
 
 [[package]]
 name = "tonic-health"
-version = "0.14.6"
+version = "0.14.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fcfab99db777fba2802f0dfa861d1628d1ae916fb199d29819941f139ae85082"
+checksum = "bc97d645691d64d96db1afe386d0d2918ac84ab56e2c91e153f22f6349a378cd"
 dependencies = [
  "prost",
  "tokio",
@@ -2833,9 +2831,9 @@ dependencies = [
 
 [[package]]
 name = "tonic-prost"
-version = "0.14.6"
+version = "0.14.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "50849f68853be452acf590cde0b146665b8d507b3b8af17261df47e02c209ea0"
+checksum = "eba464054e2226f182a34489b8b079bf4c6e3e7ab5fd7fc30e024f24aa92a484"
 dependencies = [
  "bytes",
  "prost",

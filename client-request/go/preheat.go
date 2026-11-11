@@ -24,6 +24,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -106,28 +107,163 @@ func (p *Proxy) Preheat(ctx context.Context, req *PreheatRequest) error {
 	g, ctx := errgroup.WithContext(ctx)
 	for _, peer := range seedPeers {
 		g.Go(func() error {
-			return p.download(ctx, peer, id, downloadTaskRequest, req.timeout)
+			return p.downloadTask(ctx, peer, id, downloadTaskRequest, req.timeout)
 		})
 	}
 
 	return g.Wait()
 }
 
-// selectSeedPeers selects the seed peers the scope addresses for the task: the
-// replicas in the consistent hash ring order, or all seed peers.
-func (p *Proxy) selectSeedPeers(id string, scope Scope, replicas int) ([]*commonv2.Host, error) {
-	if scope == ScopeAllSeedPeers {
-		return p.seedPeerSelector.SelectAll()
+// PreheatImage preheats an OCI image via the Dragonfly. It resolves the
+// manifests of all the platforms, or of the specified one, and has the seed
+// peers download each manifest and blob. The seed peers record the tasks by the
+// image and the platform for DeleteImage.
+func (p *Proxy) PreheatImage(ctx context.Context, req *PreheatImageRequest) error {
+	if err := req.validate(); err != nil {
+		return err
 	}
 
-	return p.seedPeerSelector.Select(id, uint32(replicas))
+	ref, err := oci.ParseImage(req.image)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+	}
+
+	opts := []oci.ResolveOption{
+		oci.WithAuth(req.username, req.password),
+		oci.WithHTTPClient(oci.DefaultHTTPClient()),
+	}
+
+	if req.platform != nil {
+		opts = append(opts, oci.WithPlatform(*req.platform))
+	}
+
+	manifests, token, err := oci.Resolve(ctx, ref, opts...)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrInternal, err)
+	}
+
+	if token == "" {
+		return fmt.Errorf("%w: registry did not return authentication token", ErrInternal)
+	}
+
+	// Build authorization header for blob downloads through the Dragonfly.
+	header := make(http.Header)
+	header.Set("Authorization", token)
+
+	// Build the accept header with the manifest media types for downloading
+	// manifests, so the registry returns the exact representation matching the
+	// digest.
+	manifestHeader := header.Clone()
+	manifestHeader.Set("Accept", strings.Join(distribution.ManifestMediaTypes(), ","))
+
+	// Collect the manifests and blobs of the matched platforms. A blob shared
+	// by several platforms is preheated for each of them.
+	type target struct {
+		url    string
+		header http.Header
+		image  *commonv2.Image
+	}
+
+	var targets []target
+	for _, manifest := range manifests {
+		image := &commonv2.Image{Reference: ref.String()}
+		if manifest.Platform != "" {
+			image.Platform = &manifest.Platform
+		}
+
+		if slices.ContainsFunc(targets, func(t target) bool {
+			return t.url == manifest.URL && t.image.GetPlatform() == manifest.Platform
+		}) {
+			continue
+		}
+
+		targets = append(targets, target{url: manifest.URL, header: manifestHeader, image: image})
+		for _, blobURL := range manifest.BlobURLs {
+			if !slices.ContainsFunc(targets, func(t target) bool {
+				return t.url == blobURL && t.image.GetPlatform() == manifest.Platform
+			}) {
+				targets = append(targets, target{url: blobURL, header: header, image: image})
+			}
+		}
+	}
+
+	priority := commonv2.Priority_LEVEL6
+	if req.priority != nil {
+		priority = commonv2.Priority(*req.priority)
+	}
+
+	// Preheat the manifests and blobs concurrently, limited by the concurrent
+	// task count.
+	remoteIP := ip.IPv4.String()
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(req.concurrentTaskCount)
+	for _, target := range targets {
+		g.Go(func() error {
+			// Generate task id for selecting seed peer.
+			id, err := idgen.TaskIDV2(target.url, req.pieceLength, req.tag, req.application, req.filteredQueryParams, req.contentForCalculatingTaskID, req.enableTaskIDBasedBlobDigest)
+			if err != nil {
+				return fmt.Errorf("%w: failed to generate task id: %v", ErrInternal, err)
+			}
+
+			// Select seed peers for downloading.
+			seedPeers, err := p.selectSeedPeers(id, req.scope, req.replicas)
+			if err != nil {
+				return fmt.Errorf("%w: failed to select seed peers: %v", ErrInternal, err)
+			}
+
+			if req.scope == ScopeDefault && len(seedPeers) < req.replicas {
+				return fmt.Errorf("%w: insufficient seed peers for %d replicas, %d available", ErrInternal, req.replicas, len(seedPeers))
+			}
+
+			// Construct the download task request with the image.
+			download := &commonv2.Download{
+				Url:                         target.url,
+				Type:                        commonv2.TaskType_STANDARD,
+				Priority:                    priority,
+				FilteredQueryParams:         req.filteredQueryParams,
+				RequestHeader:               headerToMap(target.header),
+				PieceLength:                 req.pieceLength,
+				Timeout:                     durationpb.New(req.timeout),
+				RemoteIp:                    &remoteIP,
+				EnableTaskIdBasedBlobDigest: req.enableTaskIDBasedBlobDigest,
+				SchedulingPolicy:            commonv2.SchedulingPolicy_ALWAYS,
+				Image:                       target.image,
+			}
+
+			if req.tag != "" {
+				download.Tag = &req.tag
+			}
+
+			if req.application != "" {
+				download.Application = &req.application
+			}
+
+			if req.contentForCalculatingTaskID != "" {
+				download.ContentForCalculatingTaskId = &req.contentForCalculatingTaskID
+			}
+
+			downloadTaskRequest := &dfdaemonv2.DownloadTaskRequest{Download: download}
+
+			// Trigger every replica seed peer to download the task concurrently.
+			g, ctx := errgroup.WithContext(ctx)
+			for _, peer := range seedPeers {
+				g.Go(func() error {
+					return p.downloadTask(ctx, peer, id, downloadTaskRequest, req.timeout)
+				})
+			}
+
+			return g.Wait()
+		})
+	}
+
+	return g.Wait()
 }
 
-// download has the seed peer download the task and drains the response stream,
-// retrying a transient failure on the same seed peer so the file lands on every
-// replica. Each attempt runs under the timeout. The gRPC status of a failure
-// stays in the error, so isRetryable can tell a definitive one apart.
-func (p *Proxy) download(ctx context.Context, peer *commonv2.Host, id string, downloadTaskRequest *dfdaemonv2.DownloadTaskRequest, timeout time.Duration) error {
+// downloadTask has the seed peer download the task and drains the response
+// stream, retrying a transient failure on the same seed peer so the file lands
+// on every replica. Each attempt runs under the timeout. The gRPC status of a
+// failure stays in the error, so isRetryable can tell a definitive one apart.
+func (p *Proxy) downloadTask(ctx context.Context, peer *commonv2.Host, id string, downloadTaskRequest *dfdaemonv2.DownloadTaskRequest, timeout time.Duration) error {
 	addr := net.JoinHostPort(peer.Ip, strconv.Itoa(int(peer.Port)))
 	conn, err := grpc.NewClient(
 		addr,
@@ -162,89 +298,4 @@ func (p *Proxy) download(ctx context.Context, peer *commonv2.Host, id string, do
 			}
 		}
 	})
-}
-
-// PreheatImage preheats an OCI image by downloading its manifests and blobs via
-// the Dragonfly. It parses the image reference, authenticates with the OCI
-// registry, resolves the image manifest (including multi-platform image
-// indexes), and triggers the seed client to download the matched platform
-// manifests (referenced by their digests) and each blob (config and layers).
-func (p *Proxy) PreheatImage(ctx context.Context, req *PreheatImageRequest) error {
-	if err := req.validate(); err != nil {
-		return err
-	}
-
-	ref, err := oci.ParseImage(req.image)
-	if err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidArgument, err)
-	}
-
-	manifestURLs, blobURLs, token, err := oci.Resolve(ctx, ref,
-		oci.WithAuth(req.username, req.password),
-		oci.WithPlatform(req.platform),
-		oci.WithHTTPClient(oci.DefaultHTTPClient()),
-	)
-	if err != nil {
-		return fmt.Errorf("%w: %v", ErrInternal, err)
-	}
-
-	if token == "" {
-		return fmt.Errorf("%w: registry did not return authentication token", ErrInternal)
-	}
-
-	// Build authorization header for blob downloads through the Dragonfly.
-	header := make(http.Header)
-	header.Set("Authorization", token)
-
-	// Build the accept header with the manifest media types for downloading
-	// manifests, so the registry returns the exact representation matching the
-	// digest.
-	manifestHeader := header.Clone()
-	manifestHeader.Set("Accept", strings.Join(distribution.ManifestMediaTypes(), ","))
-
-	// Collect the preheat targets. The manifests are the matched platform
-	// manifests referenced by their digests, excluding the multi-platform image
-	// index. The blobs include the configs and the layers of the matched
-	// platform manifests.
-	type target struct {
-		url    string
-		header http.Header
-	}
-
-	targets := make([]target, 0, len(manifestURLs)+len(blobURLs))
-	for _, manifestURL := range uniqueURLs(manifestURLs) {
-		targets = append(targets, target{url: manifestURL, header: manifestHeader})
-	}
-
-	for _, blobURL := range uniqueURLs(blobURLs) {
-		targets = append(targets, target{url: blobURL, header: header})
-	}
-
-	// Preheat the manifests and blobs concurrently, limited by the concurrent
-	// task count.
-	g, ctx := errgroup.WithContext(ctx)
-	g.SetLimit(req.concurrentTaskCount)
-	for _, target := range targets {
-		g.Go(func() error {
-			preheatReq := &PreheatRequest{
-				url:                         target.url,
-				header:                      target.header.Clone(),
-				pieceLength:                 req.pieceLength,
-				tag:                         req.tag,
-				application:                 req.application,
-				filteredQueryParams:         req.filteredQueryParams,
-				contentForCalculatingTaskID: req.contentForCalculatingTaskID,
-				enableTaskIDBasedBlobDigest: req.enableTaskIDBasedBlobDigest,
-				priority:                    req.priority,
-				replicas:                    req.replicas,
-				scope:                       req.scope,
-				timeout:                     req.timeout,
-				certificates:                req.certificates,
-			}
-
-			return p.Preheat(ctx, preheatReq)
-		})
-	}
-
-	return g.Wait()
 }
