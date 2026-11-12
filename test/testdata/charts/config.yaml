@@ -1,7 +1,7 @@
 scheduler:
   image:
     repository: dragonflyoss/scheduler
-    tag: v2.5.4-rc.0
+    tag: v2.5.4-rc.1
   replicas: 1
   resources:
     requests:
@@ -21,7 +21,7 @@ seedClient:
   replicas: 4
   image:
     repository: dragonflyoss/client
-    tag: v1.5.12
+    tag: v1.5.13
   resources:
     requests:
       cpu: '0'
@@ -41,8 +41,6 @@ seedClient:
     proxy:
       server:
         requestRateLimit: 4000
-    backend:
-      enableCacheTemporaryRedirect: false
 
 client:
   enable: false
