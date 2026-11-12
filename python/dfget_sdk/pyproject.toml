@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dragonfly-dfget-sdk"
+version = "0.1.0"
+description = "Zero-dependency Python SDK for the dfget command-line tool (Dragonfly P2P downloads)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Apache-2.0" }
+authors = [{ name = "The Dragonfly Authors" }]
+keywords = ["dragonfly", "dfget", "p2p", "download", "huggingface", "modelscope"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Internet :: File Transfer Protocol (FTP)",
+]
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=7.0", "pytest-asyncio>=0.21"]
+
+[project.scripts]
+dfget-sdk = "dragonfly_dfget.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/dragonflyoss/dragonfly-sdk"
+Issue = "https://github.com/dragonflyoss/dragonfly/issues/4421"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
