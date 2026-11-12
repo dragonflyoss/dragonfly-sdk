@@ -1,7 +1,7 @@
 scheduler:
   image:
     repository: dragonflyoss/scheduler
-    tag: v2.5.4-rc.1
+    tag: v2.5.4-rc.2
   replicas: 1
   resources:
     requests:

@@ -80,7 +80,8 @@ func (p *Proxy) Delete(ctx context.Context, req *DeleteRequest) error {
 // DeleteImage deletes a preheated OCI image from every healthy seed peer by the
 // dfdaemon delete image API, for all its platforms or the specified one. A task
 // still referenced by another image or platform is retained. A seed peer that
-// fails is left out of the response, an ended context fails the request.
+// fails is left out of the response, an ended context fails the request with
+// the seed peers that already deleted the image.
 func (p *Proxy) DeleteImage(ctx context.Context, req *DeleteImageRequest) (*DeleteImageResponse, error) {
 	if err := req.validate(); err != nil {
 		return nil, err
@@ -135,11 +136,8 @@ func (p *Proxy) DeleteImage(ctx context.Context, req *DeleteImageRequest) (*Dele
 
 	// A seed peer that fails is left out of the response.
 	_ = g.Wait()
-	if err := context.Cause(ctx); err != nil {
-		return nil, err
-	}
 
-	return &DeleteImageResponse{Peers: slices.DeleteFunc(peers, func(peer *PeerDeletedImage) bool { return peer == nil })}, nil
+	return &DeleteImageResponse{Peers: slices.DeleteFunc(peers, func(peer *PeerDeletedImage) bool { return peer == nil })}, context.Cause(ctx)
 }
 
 // deleteTask has the seed peer delete the task, retrying a transient failure on

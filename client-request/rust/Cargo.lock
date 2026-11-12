@@ -595,6 +595,7 @@ version = "1.14.1"
 dependencies = [
  "async-trait",
  "backon",
+ "base64",
  "bytes",
  "criterion",
  "dashmap",

@@ -34,6 +34,7 @@ import (
 	"github.com/cenkalti/backoff/v5"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -166,9 +167,49 @@ func TestPreheatRetriesOnlyTransientDownloadFailures(t *testing.T) {
 	tests := []struct {
 		name       string
 		code       codes.Code
+		trailer    metadata.MD
 		maxRetries uint8
 		expect     func(t *testing.T, hits int32, err error)
 	}{
+		{
+			name:       "backend not found",
+			code:       codes.Internal,
+			trailer:    metadata.Pairs("grpc-status-details-bin", `{"message":"not found","header":{"X-Served-By":"origin"},"status_code":404}`),
+			maxRetries: 3,
+			expect: func(t *testing.T, hits int32, err error) {
+				assert := assert.New(t)
+				var backendErr *BackendError
+				assert.ErrorAs(err, &backendErr)
+				assert.Equal(http.StatusNotFound, backendErr.StatusCode)
+				assert.Equal("not found", backendErr.Message)
+				assert.Equal("origin", backendErr.Header.Get("X-Served-By"))
+				assert.Equal(int32(1), hits)
+			},
+		},
+		{
+			name:       "backend service unavailable",
+			code:       codes.Internal,
+			trailer:    metadata.Pairs("grpc-status-details-bin", `{"message":"unavailable","header":{},"status_code":503}`),
+			maxRetries: 1,
+			expect: func(t *testing.T, hits int32, err error) {
+				assert := assert.New(t)
+				var backendErr *BackendError
+				assert.ErrorAs(err, &backendErr)
+				assert.Equal(http.StatusServiceUnavailable, backendErr.StatusCode)
+				assert.Equal(int32(2), hits)
+			},
+		},
+		{
+			name:       "backend without status code",
+			code:       codes.Internal,
+			trailer:    metadata.Pairs("grpc-status-details-bin", `{"message":"connection refused","header":{}}`),
+			maxRetries: 1,
+			expect: func(t *testing.T, hits int32, err error) {
+				assert := assert.New(t)
+				assert.ErrorIs(err, ErrInternal)
+				assert.Equal(int32(2), hits)
+			},
+		},
 		{
 			name:       "internal",
 			code:       codes.Internal,
@@ -245,8 +286,9 @@ func TestPreheatRetriesOnlyTransientDownloadFailures(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var hits atomic.Int32
 			port := setupMockSeedPeerServer(t, &mockSeedPeer{
-				downloadTaskErr: status.Error(tc.code, "download failed"),
-				onDownloadTask:  func() { hits.Add(1) },
+				downloadTaskErr:     status.Error(tc.code, "download failed"),
+				downloadTaskTrailer: tc.trailer,
+				onDownloadTask:      func() { hits.Add(1) },
 			})
 			endpoint := setupMockScheduler(t, []*commonv2.Host{createSeedPeerHost("seed-peer-1", port, 0)})
 
@@ -480,8 +522,105 @@ func TestPreheatImageDownloadsManifestsAndBlobs(t *testing.T) {
 		},
 	}
 
+	downloadTaskRequests := make(chan *dfdaemonv2.DownloadTaskRequest, 8)
+	port := setupMockSeedPeerServer(t, &mockSeedPeer{
+		downloadTask: func(req *dfdaemonv2.DownloadTaskRequest) { downloadTaskRequests <- req },
+	})
+	endpoint := setupMockScheduler(t, []*commonv2.Host{createSeedPeerHost("seed-peer-1", port, 0)})
+
+	proxy, err := New(context.Background(), endpoint)
+	assert.NoError(t, err)
+	defer proxy.Close()
+
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			err := proxy.PreheatImage(context.Background(), tc.req)
+
+			var downloads []*commonv2.Download
+			for len(downloadTaskRequests) > 0 {
+				downloads = append(downloads, (<-downloadTaskRequests).GetDownload())
+			}
+			tc.expect(t, downloads, err)
+		})
+	}
+}
+
+func TestPreheatImageWithoutBearerToken(t *testing.T) {
+	manifest := `{
+		"schemaVersion": 2,
+		"mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+		"config": {
+			"mediaType": "application/vnd.docker.container.image.v1+json",
+			"size": 7023,
+			"digest": "sha256:b5b2b2c507a0944348e0303114d8d93aaaa081732b86451d9bce1f432a537bc7"
+		},
+		"layers": []
+	}`
+
+	tests := []struct {
+		name      string
+		challenge string
+		req       func(registry string) *PreheatImageRequest
+		expect    func(t *testing.T, downloads []*commonv2.Download, err error)
+	}{
+		{
+			name: "anonymous",
+			req: func(registry string) *PreheatImageRequest {
+				return NewPreheatImageRequest(registry+"/foo/bar:1.0", WithPreheatImageRequestReplicas(1))
+			},
+			expect: func(t *testing.T, downloads []*commonv2.Download, err error) {
+				assert := assert.New(t)
+				assert.NoError(err)
+				assert.Len(downloads, 2)
+				for _, download := range downloads {
+					assert.NotContains(download.GetRequestHeader(), "Authorization")
+				}
+			},
+		},
+		{
+			name:      "basic credentials",
+			challenge: `Basic realm="registry"`,
+			req: func(registry string) *PreheatImageRequest {
+				return NewPreheatImageRequest(registry+"/foo/bar:1.0", WithPreheatImageRequestReplicas(1), WithPreheatImageRequestAuth("foo", "bar"))
+			},
+			expect: func(t *testing.T, downloads []*commonv2.Download, err error) {
+				assert := assert.New(t)
+				assert.NoError(err)
+				assert.Len(downloads, 2)
+				for _, download := range downloads {
+					assert.Equal("Basic Zm9vOmJhcg==", download.GetRequestHeader()["Authorization"])
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			listener, err := net.Listen("tcp", net.JoinHostPort(ip.IPv4.String(), "0"))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			mux := http.NewServeMux()
+			mux.HandleFunc("/v2/", func(w http.ResponseWriter, r *http.Request) {
+				if tc.challenge != "" && r.Header.Get("Authorization") == "" {
+					w.Header().Set("WWW-Authenticate", tc.challenge)
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+
+				w.WriteHeader(http.StatusOK)
+			})
+			mux.HandleFunc("/v2/foo/bar/manifests/", func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/vnd.docker.distribution.manifest.v2+json")
+				fmt.Fprint(w, manifest)
+			})
+			server := httptest.NewUnstartedServer(mux)
+			server.Listener.Close()
+			server.Listener = listener
+			server.StartTLS()
+			defer server.Close()
+
 			downloadTaskRequests := make(chan *dfdaemonv2.DownloadTaskRequest, 8)
 			port := setupMockSeedPeerServer(t, &mockSeedPeer{
 				downloadTask: func(req *dfdaemonv2.DownloadTaskRequest) { downloadTaskRequests <- req },
@@ -492,12 +631,11 @@ func TestPreheatImageDownloadsManifestsAndBlobs(t *testing.T) {
 			assert.NoError(t, err)
 			defer proxy.Close()
 
-			err = proxy.PreheatImage(context.Background(), tc.req)
-			close(downloadTaskRequests)
+			err = proxy.PreheatImage(context.Background(), tc.req(listener.Addr().String()))
 
 			var downloads []*commonv2.Download
-			for downloadTaskRequest := range downloadTaskRequests {
-				downloads = append(downloads, downloadTaskRequest.GetDownload())
+			for len(downloadTaskRequests) > 0 {
+				downloads = append(downloads, (<-downloadTaskRequests).GetDownload())
 			}
 			tc.expect(t, downloads, err)
 		})
