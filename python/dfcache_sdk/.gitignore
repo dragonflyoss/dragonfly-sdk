@@ -1,0 +1,20 @@
+# Virtual environments
+.venv/
+venv/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# uv
+uv.lock
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Test / tooling caches
+.pytest_cache/
+.coverage
+htmlcov/
