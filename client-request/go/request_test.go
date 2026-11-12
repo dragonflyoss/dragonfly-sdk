@@ -34,6 +34,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
@@ -68,13 +69,14 @@ func setupMockSchedulerServer(t testing.TB, scheduler *mockScheduler) string {
 
 type mockSeedPeer struct {
 	dfdaemonv2.UnimplementedDfdaemonUploadServer
-	downloadTaskErr error
-	onDownloadTask  func()
-	downloadTask    func(*dfdaemonv2.DownloadTaskRequest)
-	deleteTaskErr   error
-	onDeleteTask    func()
-	deleteImage     func(*dfdaemonv2.DeleteImageRequest) (*dfdaemonv2.DeleteImageResponse, error)
-	statLocalTask   func(*dfdaemonv2.StatLocalTaskRequest) (*dfdaemonv2.StatLocalTaskResponse, error)
+	downloadTaskErr     error
+	downloadTaskTrailer metadata.MD
+	onDownloadTask      func()
+	downloadTask        func(*dfdaemonv2.DownloadTaskRequest)
+	deleteTaskErr       error
+	onDeleteTask        func()
+	deleteImage         func(*dfdaemonv2.DeleteImageRequest) (*dfdaemonv2.DeleteImageResponse, error)
+	statLocalTask       func(*dfdaemonv2.StatLocalTaskRequest) (*dfdaemonv2.StatLocalTaskResponse, error)
 }
 
 func (s *mockSeedPeer) DownloadTask(req *dfdaemonv2.DownloadTaskRequest, stream dfdaemonv2.DfdaemonUpload_DownloadTaskServer) error {
@@ -87,6 +89,7 @@ func (s *mockSeedPeer) DownloadTask(req *dfdaemonv2.DownloadTaskRequest, stream 
 	}
 
 	if s.downloadTaskErr != nil {
+		stream.SetTrailer(s.downloadTaskTrailer)
 		return s.downloadTaskErr
 	}
 

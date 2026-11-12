@@ -330,7 +330,7 @@ func TestDeleteImageFailsWhenTheContextEnds(t *testing.T) {
 			expect: func(t *testing.T, resp *DeleteImageResponse, err error) {
 				assert := assert.New(t)
 				assert.ErrorIs(err, context.Canceled)
-				assert.Nil(resp)
+				assert.Empty(resp.Peers)
 			},
 		},
 		{
@@ -339,7 +339,7 @@ func TestDeleteImageFailsWhenTheContextEnds(t *testing.T) {
 			expect: func(t *testing.T, resp *DeleteImageResponse, err error) {
 				assert := assert.New(t)
 				assert.ErrorIs(err, context.DeadlineExceeded)
-				assert.Nil(resp)
+				assert.Empty(resp.Peers)
 			},
 		},
 	}

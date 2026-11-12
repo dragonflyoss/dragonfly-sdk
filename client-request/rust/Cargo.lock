@@ -591,10 +591,11 @@ dependencies = [
 
 [[package]]
 name = "dragonfly-client-request"
-version = "1.14.0"
+version = "1.14.1"
 dependencies = [
  "async-trait",
  "backon",
+ "base64",
  "bytes",
  "criterion",
  "dashmap",

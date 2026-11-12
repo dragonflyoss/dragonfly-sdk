@@ -51,6 +51,8 @@ use tonic::transport::Channel;
 use tracing::{debug, warn};
 
 #[cfg(feature = "preheat")]
+use base64::{engine::general_purpose::STANDARD, Engine};
+#[cfg(feature = "preheat")]
 use dragonfly_api::{
     common::v2::Image,
     dfdaemon::v2::{DeleteImageRequest as DfdaemonDeleteImageRequest, StatLocalTaskRequest},
@@ -1435,26 +1437,10 @@ impl Request for Proxy {
             request.image
         );
 
-        // Authenticate with the registry and get a bearer token.
-        let token = client
-            .auth(&reference, &auth, RegistryOperation::Pull)
-            .await
-            .map_err(|err| Error::Internal(format!("failed to authenticate with registry: {err}")))?
-            .ok_or_else(|| {
-                Error::Internal("registry did not return authentication token".to_string())
-            })?;
-
-        // Build authorization header for blob downloads through the Dragonfly.
-        let mut header = HeaderMap::new();
-        header.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {token}"))
-                .map_err(|err| Error::Internal(format!("invalid auth token: {err}")))?,
-        );
-
         // Build the accept header with the manifest media types for downloading manifests,
         // so the registry returns the exact representation matching the digest.
-        let mut manifest_header = header.clone();
+        let header = HeaderMap::new();
+        let mut manifest_header = HeaderMap::new();
         manifest_header.insert(
             ACCEPT,
             HeaderValue::from_str(&MIME_TYPES_DISTRIBUTION_MANIFEST.join(","))
@@ -1505,6 +1491,9 @@ impl Request for Proxy {
         for (url, header, image) in targets {
             let semaphore = semaphore.clone();
             let proxy = self.clone();
+            let client = client.clone();
+            let reference = reference.clone();
+            let auth = auth.clone();
             let preheat_request = PreheatRequest {
                 url,
                 header,
@@ -1562,6 +1551,36 @@ impl Request for Proxy {
                         )));
                     }
 
+                    // Authorize the target when it starts, because the token of the registry
+                    // expires during a long preheat. A registry without a bearer token is
+                    // authorized with the basic credentials, if any.
+                    let token = client
+                        .auth(&reference, &auth, RegistryOperation::Pull)
+                        .await
+                        .map_err(|err| {
+                            Error::Internal(format!("failed to authenticate with registry: {err}"))
+                        })?;
+
+                    let authorization = match (token, auth) {
+                        (Some(token), _) => Some(format!("Bearer {token}")),
+                        (None, RegistryAuth::Basic(username, password)) => Some(format!(
+                            "Basic {}",
+                            STANDARD.encode(format!("{username}:{password}"))
+                        )),
+                        (None, RegistryAuth::Anonymous) => None,
+                        (None, RegistryAuth::Bearer(_)) => None,
+                    };
+
+                    let mut request_header = preheat_request.header.clone();
+                    if let Some(authorization) = authorization {
+                        request_header.insert(
+                            AUTHORIZATION,
+                            HeaderValue::from_str(&authorization).map_err(|err| {
+                                Error::Internal(format!("invalid authorization: {err}"))
+                            })?,
+                        );
+                    }
+
                     // Construct the download task request with the image.
                     let download_task_request = DownloadTaskRequest {
                         download: Some(Download {
@@ -1571,7 +1590,7 @@ impl Request for Proxy {
                             application: preheat_request.application.clone(),
                             priority: preheat_request.priority.unwrap_or(Priority::Level6 as i32),
                             filtered_query_params: preheat_request.filtered_query_params.clone(),
-                            request_header: headermap_to_hashmap(&preheat_request.header),
+                            request_header: headermap_to_hashmap(&request_header),
                             piece_length: preheat_request.piece_length,
                             timeout: Some(
                                 prost_wkt_types::Duration::try_from(preheat_request.timeout)

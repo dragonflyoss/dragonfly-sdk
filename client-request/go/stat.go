@@ -61,6 +61,10 @@ func (p *Proxy) StatImage(ctx context.Context, req *StatImageRequest) (*StatImag
 
 	manifests, _, err := oci.Resolve(ctx, ref, opts...)
 	if err != nil {
+		if cause := context.Cause(ctx); cause != nil {
+			return nil, cause
+		}
+
 		return nil, fmt.Errorf("%w: %v", ErrInternal, err)
 	}
 

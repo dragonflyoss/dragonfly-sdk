@@ -18,6 +18,7 @@ package request
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -31,7 +32,9 @@ import (
 
 	commonv2 "d7y.io/api/v2/pkg/apis/common/v2"
 	dfdaemonv2 "d7y.io/api/v2/pkg/apis/dfdaemon/v2"
+	errordetailsv2 "d7y.io/api/v2/pkg/apis/errordetails/v2"
 	"d7y.io/dragonfly/v2/pkg/idgen"
+	nethttp "d7y.io/dragonfly/v2/pkg/net/http"
 	"d7y.io/dragonfly/v2/pkg/net/ip"
 	"d7y.io/dragonfly/v2/pkg/oci"
 	"github.com/docker/distribution"
@@ -40,6 +43,10 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/durationpb"
 )
+
+// grpcStatusDetailsBinHeader is the trailer of the details of the gRPC status,
+// the same header as Status::GRPC_STATUS_DETAILS of tonic.
+const grpcStatusDetailsBinHeader = "grpc-status-details-bin"
 
 // Preheat preheats a file by downloading it to the replicas of seed peers, or
 // to all seed peers with ScopeAllSeedPeers, via the Dragonfly. It triggers
@@ -137,23 +144,27 @@ func (p *Proxy) PreheatImage(ctx context.Context, req *PreheatImageRequest) erro
 		opts = append(opts, oci.WithPlatform(*req.platform))
 	}
 
-	manifests, token, err := oci.Resolve(ctx, ref, opts...)
+	manifests, _, err := oci.Resolve(ctx, ref, opts...)
 	if err != nil {
+		if cause := context.Cause(ctx); cause != nil {
+			return cause
+		}
+
 		return fmt.Errorf("%w: %v", ErrInternal, err)
 	}
 
-	if token == "" {
-		return fmt.Errorf("%w: registry did not return authentication token", ErrInternal)
+	// Authorize the targets with one client, which keeps the token of the
+	// registry and renews it when it expires during a long preheat.
+	authClient, err := oci.NewAuthClient(ref, p.registryClient, req.username, req.password)
+	if err != nil {
+		return fmt.Errorf("%w: failed to authenticate with registry: %v", ErrInternal, err)
 	}
-
-	// Build authorization header for blob downloads through the Dragonfly.
-	header := make(http.Header)
-	header.Set("Authorization", token)
 
 	// Build the accept header with the manifest media types for downloading
 	// manifests, so the registry returns the exact representation matching the
 	// digest.
-	manifestHeader := header.Clone()
+	header := make(http.Header)
+	manifestHeader := make(http.Header)
 	manifestHeader.Set("Accept", strings.Join(distribution.ManifestMediaTypes(), ","))
 
 	// Collect the manifests and blobs of the matched platforms. A blob shared
@@ -215,13 +226,24 @@ func (p *Proxy) PreheatImage(ctx context.Context, req *PreheatImageRequest) erro
 				return fmt.Errorf("%w: insufficient seed peers for %d replicas, %d available", ErrInternal, req.replicas, len(seedPeers))
 			}
 
+			// Authorize the target when it starts, the registry may need no authorization.
+			authorization, err := authClient.Authorization()
+			if err != nil {
+				return fmt.Errorf("%w: failed to authenticate with registry: %v", ErrInternal, err)
+			}
+
+			requestHeader := target.header.Clone()
+			if authorization != "" {
+				requestHeader.Set("Authorization", authorization)
+			}
+
 			// Construct the download task request with the image.
 			download := &commonv2.Download{
 				Url:                         target.url,
 				Type:                        commonv2.TaskType_STANDARD,
 				Priority:                    priority,
 				FilteredQueryParams:         req.filteredQueryParams,
-				RequestHeader:               headerToMap(target.header),
+				RequestHeader:               headerToMap(requestHeader),
 				PieceLength:                 req.pieceLength,
 				Timeout:                     durationpb.New(req.timeout),
 				RemoteIp:                    &remoteIP,
@@ -290,7 +312,19 @@ func (p *Proxy) downloadTask(ctx context.Context, peer *commonv2.Host, id string
 					return nil
 				}
 
-				return fmt.Errorf("%w: failed to download task %s: %w", ErrInternal, id, err)
+				// The dfdaemon reports a failure of the source as the JSON of the
+				// backend error in the details of the status. The Rust SDK reads
+				// them by Status::details of tonic, but grpc-go only decodes the
+				// details of google.rpc.Status and leaves the others in the
+				// trailer. Read the trailer to keep the same behavior as the Rust
+				// SDK, so a definitive answer such as 404 is not retried.
+				var backend errordetailsv2.Backend
+				details := stream.Trailer().Get(grpcStatusDetailsBinHeader)
+				if len(details) != 1 || json.Unmarshal([]byte(details[0]), &backend) != nil || backend.StatusCode == nil {
+					return fmt.Errorf("%w: failed to download task %s: %w", ErrInternal, id, err)
+				}
+
+				return &BackendError{Message: backend.GetMessage(), Header: nethttp.MapToHeader(backend.GetHeader()), StatusCode: int(backend.GetStatusCode())}
 			}
 		}
 	})
