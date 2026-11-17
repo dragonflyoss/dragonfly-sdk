@@ -61,6 +61,13 @@ func TestNewWithEndpointsInvalidMaxRetries(t *testing.T) {
 	assert.ErrorIs(err, ErrInvalidArgument)
 }
 
+func TestNewWithEndpointsInvalidReadTimeout(t *testing.T) {
+	assert := assert.New(t)
+
+	_, err := NewWithEndpoints([]string{"http://127.0.0.1:4001"}, WithProxyWithEndpointsReadTimeout(0))
+	assert.ErrorIs(err, ErrInvalidArgument)
+}
+
 func TestNewWithEndpointsInvalidEndpoint(t *testing.T) {
 	assert := assert.New(t)
 
@@ -431,16 +438,18 @@ func TestGetIntoWithEndpointsResumesATruncatedBody(t *testing.T) {
 
 func TestGetWithEndpointsResumesABodyThatBreaksOff(t *testing.T) {
 	tests := []struct {
-		name       string
-		stall      bool
-		timeout    time.Duration
-		maxRetries uint8
-		expect     func(t *testing.T, content []byte, hits int32, err error)
+		name        string
+		stall       bool
+		timeout     time.Duration
+		readTimeout time.Duration
+		maxRetries  uint8
+		expect      func(t *testing.T, content []byte, hits int32, err error)
 	}{
 		{
-			name:       "truncated body",
-			timeout:    time.Second,
-			maxRetries: 1,
+			name:        "truncated body",
+			timeout:     time.Second,
+			readTimeout: defaultRequestReadTimeout,
+			maxRetries:  1,
 			expect: func(t *testing.T, content []byte, hits int32, err error) {
 				assert := assert.New(t)
 				assert.NoError(err)
@@ -449,10 +458,11 @@ func TestGetWithEndpointsResumesABodyThatBreaksOff(t *testing.T) {
 			},
 		},
 		{
-			name:       "stalled body",
-			stall:      true,
-			timeout:    200 * time.Millisecond,
-			maxRetries: 1,
+			name:        "stalled body",
+			stall:       true,
+			timeout:     200 * time.Millisecond,
+			readTimeout: defaultRequestReadTimeout,
+			maxRetries:  1,
 			expect: func(t *testing.T, content []byte, hits int32, err error) {
 				assert := assert.New(t)
 				assert.NoError(err)
@@ -461,9 +471,23 @@ func TestGetWithEndpointsResumesABodyThatBreaksOff(t *testing.T) {
 			},
 		},
 		{
-			name:       "truncated body without retries",
-			timeout:    time.Second,
-			maxRetries: 0,
+			name:        "stalled body past the read timeout",
+			stall:       true,
+			timeout:     defaultRequestTimeout,
+			readTimeout: 200 * time.Millisecond,
+			maxRetries:  1,
+			expect: func(t *testing.T, content []byte, hits int32, err error) {
+				assert := assert.New(t)
+				assert.NoError(err)
+				assert.Equal("hello dragonfly", string(content))
+				assert.Equal(int32(2), hits)
+			},
+		},
+		{
+			name:        "truncated body without retries",
+			timeout:     time.Second,
+			readTimeout: defaultRequestReadTimeout,
+			maxRetries:  0,
 			expect: func(t *testing.T, content []byte, hits int32, err error) {
 				assert := assert.New(t)
 				assert.ErrorIs(err, ErrInternal)
@@ -471,10 +495,23 @@ func TestGetWithEndpointsResumesABodyThatBreaksOff(t *testing.T) {
 			},
 		},
 		{
-			name:       "stalled body without retries",
-			stall:      true,
-			timeout:    200 * time.Millisecond,
-			maxRetries: 0,
+			name:        "stalled body without retries",
+			stall:       true,
+			timeout:     200 * time.Millisecond,
+			readTimeout: defaultRequestReadTimeout,
+			maxRetries:  0,
+			expect: func(t *testing.T, content []byte, hits int32, err error) {
+				assert := assert.New(t)
+				assert.ErrorIs(err, ErrRequestTimeout)
+				assert.Equal(int32(1), hits)
+			},
+		},
+		{
+			name:        "stalled body past the read timeout without retries",
+			stall:       true,
+			timeout:     defaultRequestTimeout,
+			readTimeout: 200 * time.Millisecond,
+			maxRetries:  0,
 			expect: func(t *testing.T, content []byte, hits int32, err error) {
 				assert := assert.New(t)
 				assert.ErrorIs(err, ErrRequestTimeout)
@@ -500,15 +537,80 @@ func TestGetWithEndpointsResumesABodyThatBreaksOff(t *testing.T) {
 				}
 			})
 
-			proxy, err := NewWithEndpoints([]string{fmt.Sprintf("http://127.0.0.1:%d", proxyPort)}, WithProxyWithEndpointsMaxRetries(tc.maxRetries))
+			proxy, err := NewWithEndpoints([]string{fmt.Sprintf("http://127.0.0.1:%d", proxyPort)}, WithProxyWithEndpointsMaxRetries(tc.maxRetries), WithProxyWithEndpointsReadTimeout(tc.readTimeout))
 			assert.NoError(t, err)
 
-			resp, err := proxy.Get(context.Background(), NewGetRequest("http://example.com/file.txt", WithGetRequestTimeout(tc.timeout)))
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			resp, err := proxy.Get(ctx, NewGetRequest("http://example.com/file.txt", WithGetRequestTimeout(tc.timeout)))
 			assert.NoError(t, err)
 			defer resp.Body.Close()
 
 			content, err := io.ReadAll(resp.Body)
 			tc.expect(t, content, hits.Load(), err)
+		})
+	}
+}
+
+func TestGetWithEndpointsTimesOutASlowReaderByTheTimeoutOnly(t *testing.T) {
+	tests := []struct {
+		name        string
+		timeout     time.Duration
+		readTimeout time.Duration
+		expect      func(t *testing.T, tail []byte, err error)
+	}{
+		{
+			name:        "read timeout",
+			timeout:     defaultRequestTimeout,
+			readTimeout: time.Second,
+			expect: func(t *testing.T, tail []byte, err error) {
+				assert := assert.New(t)
+				assert.NoError(err)
+				assert.Equal(32<<20-1, len(tail))
+			},
+		},
+		{
+			name:        "timeout",
+			timeout:     2 * time.Second,
+			readTimeout: defaultRequestReadTimeout,
+			expect: func(t *testing.T, tail []byte, err error) {
+				assert.ErrorIs(t, err, ErrRequestTimeout)
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
+
+			content := strings.Repeat("x", 32<<20)
+			var hits atomic.Int32
+			proxyPort := setupMockSeedPeerProxy(t, func(w http.ResponseWriter, r *http.Request) {
+				hits.Add(1)
+				http.ServeContent(w, r, "", time.Time{}, strings.NewReader(content))
+			})
+
+			proxy, err := NewWithEndpoints(
+				[]string{fmt.Sprintf("http://127.0.0.1:%d", proxyPort)},
+				WithProxyWithEndpointsMaxRetries(0),
+				WithProxyWithEndpointsReadTimeout(tc.readTimeout),
+			)
+			assert.NoError(err)
+
+			resp, err := proxy.Get(context.Background(), NewGetRequest("http://example.com/file.txt", WithGetRequestTimeout(tc.timeout)))
+			assert.NoError(err)
+			defer resp.Body.Close()
+
+			time.Sleep(1200 * time.Millisecond)
+			head := make([]byte, 1)
+			_, err = io.ReadFull(resp.Body, head)
+			assert.NoError(err)
+
+			time.Sleep(1200 * time.Millisecond)
+			tail, err := io.ReadAll(resp.Body)
+			assert.Equal(int32(1), hits.Load())
+			tc.expect(t, tail, err)
 		})
 	}
 }
@@ -605,17 +707,38 @@ func TestGetIntoWithEndpointsFailsOnAWriterError(t *testing.T) {
 }
 
 func TestGetIntoWithEndpointsTimeout(t *testing.T) {
-	assert := assert.New(t)
+	tests := []struct {
+		name        string
+		timeout     time.Duration
+		readTimeout time.Duration
+	}{
+		{
+			name:        "timeout",
+			timeout:     50 * time.Millisecond,
+			readTimeout: defaultRequestReadTimeout,
+		},
+		{
+			name:        "read timeout",
+			timeout:     defaultRequestTimeout,
+			readTimeout: 50 * time.Millisecond,
+		},
+	}
 
-	proxyPort := setupMockSeedPeerProxy(t, func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(500 * time.Millisecond)
-	})
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
 
-	proxy, err := NewWithEndpoints([]string{fmt.Sprintf("http://127.0.0.1:%d", proxyPort)})
-	assert.NoError(err)
+			proxyPort := setupMockSeedPeerProxy(t, func(w http.ResponseWriter, r *http.Request) {
+				time.Sleep(500 * time.Millisecond)
+			})
 
-	var buf bytes.Buffer
-	req := NewGetRequest("http://example.com/file.txt", WithGetRequestTimeout(50*time.Millisecond))
-	_, err = proxy.GetInto(context.Background(), req, &buf)
-	assert.ErrorIs(err, ErrRequestTimeout)
+			proxy, err := NewWithEndpoints([]string{fmt.Sprintf("http://127.0.0.1:%d", proxyPort)}, WithProxyWithEndpointsReadTimeout(tc.readTimeout))
+			assert.NoError(err)
+
+			var buf bytes.Buffer
+			req := NewGetRequest("http://example.com/file.txt", WithGetRequestTimeout(tc.timeout))
+			_, err = proxy.GetInto(context.Background(), req, &buf)
+			assert.ErrorIs(err, ErrRequestTimeout)
+		})
+	}
 }

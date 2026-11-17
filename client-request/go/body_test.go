@@ -280,7 +280,7 @@ func TestResumableBodyRead(t *testing.T) {
 
 			resp := sender.responses[0]
 			sender.responses, sender.errs = sender.responses[1:], sender.errs[1:]
-			attempts, err := retryPolicy{maxRetries: tc.maxRetries}.newAttempts([]string{"a", "b"}, time.Second)
+			attempts, err := retryPolicy{maxRetries: tc.maxRetries}.newAttempts([]string{"a", "b"}, time.Second, time.Second)
 			assert.NoError(t, err)
 
 			body := newResumableBody(context.Background(), sender, NewGetRequest("http://example.com/file.txt"), attempts, resp, func() {})
@@ -336,7 +336,7 @@ func TestResumableBodyReadAfterTheBodyEnded(t *testing.T) {
 				Header:     http.Header{"Content-Range": {"bytes 0-14/15"}},
 				Body:       io.NopCloser(io.MultiReader(strings.NewReader("hello "), iotest.ErrReader(io.ErrUnexpectedEOF))),
 			}
-			attempts, err := retryPolicy{maxRetries: 3}.newAttempts([]string{"a", "b"}, time.Second)
+			attempts, err := retryPolicy{maxRetries: 3}.newAttempts([]string{"a", "b"}, time.Second, time.Second)
 			assert.NoError(t, err)
 
 			cancels := 0
@@ -370,7 +370,7 @@ func TestResumableBodyOwnsTheRequestHeader(t *testing.T) {
 		Header:     http.Header{"Content-Range": {"bytes 0-14/15"}},
 		Body:       io.NopCloser(io.MultiReader(strings.NewReader("hello "), iotest.ErrReader(io.ErrUnexpectedEOF))),
 	}
-	attempts, err := retryPolicy{maxRetries: 1}.newAttempts([]string{"a"}, time.Second)
+	attempts, err := retryPolicy{maxRetries: 1}.newAttempts([]string{"a"}, time.Second, time.Second)
 	assert.NoError(err)
 
 	header := http.Header{"X-Token": {"a"}}

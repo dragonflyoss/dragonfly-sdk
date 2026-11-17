@@ -93,8 +93,9 @@ way on each replica seed peer.
 
 The default is one retry at once and `max_retries(0)` disables retries. An
 exponential backoff spreads the retries out, `ExponentialBuilder` being
-re-exported from [backon](https://docs.rs/backon). The request timeout applies
-to each attempt:
+re-exported from [backon](https://docs.rs/backon). The `read_timeout` of the
+proxy bounds the wait for the response and for each chunk of the body. The
+request timeout applies to each attempt:
 
 ```rust
 use dragonfly_client_request::ExponentialBuilder;
@@ -170,7 +171,7 @@ all its platforms unless a platform is set:
 
 ```toml
 [dependencies]
-dragonfly-client-request = { version = "1.14.1", features = ["preheat"] }
+dragonfly-client-request = { version = "1.15.0", features = ["preheat"] }
 ```
 
 ```rust

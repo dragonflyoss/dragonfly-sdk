@@ -97,6 +97,12 @@ func WithProxyBackoff(b *backoff.ExponentialBackOff) ProxyOption {
 	return func(p *Proxy) { p.retry.backoff = b }
 }
 
+// WithProxyReadTimeout sets the read timeout of the requests, the longest wait
+// for a response and for every read of its body. Default 1 minute.
+func WithProxyReadTimeout(timeout time.Duration) ProxyOption {
+	return func(p *Proxy) { p.readTimeout = timeout }
+}
+
 // WithProxySchedulerRequestTimeout sets the timeout of requests to the
 // scheduler service.
 func WithProxySchedulerRequestTimeout(timeout time.Duration) ProxyOption {
@@ -158,6 +164,9 @@ type Proxy struct {
 	// retry is the retry policy of the requests.
 	retry retryPolicy
 
+	// readTimeout is the read timeout of the requests.
+	readTimeout time.Duration
+
 	// schedulerRequestTimeout is the timeout of requests to the scheduler
 	// service.
 	schedulerRequestTimeout time.Duration
@@ -184,6 +193,7 @@ type Proxy struct {
 func New(ctx context.Context, schedulerEndpoint string, opts ...ProxyOption) (*Proxy, error) {
 	p := &Proxy{
 		retry:                   defaultRetryPolicy,
+		readTimeout:             defaultRequestReadTimeout,
 		schedulerRequestTimeout: defaultSchedulerRequestTimeout,
 		healthCheckInterval:     defaultHealthCheckInterval,
 		seedPeerSelector:        selector.New(),
@@ -236,6 +246,10 @@ func (p *Proxy) validate() error {
 
 	if p.healthCheckInterval < time.Second || p.healthCheckInterval > 600*time.Second {
 		return fmt.Errorf("%w: health check interval must be between 1 and 600 seconds", ErrInvalidArgument)
+	}
+
+	if p.readTimeout <= 0 {
+		return fmt.Errorf("%w: read timeout must be greater than 0", ErrInvalidArgument)
 	}
 
 	if p.retry.maxRetries > 10 {
@@ -303,7 +317,7 @@ func (p *Proxy) Get(ctx context.Context, req *GetRequest) (*GetResponse, error) 
 		return nil, err
 	}
 
-	attempts, err := p.retry.newAttempts(endpoints, req.timeout)
+	attempts, err := p.retry.newAttempts(endpoints, req.timeout, p.readTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -337,7 +351,7 @@ func (p *Proxy) GetInto(ctx context.Context, req *GetRequest, w io.Writer) (*Get
 		return nil, err
 	}
 
-	attempts, err := p.retry.newAttempts(endpoints, req.timeout)
+	attempts, err := p.retry.newAttempts(endpoints, req.timeout, p.readTimeout)
 	if err != nil {
 		return nil, err
 	}

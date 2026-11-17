@@ -70,7 +70,8 @@ seed peer.
 The default is one retry at once and `WithProxyMaxRetries(0)` disables retries.
 An exponential backoff from [cenkalti/backoff](https://pkg.go.dev/github.com/cenkalti/backoff/v5)
 spreads the retries out, every request starting from a fresh copy of it. The
-request timeout applies to each attempt:
+read timeout of the proxy bounds the wait for the response and for every read
+of the body. The request timeout applies to each attempt:
 
 ```go
 import "github.com/cenkalti/backoff/v5"

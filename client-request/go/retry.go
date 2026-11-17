@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand/v2"
 	"net/http"
 	"slices"
@@ -98,23 +99,23 @@ func (p retryPolicy) run(ctx context.Context, attempt func() error) error {
 }
 
 // newAttempts returns the attempts of a request across endpoints, shuffled
-// once, each under its own timeout. It fails with ErrInvalidArgument when
-// endpoints is empty.
-func (p retryPolicy) newAttempts(endpoints []string, timeout time.Duration) (*attempts, error) {
+// once, each under its own timeout and read timeout. It fails with
+// ErrInvalidArgument when endpoints is empty.
+func (p retryPolicy) newAttempts(endpoints []string, timeout, readTimeout time.Duration) (*attempts, error) {
 	if len(endpoints) == 0 {
 		return nil, fmt.Errorf("%w: no endpoints to send request", ErrInvalidArgument)
 	}
 
 	shuffled := slices.Clone(endpoints)
 	rand.Shuffle(len(shuffled), func(i, j int) { shuffled[i], shuffled[j] = shuffled[j], shuffled[i] })
-
 	delays := p.newBackOff()
 	delays.Reset()
 	return &attempts{
-		endpoints: shuffled,
-		retries:   p.maxRetries,
-		delays:    delays,
-		timeout:   timeout,
+		endpoints:   shuffled,
+		retries:     p.maxRetries,
+		delays:      delays,
+		timeout:     timeout,
+		readTimeout: readTimeout,
 	}, nil
 }
 
@@ -137,14 +138,18 @@ type attempts struct {
 
 	// timeout is the timeout of each attempt.
 	timeout time.Duration
+
+	// readTimeout is the read timeout of each attempt.
+	readTimeout time.Duration
 }
 
 // run runs send until it succeeds, fails definitively, or no retry is left,
 // every attempt aimed at the next endpoint, wrapping around when the endpoints
-// run out before the retries do. Each attempt runs under its own timeout, and
-// the cancel function of the successful attempt is returned so the caller
-// releases it once the body is read. The loop is written out because
-// backoff.Retry resets its backoff and counts its own tries on every call.
+// run out before the retries do. Each attempt runs under its own timeout and
+// read timeout, and the cancel function of the successful attempt is returned
+// so the caller releases it once the body is read. The loop is written out
+// because backoff.Retry resets its backoff and counts its own tries on every
+// call.
 //
 //	endpoints [B, A]                  maxRetries 3
 //
@@ -159,9 +164,15 @@ func (a *attempts) run(
 		endpoint := a.endpoints[a.next%len(a.endpoints)]
 		a.next++
 
+		// A timer cancels the attempt on a read timeout, since a deadline would
+		// count the time between two reads.
 		attemptCtx, cancel := context.WithTimeout(ctx, a.timeout)
+		attemptCtx, cancelCause := context.WithCancelCause(attemptCtx)
+		timer := time.AfterFunc(a.readTimeout, func() { cancelCause(context.DeadlineExceeded) })
 		resp, err := send(attemptCtx, endpoint)
+		timer.Stop()
 		if err == nil {
+			resp.Body = &timeoutReadCloser{ReadCloser: resp.Body, ctx: attemptCtx, timer: timer, timeout: a.readTimeout}
 			return resp, cancel, nil
 		}
 		cancel()
@@ -179,6 +190,33 @@ func (a *attempts) run(
 			return nil, nil, err
 		}
 	}
+}
+
+// timeoutReadCloser is a response body with a timeout on every Read.
+type timeoutReadCloser struct {
+	io.ReadCloser
+
+	// ctx is the context of the request.
+	ctx context.Context
+
+	// timer cancels ctx once a Read outlasts timeout.
+	timer *time.Timer
+
+	// timeout is the timeout of a Read.
+	timeout time.Duration
+}
+
+// Read implements io.Reader under the timeout.
+func (r *timeoutReadCloser) Read(p []byte) (int, error) {
+	r.timer.Reset(r.timeout)
+	defer r.timer.Stop()
+
+	n, err := r.ReadCloser.Read(p)
+	if err != nil && err != io.EOF && errors.Is(context.Cause(r.ctx), context.DeadlineExceeded) {
+		err = context.DeadlineExceeded
+	}
+
+	return n, err
 }
 
 // backoff returns the delay of the next retry after an attempt failed, in run

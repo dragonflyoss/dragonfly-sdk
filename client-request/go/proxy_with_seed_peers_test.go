@@ -80,6 +80,11 @@ func TestNewWithSeedPeersInvalid(t *testing.T) {
 			seedPeers: []SeedPeer{{Host: createSeedPeerHost("seed-peer-1", 0, 4001), Healthy: true}},
 			opts:      []ProxyWithSeedPeersOption{WithProxyWithSeedPeersMaxRetries(11)},
 		},
+		{
+			name:      "no read timeout",
+			seedPeers: []SeedPeer{{Host: createSeedPeerHost("seed-peer-1", 0, 4001), Healthy: true}},
+			opts:      []ProxyWithSeedPeersOption{WithProxyWithSeedPeersReadTimeout(0)},
+		},
 	}
 
 	for _, tc := range tests {
