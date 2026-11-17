@@ -41,6 +41,9 @@ import (
 // defaultRequestTimeout is the default timeout for requests.
 const defaultRequestTimeout = 10 * 60 * time.Second
 
+// defaultRequestReadTimeout is the default read timeout for requests.
+const defaultRequestReadTimeout = 60 * time.Second
+
 // defaultConcurrentTaskCount is the default number of blobs to preheat
 // concurrently.
 const defaultConcurrentTaskCount = 4
@@ -78,13 +81,23 @@ func (s Scope) validate() error {
 //
 // A request is served by the seed peers the consistent hash ring picks for its
 // task, and a seed peer's dfdaemon fetches from the origin only what the P2P
-// network does not hold yet:
+// network does not hold yet. A failed attempt is retried on the next seed peer:
 //
 //	client ──lookup──▶ hash ring ──▶ seed peers [B, A]
-//	  │
-//	  └──GET──▶ B (seed peer proxy) ──miss──▶ origin
-//	                │
-//	                └──5xx / timeout──▶ retry on A
+//
+//	attempt 1 ──GET──▶ B (seed peer proxy) ──miss──▶ origin
+//	  ├─ connect error, 5xx, 408 or 429 ───────▶ wait(delay) ──▶ attempt 2
+//	  ├─ no response within the read timeout ──▶ wait(delay) ──▶ attempt 2
+//	  ├─ any other answer, such as 404 ────────▶ fails at once
+//	  └─ 2xx ──▶ read ──▶ read ──▶ ... ──▶ EOF
+//	               └─ breaks off at byte 6 ────▶ wait(delay) ──▶ attempt 2
+//	                    ├─ connection reset
+//	                    ├─ ended before its length
+//	                    └─ no read within the read timeout
+//
+//	attempt 2 ──GET──▶ A
+//	  ├─ nothing read yet ─────────▶ the same request
+//	  └─ after the body broke off ─▶ Range: bytes=6-14 ──▶ 206 bytes 6-14/15 ──▶ ... ──▶ EOF
 //
 // Proxy implements it.
 type Request interface {
@@ -348,7 +361,7 @@ func (r *GetRequest) send(ctx context.Context, client *http.Client) (*http.Respo
 
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(context.Cause(ctx), context.DeadlineExceeded) {
 			return nil, fmt.Errorf("%w: %v", ErrRequestTimeout, err)
 		}
 

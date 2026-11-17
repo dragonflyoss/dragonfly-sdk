@@ -22,6 +22,7 @@ import (
 	"io"
 	"net/http"
 	"slices"
+	"time"
 
 	"github.com/cenkalti/backoff/v5"
 )
@@ -43,6 +44,12 @@ func WithProxyWithEndpointsBackoff(b *backoff.ExponentialBackOff) ProxyWithEndpo
 	return func(p *ProxyWithEndpoints) { p.retry.backoff = b }
 }
 
+// WithProxyWithEndpointsReadTimeout sets the read timeout of the requests, the
+// longest wait for a response and for every read of its body. Default 1 minute.
+func WithProxyWithEndpointsReadTimeout(timeout time.Duration) ProxyWithEndpointsOption {
+	return func(p *ProxyWithEndpoints) { p.readTimeout = timeout }
+}
+
 // ProxyWithEndpoints is the HTTP proxy client that sends requests via the
 // fixed seed peer endpoints of the Dragonfly given at construction, without
 // selecting seed peers by the consistent hash ring or syncing them from the
@@ -50,6 +57,9 @@ func WithProxyWithEndpointsBackoff(b *backoff.ExponentialBackOff) ProxyWithEndpo
 type ProxyWithEndpoints struct {
 	// retry is the retry policy of the requests.
 	retry retryPolicy
+
+	// readTimeout is the read timeout of the requests.
+	readTimeout time.Duration
 
 	// endpoints is the seed peer endpoints serving the requests.
 	endpoints []string
@@ -65,8 +75,9 @@ type ProxyWithEndpoints struct {
 // its own client with a reusable connection pool.
 func NewWithEndpoints(endpoints []string, opts ...ProxyWithEndpointsOption) (*ProxyWithEndpoints, error) {
 	p := &ProxyWithEndpoints{
-		retry:     defaultRetryPolicy,
-		endpoints: slices.Clone(endpoints),
+		retry:       defaultRetryPolicy,
+		readTimeout: defaultRequestReadTimeout,
+		endpoints:   slices.Clone(endpoints),
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -74,6 +85,10 @@ func NewWithEndpoints(endpoints []string, opts ...ProxyWithEndpointsOption) (*Pr
 
 	if len(p.endpoints) == 0 {
 		return nil, fmt.Errorf("%w: endpoints must not be empty", ErrInvalidArgument)
+	}
+
+	if p.readTimeout <= 0 {
+		return nil, fmt.Errorf("%w: read timeout must be greater than 0", ErrInvalidArgument)
 	}
 
 	if p.retry.maxRetries > 3 {
@@ -106,7 +121,7 @@ func (p *ProxyWithEndpoints) Get(ctx context.Context, req *GetRequest) (*GetResp
 		return nil, err
 	}
 
-	attempts, err := p.retry.newAttempts(p.endpoints, req.timeout)
+	attempts, err := p.retry.newAttempts(p.endpoints, req.timeout, p.readTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -139,7 +154,7 @@ func (p *ProxyWithEndpoints) GetInto(ctx context.Context, req *GetRequest, w io.
 		return nil, err
 	}
 
-	attempts, err := p.retry.newAttempts(p.endpoints, req.timeout)
+	attempts, err := p.retry.newAttempts(p.endpoints, req.timeout, p.readTimeout)
 	if err != nil {
 		return nil, err
 	}

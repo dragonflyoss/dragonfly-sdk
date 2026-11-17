@@ -129,6 +129,9 @@ const DEFAULT_REGISTRY_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// The default timeout(10 minutes) for requests.
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
+/// The default read timeout(1 minute) for requests.
+const DEFAULT_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// The default number of seed peers serving a task.
 const DEFAULT_REPLICAS: usize = 2;
 
@@ -166,14 +169,24 @@ pub type Body = Box<dyn Stream<Item = Result<Bytes>> + Send + Unpin>;
 ///
 /// A request is served by the seed peers the consistent hash ring picks for its
 /// task, and a seed peer's dfdaemon fetches from the origin only what the P2P
-/// network does not hold yet:
+/// network does not hold yet. A failed attempt is retried on the next seed peer:
 ///
 /// ```text
 /// client ──lookup──▶ hash ring ──▶ seed peers [B, A]
-///   │
-///   └──GET──▶ B (seed peer proxy) ──miss──▶ origin
-///                 │
-///                 └──5xx / timeout──▶ retry on A
+///
+/// attempt 1 ──GET──▶ B (seed peer proxy) ──miss──▶ origin
+///   ├─ connect error, 5xx, 408 or 429 ─────▶ sleep(delay) ──▶ attempt 2
+///   ├─ no response within read_timeout ────▶ sleep(delay) ──▶ attempt 2
+///   ├─ any other answer, such as 404 ──────▶ fails at once
+///   └─ 2xx ──▶ chunk ──▶ chunk ──▶ ... ──▶ end
+///                └─ breaks off at byte 6 ──▶ sleep(delay) ──▶ attempt 2
+///                     ├─ connection reset
+///                     ├─ ended before its length
+///                     └─ no chunk within read_timeout
+///
+/// attempt 2 ──GET──▶ A
+///   ├─ nothing read yet, or get_into ──▶ the same request, `buf` truncated back
+///   └─ get after its body broke off ───▶ Range: bytes=6-14 ──▶ 206 bytes 6-14/15 ──▶ ... ──▶ end
 /// ```
 ///
 /// Implemented by [`Proxy`].
@@ -986,11 +999,25 @@ pub struct PeerDeletedImage {
 }
 
 /// Factory for creating HTTPClient instances.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct HTTPClientFactory {
     /// The seed peer selector recording the answers of the proxies, if they can
     /// be ejected.
     seed_peer_selector: Option<Arc<SeedPeerSelector>>,
+
+    /// The read timeout of the clients.
+    read_timeout: Duration,
+}
+
+/// Implements Default trait.
+impl Default for HTTPClientFactory {
+    /// Returns a default HTTPClientFactory.
+    fn default() -> Self {
+        Self {
+            seed_peer_selector: None,
+            read_timeout: DEFAULT_REQUEST_READ_TIMEOUT,
+        }
+    }
 }
 
 /// Implements Factory for creating reqwest::Client instances with proxy support.
@@ -1009,6 +1036,7 @@ impl Factory<String, ClientWithMiddleware> for HTTPClientFactory {
             .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             .tcp_keepalive(KEEP_ALIVE_INTERVAL)
             .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(self.read_timeout)
             .no_gzip()
             .no_brotli()
             .no_zstd()
@@ -1094,6 +1122,9 @@ pub struct ProxyBuilder {
     /// The interval of health check for selector(seed peers).
     health_check_interval: Duration,
 
+    /// The read timeout of the requests.
+    read_timeout: Duration,
+
     /// The retry policy of the requests.
     retry: RetryPolicy,
 }
@@ -1106,6 +1137,7 @@ impl Default for ProxyBuilder {
             scheduler_endpoint: "".to_string(),
             scheduler_request_timeout: DEFAULT_SCHEDULER_REQUEST_TIMEOUT,
             health_check_interval: Duration::from_secs(60),
+            read_timeout: DEFAULT_REQUEST_READ_TIMEOUT,
             retry: RetryPolicy::default(),
         }
     }
@@ -1128,6 +1160,13 @@ impl ProxyBuilder {
     /// Sets the health check interval.
     pub fn health_check_interval(mut self, interval: Duration) -> Self {
         self.health_check_interval = interval;
+        self
+    }
+
+    /// Sets the read timeout of the requests, the longest wait for a response and
+    /// for each chunk of its body. Default 1 minute.
+    pub fn read_timeout(mut self, timeout: Duration) -> Self {
+        self.read_timeout = timeout;
         self
     }
 
@@ -1196,6 +1235,7 @@ impl ProxyBuilder {
         let client_pool = Arc::new(
             PoolBuilder::new(HTTPClientFactory {
                 seed_peer_selector: Some(seed_peer_selector.clone()),
+                read_timeout: self.read_timeout,
             })
             .capacity(DEFAULT_CLIENT_POOL_CAPACITY)
             .idle_timeout(DEFAULT_CLIENT_POOL_IDLE_TIMEOUT)
@@ -1227,6 +1267,12 @@ impl ProxyBuilder {
         if self.health_check_interval.as_secs() < 1 || self.health_check_interval.as_secs() > 600 {
             return Err(Error::InvalidArgument(
                 "health check interval must be between 1 and 600 seconds".to_string(),
+            ));
+        }
+
+        if self.read_timeout.is_zero() {
+            return Err(Error::InvalidArgument(
+                "read timeout must be greater than 0".to_string(),
             ));
         }
 
@@ -2345,6 +2391,9 @@ pub struct ProxyWithSeedPeersBuilder {
     /// The seed peers serving the requests.
     seed_peers: Vec<SeedPeer>,
 
+    /// The read timeout of the requests.
+    read_timeout: Duration,
+
     /// The retry policy of the requests.
     retry: RetryPolicy,
 }
@@ -2355,6 +2404,7 @@ impl Default for ProxyWithSeedPeersBuilder {
     fn default() -> Self {
         Self {
             seed_peers: Vec::new(),
+            read_timeout: DEFAULT_REQUEST_READ_TIMEOUT,
             retry: RetryPolicy::default(),
         }
     }
@@ -2366,6 +2416,13 @@ impl ProxyWithSeedPeersBuilder {
     /// [`SchedulerClient::list_seed_peers`] returns.
     pub fn seed_peers(mut self, seed_peers: Vec<SeedPeer>) -> Self {
         self.seed_peers = seed_peers;
+        self
+    }
+
+    /// Sets the read timeout of the requests, the longest wait for a response and
+    /// for each chunk of its body. Default 1 minute.
+    pub fn read_timeout(mut self, timeout: Duration) -> Self {
+        self.read_timeout = timeout;
         self
     }
 
@@ -2397,6 +2454,7 @@ impl ProxyWithSeedPeersBuilder {
         seed_peer_selector.update(self.seed_peers).await;
 
         let proxy = ProxyBuilder {
+            read_timeout: self.read_timeout,
             retry: self.retry,
             ..Default::default()
         }
@@ -2407,6 +2465,12 @@ impl ProxyWithSeedPeersBuilder {
     /// Validates the input parameters.
     fn validate(&self) -> Result<()> {
         ProxyWithSeedPeers::validate_seed_peers(&self.seed_peers)?;
+
+        if self.read_timeout.is_zero() {
+            return Err(Error::InvalidArgument(
+                "read timeout must be greater than 0".to_string(),
+            ));
+        }
 
         if self.retry.max_retries > 10 {
             return Err(Error::InvalidArgument(
@@ -2501,6 +2565,9 @@ pub struct ProxyWithEndpointsBuilder {
     /// The seed peer endpoints serving the requests.
     endpoints: Vec<String>,
 
+    /// The read timeout of the requests.
+    read_timeout: Duration,
+
     /// The retry policy of the requests.
     retry: RetryPolicy,
 }
@@ -2511,6 +2578,7 @@ impl Default for ProxyWithEndpointsBuilder {
     fn default() -> Self {
         Self {
             endpoints: Vec::new(),
+            read_timeout: DEFAULT_REQUEST_READ_TIMEOUT,
             retry: RetryPolicy::default(),
         }
     }
@@ -2521,6 +2589,13 @@ impl ProxyWithEndpointsBuilder {
     /// Sets the seed peer endpoints serving the requests.
     pub fn endpoints(mut self, endpoints: Vec<String>) -> Self {
         self.endpoints = endpoints;
+        self
+    }
+
+    /// Sets the read timeout of the requests, the longest wait for a response and
+    /// for each chunk of its body. Default 1 minute.
+    pub fn read_timeout(mut self, timeout: Duration) -> Self {
+        self.read_timeout = timeout;
         self
     }
 
@@ -2549,7 +2624,10 @@ impl ProxyWithEndpointsBuilder {
 
         // Create a client per endpoint, so every endpoint has its own reusable
         // connection pool.
-        let factory = HTTPClientFactory::default();
+        let factory = HTTPClientFactory {
+            read_timeout: self.read_timeout,
+            ..Default::default()
+        };
         let mut clients = HashMap::with_capacity(self.endpoints.len());
         for endpoint in self.endpoints.iter() {
             if clients.contains_key(endpoint) {
@@ -2571,6 +2649,12 @@ impl ProxyWithEndpointsBuilder {
         if self.endpoints.is_empty() {
             return Err(Error::InvalidArgument(
                 "endpoints must not be empty".to_string(),
+            ));
+        }
+
+        if self.read_timeout.is_zero() {
+            return Err(Error::InvalidArgument(
+                "read timeout must be greater than 0".to_string(),
             ));
         }
 
@@ -2864,6 +2948,7 @@ mod tests {
 
     type ExpectElapsed = fn(Duration);
     type ExpectResumed = fn(Result<Vec<u8>>, usize, Duration);
+    type ExpectLength = fn(Result<usize>);
 
     #[tokio::test]
     async fn new_success() {
@@ -2881,14 +2966,28 @@ mod tests {
     #[tokio::test]
     async fn new_invalid_params() {
         let test_cases = vec![
-            ("", None, None),
-            ("http://0.0.0.0:4000", Some(11), None),
-            ("http://0.0.0.0:4000", None, Some(Duration::from_secs(0))),
-            ("http://0.0.0.0:4000", None, Some(Duration::from_secs(601))),
+            ("", None, None, None),
+            ("http://0.0.0.0:4000", Some(11), None, None),
+            (
+                "http://0.0.0.0:4000",
+                None,
+                Some(Duration::from_secs(0)),
+                None,
+            ),
+            (
+                "http://0.0.0.0:4000",
+                None,
+                Some(Duration::from_secs(601)),
+                None,
+            ),
+            ("http://0.0.0.0:4000", None, None, Some(Duration::ZERO)),
         ];
 
-        for (endpoint, max_retries, health_check_interval) in test_cases {
+        for (endpoint, max_retries, health_check_interval, read_timeout) in test_cases {
             let mut builder = Proxy::builder().scheduler_endpoint(endpoint.to_string());
+            if let Some(read_timeout) = read_timeout {
+                builder = builder.read_timeout(read_timeout);
+            }
             if let Some(max_retries) = max_retries {
                 builder = builder.max_retries(max_retries);
             }
@@ -2899,7 +2998,7 @@ mod tests {
             let result = builder.build().await;
             assert!(
                 matches!(result, Err(Error::InvalidArgument(_))),
-                "endpoint: {endpoint}, max_retries: {max_retries:?}, health_check_interval: {health_check_interval:?}"
+                "endpoint: {endpoint}, max_retries: {max_retries:?}, health_check_interval: {health_check_interval:?}, read_timeout: {read_timeout:?}"
             );
         }
     }
@@ -2907,12 +3006,13 @@ mod tests {
     #[tokio::test]
     async fn new_with_seed_peers_invalid_params() {
         let test_cases = vec![
-            (vec![], None),
+            (vec![], None, None),
             (
                 vec![SeedPeer {
                     host: create_seed_peer_host("", 0, 4001),
                     healthy: true,
                 }],
+                None,
                 None,
             ),
             (
@@ -2927,6 +3027,7 @@ mod tests {
                     },
                 ],
                 None,
+                None,
             ),
             (
                 vec![SeedPeer {
@@ -2934,11 +3035,23 @@ mod tests {
                     healthy: true,
                 }],
                 Some(11),
+                None,
+            ),
+            (
+                vec![SeedPeer {
+                    host: create_seed_peer_host("seed-peer-1", 0, 4001),
+                    healthy: true,
+                }],
+                None,
+                Some(Duration::ZERO),
             ),
         ];
 
-        for (seed_peers, max_retries) in test_cases {
+        for (seed_peers, max_retries, read_timeout) in test_cases {
             let mut builder = ProxyWithSeedPeers::builder().seed_peers(seed_peers.clone());
+            if let Some(read_timeout) = read_timeout {
+                builder = builder.read_timeout(read_timeout);
+            }
             if let Some(max_retries) = max_retries {
                 builder = builder.max_retries(max_retries);
             }
@@ -2946,7 +3059,7 @@ mod tests {
             let result = builder.build().await;
             assert!(
                 matches!(result, Err(Error::InvalidArgument(_))),
-                "seed_peers: {seed_peers:?}, max_retries: {max_retries:?}"
+                "seed_peers: {seed_peers:?}, max_retries: {max_retries:?}, read_timeout: {read_timeout:?}"
             );
         }
     }
@@ -3206,6 +3319,39 @@ mod tests {
         let response = proxy.get_into(&request, &mut buf).await.unwrap();
         assert!(response.success);
         assert_eq!(&buf[..], b"hello dragonfly");
+    }
+
+    #[tokio::test]
+    async fn get_into_with_seed_peers_retries_a_first_attempt_past_the_read_timeout() {
+        let (port, connections) =
+            setup_flaky_seed_peer_proxy(FlakyFirstConnection::Hang, "hello dragonfly").await;
+        let proxy = ProxyWithSeedPeers::builder()
+            .seed_peers(vec![SeedPeer {
+                host: create_seed_peer_host("seed-peer-1", 0, port),
+                healthy: true,
+            }])
+            .read_timeout(Duration::from_millis(300))
+            .build()
+            .await
+            .unwrap();
+
+        let request = GetRequest {
+            url: "http://example.com/file.txt".to_string(),
+            replicas: 1,
+            ..Default::default()
+        };
+
+        let start = std::time::Instant::now();
+        let mut buf = BytesMut::new();
+        let response = proxy.get_into(&request, &mut buf).await.unwrap();
+        let elapsed = start.elapsed();
+        assert!(response.success);
+        assert_eq!(&buf[..], b"hello dragonfly");
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(
+            (Duration::from_millis(300)..Duration::from_millis(900)).contains(&elapsed),
+            "elapsed: {elapsed:?}"
+        );
     }
 
     #[tokio::test]
@@ -3665,14 +3811,38 @@ mod tests {
 
     #[tokio::test]
     async fn get_into_retries_a_flaky_first_attempt() {
-        let test_cases: Vec<(FlakyFirstConnection, Duration, ExpectElapsed)> = vec![
+        let test_cases: Vec<(FlakyFirstConnection, Duration, Duration, ExpectElapsed)> = vec![
             (
                 FlakyFirstConnection::TruncateBody,
                 DEFAULT_REQUEST_TIMEOUT,
+                DEFAULT_REQUEST_READ_TIMEOUT,
                 |_elapsed| {},
             ),
             (
                 FlakyFirstConnection::Hang,
+                Duration::from_millis(300),
+                DEFAULT_REQUEST_READ_TIMEOUT,
+                |elapsed| {
+                    assert!(
+                        (Duration::from_millis(300)..Duration::from_millis(900)).contains(&elapsed),
+                        "elapsed: {elapsed:?}"
+                    );
+                },
+            ),
+            (
+                FlakyFirstConnection::Hang,
+                DEFAULT_REQUEST_TIMEOUT,
+                Duration::from_millis(300),
+                |elapsed| {
+                    assert!(
+                        (Duration::from_millis(300)..Duration::from_millis(900)).contains(&elapsed),
+                        "elapsed: {elapsed:?}"
+                    );
+                },
+            ),
+            (
+                FlakyFirstConnection::StallBody,
+                DEFAULT_REQUEST_TIMEOUT,
                 Duration::from_millis(300),
                 |elapsed| {
                     assert!(
@@ -3683,7 +3853,7 @@ mod tests {
             ),
         ];
 
-        for (first, timeout, expect) in test_cases {
+        for (first, timeout, read_timeout, expect) in test_cases {
             let (port, connections) = setup_flaky_seed_peer_proxy(first, "hello dragonfly").await;
             let mock_seed_peer = setup_mock_seed_peer(MockSet::new()).await.unwrap();
             let mock_scheduler = setup_mock_scheduler(vec![create_seed_peer_host(
@@ -3697,6 +3867,7 @@ mod tests {
             let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
             let proxy = Proxy::builder()
                 .scheduler_endpoint(scheduler_endpoint)
+                .read_timeout(read_timeout)
                 .build()
                 .await
                 .unwrap();
@@ -3725,14 +3896,38 @@ mod tests {
     #[tokio::test]
     async fn get_into_with_endpoints_retries_a_flaky_first_attempt() {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let test_cases: Vec<(FlakyFirstConnection, Duration, ExpectElapsed)> = vec![
+        let test_cases: Vec<(FlakyFirstConnection, Duration, Duration, ExpectElapsed)> = vec![
             (
                 FlakyFirstConnection::TruncateBody,
                 DEFAULT_REQUEST_TIMEOUT,
+                DEFAULT_REQUEST_READ_TIMEOUT,
                 |_elapsed| {},
             ),
             (
                 FlakyFirstConnection::Hang,
+                Duration::from_millis(300),
+                DEFAULT_REQUEST_READ_TIMEOUT,
+                |elapsed| {
+                    assert!(
+                        (Duration::from_millis(300)..Duration::from_millis(900)).contains(&elapsed),
+                        "elapsed: {elapsed:?}"
+                    );
+                },
+            ),
+            (
+                FlakyFirstConnection::Hang,
+                DEFAULT_REQUEST_TIMEOUT,
+                Duration::from_millis(300),
+                |elapsed| {
+                    assert!(
+                        (Duration::from_millis(300)..Duration::from_millis(900)).contains(&elapsed),
+                        "elapsed: {elapsed:?}"
+                    );
+                },
+            ),
+            (
+                FlakyFirstConnection::StallBody,
+                DEFAULT_REQUEST_TIMEOUT,
                 Duration::from_millis(300),
                 |elapsed| {
                     assert!(
@@ -3743,10 +3938,11 @@ mod tests {
             ),
         ];
 
-        for (first, timeout, expect) in test_cases {
+        for (first, timeout, read_timeout, expect) in test_cases {
             let (port, connections) = setup_flaky_seed_peer_proxy(first, "hello dragonfly").await;
             let proxy = ProxyWithEndpoints::builder()
                 .endpoints(vec![format!("http://127.0.0.1:{port}")])
+                .read_timeout(read_timeout)
                 .build()
                 .await
                 .unwrap();
@@ -3772,11 +3968,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_times_out_a_slow_reader_by_the_timeout_only() {
+        let test_cases: Vec<(Duration, Duration, ExpectLength)> = vec![
+            (
+                DEFAULT_REQUEST_TIMEOUT,
+                Duration::from_millis(300),
+                |result| assert_eq!(result.unwrap(), 32 << 20),
+            ),
+            (
+                Duration::from_millis(300),
+                DEFAULT_REQUEST_READ_TIMEOUT,
+                |result| {
+                    assert!(
+                        matches!(result, Err(Error::RequestTimeout(_))),
+                        "result: {result:?}"
+                    )
+                },
+            ),
+        ];
+
+        for (timeout, read_timeout, expect) in test_cases {
+            let mut mocks = MockSet::new();
+            mocks.mock(|when, then| {
+                when.get().path("/file.txt");
+                then.text("x".repeat(32 << 20));
+            });
+            let mock_proxy = setup_mock_seed_peer_proxy(mocks).await.unwrap();
+            let mock_seed_peer = setup_mock_seed_peer(MockSet::new()).await.unwrap();
+            let mock_scheduler = setup_mock_scheduler(vec![create_seed_peer_host(
+                "seed-peer-1",
+                mock_seed_peer.port().unwrap(),
+                mock_proxy.port().unwrap(),
+            )])
+            .await
+            .unwrap();
+
+            let scheduler_endpoint = format!("http://0.0.0.0:{}", mock_scheduler.port().unwrap());
+            let proxy = Proxy::builder()
+                .scheduler_endpoint(scheduler_endpoint)
+                .max_retries(0)
+                .read_timeout(read_timeout)
+                .build()
+                .await
+                .unwrap();
+
+            let request = GetRequest {
+                url: "http://example.com/file.txt".to_string(),
+                replicas: 1,
+                timeout,
+                ..Default::default()
+            };
+
+            let mut body = proxy.get(&request).await.unwrap().body.unwrap();
+            let chunk = body.try_next().await.unwrap().unwrap();
+            tokio::time::sleep(Duration::from_millis(900)).await;
+            let result = body
+                .try_fold(
+                    chunk.len(),
+                    |len, chunk| async move { Ok(len + chunk.len()) },
+                )
+                .await;
+
+            expect(result);
+        }
+    }
+
+    #[tokio::test]
     async fn get_resumes_a_body_that_breaks_off() {
-        let test_cases: Vec<(FlakyFirstConnection, Duration, u8, ExpectResumed)> = vec![
+        let test_cases: Vec<(FlakyFirstConnection, Duration, Duration, u8, ExpectResumed)> = vec![
             (
                 FlakyFirstConnection::TruncateBody,
                 DEFAULT_REQUEST_TIMEOUT,
+                DEFAULT_REQUEST_READ_TIMEOUT,
                 1,
                 |result, connections, _elapsed| {
                     assert_eq!(result.unwrap(), b"hello dragonfly");
@@ -3785,6 +4048,21 @@ mod tests {
             ),
             (
                 FlakyFirstConnection::StallBody,
+                Duration::from_millis(300),
+                DEFAULT_REQUEST_READ_TIMEOUT,
+                1,
+                |result, connections, elapsed| {
+                    assert_eq!(result.unwrap(), b"hello dragonfly");
+                    assert_eq!(connections, 2);
+                    assert!(
+                        (Duration::from_millis(300)..Duration::from_millis(900)).contains(&elapsed),
+                        "elapsed: {elapsed:?}"
+                    );
+                },
+            ),
+            (
+                FlakyFirstConnection::StallBody,
+                DEFAULT_REQUEST_TIMEOUT,
                 Duration::from_millis(300),
                 1,
                 |result, connections, elapsed| {
@@ -3799,6 +4077,7 @@ mod tests {
             (
                 FlakyFirstConnection::TruncateBody,
                 DEFAULT_REQUEST_TIMEOUT,
+                DEFAULT_REQUEST_READ_TIMEOUT,
                 0,
                 |result, connections, _elapsed| {
                     assert!(
@@ -3811,6 +4090,20 @@ mod tests {
             (
                 FlakyFirstConnection::StallBody,
                 Duration::from_millis(300),
+                DEFAULT_REQUEST_READ_TIMEOUT,
+                0,
+                |result, connections, _elapsed| {
+                    assert!(
+                        matches!(result, Err(Error::RequestTimeout(_))),
+                        "result: {result:?}"
+                    );
+                    assert_eq!(connections, 1);
+                },
+            ),
+            (
+                FlakyFirstConnection::StallBody,
+                DEFAULT_REQUEST_TIMEOUT,
+                Duration::from_millis(300),
                 0,
                 |result, connections, _elapsed| {
                     assert!(
@@ -3822,7 +4115,7 @@ mod tests {
             ),
         ];
 
-        for (first, timeout, max_retries, expect) in test_cases {
+        for (first, timeout, read_timeout, max_retries, expect) in test_cases {
             let (port, connections) = setup_flaky_seed_peer_proxy(first, "hello dragonfly").await;
             let mock_seed_peer = setup_mock_seed_peer(MockSet::new()).await.unwrap();
             let mock_scheduler = setup_mock_scheduler(vec![create_seed_peer_host(
@@ -3837,6 +4130,7 @@ mod tests {
             let proxy = Proxy::builder()
                 .scheduler_endpoint(scheduler_endpoint)
                 .max_retries(max_retries)
+                .read_timeout(read_timeout)
                 .build()
                 .await
                 .unwrap();
@@ -3870,10 +4164,11 @@ mod tests {
     #[tokio::test]
     async fn get_with_endpoints_resumes_a_body_that_breaks_off() {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let test_cases: Vec<(FlakyFirstConnection, Duration, u8, ExpectResumed)> = vec![
+        let test_cases: Vec<(FlakyFirstConnection, Duration, Duration, u8, ExpectResumed)> = vec![
             (
                 FlakyFirstConnection::TruncateBody,
                 DEFAULT_REQUEST_TIMEOUT,
+                DEFAULT_REQUEST_READ_TIMEOUT,
                 1,
                 |result, connections, _elapsed| {
                     assert_eq!(result.unwrap(), b"hello dragonfly");
@@ -3882,6 +4177,21 @@ mod tests {
             ),
             (
                 FlakyFirstConnection::StallBody,
+                Duration::from_millis(300),
+                DEFAULT_REQUEST_READ_TIMEOUT,
+                1,
+                |result, connections, elapsed| {
+                    assert_eq!(result.unwrap(), b"hello dragonfly");
+                    assert_eq!(connections, 2);
+                    assert!(
+                        (Duration::from_millis(300)..Duration::from_millis(900)).contains(&elapsed),
+                        "elapsed: {elapsed:?}"
+                    );
+                },
+            ),
+            (
+                FlakyFirstConnection::StallBody,
+                DEFAULT_REQUEST_TIMEOUT,
                 Duration::from_millis(300),
                 1,
                 |result, connections, elapsed| {
@@ -3896,6 +4206,7 @@ mod tests {
             (
                 FlakyFirstConnection::TruncateBody,
                 DEFAULT_REQUEST_TIMEOUT,
+                DEFAULT_REQUEST_READ_TIMEOUT,
                 0,
                 |result, connections, _elapsed| {
                     assert!(
@@ -3908,6 +4219,20 @@ mod tests {
             (
                 FlakyFirstConnection::StallBody,
                 Duration::from_millis(300),
+                DEFAULT_REQUEST_READ_TIMEOUT,
+                0,
+                |result, connections, _elapsed| {
+                    assert!(
+                        matches!(result, Err(Error::RequestTimeout(_))),
+                        "result: {result:?}"
+                    );
+                    assert_eq!(connections, 1);
+                },
+            ),
+            (
+                FlakyFirstConnection::StallBody,
+                DEFAULT_REQUEST_TIMEOUT,
+                Duration::from_millis(300),
                 0,
                 |result, connections, _elapsed| {
                     assert!(
@@ -3919,11 +4244,12 @@ mod tests {
             ),
         ];
 
-        for (first, timeout, max_retries, expect) in test_cases {
+        for (first, timeout, read_timeout, max_retries, expect) in test_cases {
             let (port, connections) = setup_flaky_seed_peer_proxy(first, "hello dragonfly").await;
             let proxy = ProxyWithEndpoints::builder()
                 .endpoints(vec![format!("http://127.0.0.1:{port}")])
                 .max_retries(max_retries)
+                .read_timeout(read_timeout)
                 .build()
                 .await
                 .unwrap();
@@ -4099,15 +4425,32 @@ mod tests {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         let test_cases = vec![
-            (vec![], 1, true),
-            (vec!["http://127.0.0.1:4001".to_string()], 11, true),
-            (vec!["://".to_string()], 1, false),
+            (vec![], 1, DEFAULT_REQUEST_READ_TIMEOUT, true),
+            (
+                vec!["http://127.0.0.1:4001".to_string()],
+                11,
+                DEFAULT_REQUEST_READ_TIMEOUT,
+                true,
+            ),
+            (
+                vec!["http://127.0.0.1:4001".to_string()],
+                1,
+                Duration::ZERO,
+                true,
+            ),
+            (
+                vec!["://".to_string()],
+                1,
+                DEFAULT_REQUEST_READ_TIMEOUT,
+                false,
+            ),
         ];
 
-        for (endpoints, max_retries, expected_invalid_argument) in test_cases {
+        for (endpoints, max_retries, read_timeout, expected_invalid_argument) in test_cases {
             let result = ProxyWithEndpoints::builder()
                 .endpoints(endpoints.clone())
                 .max_retries(max_retries)
+                .read_timeout(read_timeout)
                 .build()
                 .await;
             if expected_invalid_argument {

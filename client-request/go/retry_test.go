@@ -20,7 +20,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -184,7 +186,7 @@ func TestRetryPolicyRunWaitsTheBackoffDelays(t *testing.T) {
 			tc.expect(t, time.Since(start))
 
 			start = time.Now()
-			attempts, err := policy.newAttempts([]string{"a"}, time.Second)
+			attempts, err := policy.newAttempts([]string{"a"}, time.Second, time.Second)
 			assert.NoError(err)
 
 			_, _, err = attempts.run(context.Background(), func(context.Context, string) (*http.Response, error) {
@@ -326,7 +328,7 @@ func TestAttemptsRun(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			var tried []string
-			attempts, err := retryPolicy{maxRetries: tc.maxRetries}.newAttempts(tc.endpoints, time.Second)
+			attempts, err := retryPolicy{maxRetries: tc.maxRetries}.newAttempts(tc.endpoints, time.Second, time.Second)
 			if err != nil {
 				tc.expect(t, tried, err)
 				return
@@ -345,6 +347,86 @@ func TestAttemptsRun(t *testing.T) {
 				cancel()
 			}
 			tc.expect(t, tried, err)
+		})
+	}
+}
+
+func TestAttemptsRunTimesOutAReadThatStalls(t *testing.T) {
+	tests := []struct {
+		name    string
+		http2   bool
+		handler http.HandlerFunc
+		expect  func(t *testing.T, err error)
+	}{
+		{
+			name: "no response over HTTP/1.1",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				<-r.Context().Done()
+			},
+			expect: func(t *testing.T, err error) {
+				assert.ErrorIs(t, err, ErrRequestTimeout)
+			},
+		},
+		{
+			name:  "no response over HTTP/2",
+			http2: true,
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				<-r.Context().Done()
+			},
+			expect: func(t *testing.T, err error) {
+				assert.ErrorIs(t, err, ErrRequestTimeout)
+			},
+		},
+		{
+			name: "a body that stalls over HTTP/1.1",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Length", "15")
+				fmt.Fprint(w, "hello d")
+				w.(http.Flusher).Flush()
+				<-r.Context().Done()
+			},
+			expect: func(t *testing.T, err error) {
+				assert.ErrorIs(t, err, context.DeadlineExceeded)
+			},
+		},
+		{
+			name:  "a body that stalls over HTTP/2",
+			http2: true,
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Length", "15")
+				fmt.Fprint(w, "hello d")
+				w.(http.Flusher).Flush()
+				<-r.Context().Done()
+			},
+			expect: func(t *testing.T, err error) {
+				assert.ErrorIs(t, err, context.DeadlineExceeded)
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewUnstartedServer(tc.handler)
+			server.EnableHTTP2 = tc.http2
+			server.StartTLS()
+			defer server.Close()
+
+			attempts, err := retryPolicy{}.newAttempts([]string{server.URL}, defaultRequestTimeout, 200*time.Millisecond)
+			assert.NoError(t, err)
+
+			ctx, stop := context.WithCancel(context.Background())
+			defer stop()
+			defer time.AfterFunc(5*time.Second, stop).Stop()
+
+			resp, cancel, err := attempts.run(ctx, func(ctx context.Context, endpoint string) (*http.Response, error) {
+				return NewGetRequest(endpoint).send(ctx, server.Client())
+			})
+			if err == nil {
+				defer cancel()
+				defer resp.Body.Close()
+				_, err = io.ReadAll(resp.Body)
+			}
+			tc.expect(t, err)
 		})
 	}
 }
@@ -407,7 +489,7 @@ func TestAttemptsShareTheRetriesAcrossRunsAndBackoffs(t *testing.T) {
 				return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
 			}
 
-			attempts, err := retryPolicy{maxRetries: tc.maxRetries}.newAttempts([]string{"a", "b"}, time.Second)
+			attempts, err := retryPolicy{maxRetries: tc.maxRetries}.newAttempts([]string{"a", "b"}, time.Second, time.Second)
 			assert.NoError(t, err)
 
 			_, cancel, err := attempts.run(context.Background(), send)
@@ -470,7 +552,7 @@ func TestAttemptsSleepStopsWhenTheContextEnds(t *testing.T) {
 			if tc.cause != nil {
 				cancel(tc.cause)
 			}
-			attempts, err := retryPolicy{}.newAttempts([]string{"a"}, time.Second)
+			attempts, err := retryPolicy{}.newAttempts([]string{"a"}, time.Second, time.Second)
 			assert.NoError(t, err)
 
 			tc.expect(t, attempts.sleep(ctx, 0))

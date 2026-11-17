@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/cenkalti/backoff/v5"
 
@@ -44,6 +45,12 @@ func WithProxyWithSeedPeersBackoff(b *backoff.ExponentialBackOff) ProxyWithSeedP
 	return func(p *ProxyWithSeedPeers) { p.proxy.retry.backoff = b }
 }
 
+// WithProxyWithSeedPeersReadTimeout sets the read timeout of the requests, the
+// longest wait for a response and for every read of its body. Default 1 minute.
+func WithProxyWithSeedPeersReadTimeout(timeout time.Duration) ProxyWithSeedPeersOption {
+	return func(p *ProxyWithSeedPeers) { p.proxy.readTimeout = timeout }
+}
+
 // ProxyWithSeedPeers is the HTTP proxy client that sends requests via the seed
 // peers given at construction, selected by the consistent hash ring without
 // connecting to the scheduler.
@@ -59,6 +66,7 @@ func NewWithSeedPeers(seedPeers []SeedPeer, opts ...ProxyWithSeedPeersOption) (*
 	p := &ProxyWithSeedPeers{
 		proxy: &Proxy{
 			retry:            defaultRetryPolicy,
+			readTimeout:      defaultRequestReadTimeout,
 			seedPeerSelector: selector.New(),
 		},
 	}
@@ -69,6 +77,10 @@ func NewWithSeedPeers(seedPeers []SeedPeer, opts ...ProxyWithSeedPeersOption) (*
 
 	if err := p.validateSeedPeers(seedPeers); err != nil {
 		return nil, err
+	}
+
+	if p.proxy.readTimeout <= 0 {
+		return nil, fmt.Errorf("%w: read timeout must be greater than 0", ErrInvalidArgument)
 	}
 
 	if p.proxy.retry.maxRetries > 10 {
