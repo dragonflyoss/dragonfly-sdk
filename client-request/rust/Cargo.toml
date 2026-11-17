@@ -18,7 +18,7 @@ preheat = ["dep:base64", "dep:oci-client"]
 dragonfly-api = "2.3.10"
 dragonfly-hashring = "0.3.0"
 async-trait = "0.1"
-base64 = { version = "0.22", optional = true }
+base64 = { version = "0.23", optional = true }
 backon = { version = "1", default-features = false, features = ["std", "tokio-sleep"] }
 futures = "0.3.32"
 hostname = "^0.4"
