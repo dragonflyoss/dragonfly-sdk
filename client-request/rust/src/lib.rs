@@ -1436,10 +1436,15 @@ impl Request for Proxy {
 
         // Pull the image manifests, all the platforms of a multi-platform image
         // index unless the platform is specified.
-        let (manifest, manifest_digest) = client
-            .pull_manifest(&reference, &auth)
-            .await
-            .map_err(|err| Error::Internal(format!("failed to pull image manifest: {err}")))?;
+        let (manifest, manifest_digest) = self
+            .retry
+            .run(|| async {
+                client
+                    .pull_manifest(&reference, &auth)
+                    .await
+                    .map_err(|err| Error::Internal(format!("failed to pull image manifest: {err}")))
+            })
+            .await?;
 
         let manifests = match manifest {
             OciManifest::Image(manifest) => {
@@ -1456,12 +1461,18 @@ impl Request for Proxy {
                         continue;
                     }
 
-                    let (manifest, manifest_digest) = client
-                        .pull_image_manifest(&reference.clone_with_digest(entry.digest), &auth)
-                        .await
-                        .map_err(|err| {
-                            Error::Internal(format!("failed to pull image manifest: {err}"))
-                        })?;
+                    let digest_reference = reference.clone_with_digest(entry.digest);
+                    let (manifest, manifest_digest) = self
+                        .retry
+                        .run(|| async {
+                            client
+                                .pull_image_manifest(&digest_reference, &auth)
+                                .await
+                                .map_err(|err| {
+                                    Error::Internal(format!("failed to pull image manifest: {err}"))
+                                })
+                        })
+                        .await?;
 
                     manifests.push((manifest, manifest_digest, platform));
                 }
@@ -1598,14 +1609,21 @@ impl Request for Proxy {
                     }
 
                     // Authorize the target when it starts, because the token of the registry
-                    // expires during a long preheat. A registry without a bearer token is
-                    // authorized with the basic credentials, if any.
-                    let token = client
-                        .auth(&reference, &auth, RegistryOperation::Pull)
-                        .await
-                        .map_err(|err| {
-                            Error::Internal(format!("failed to authenticate with registry: {err}"))
-                        })?;
+                    // expires during a long preheat, retrying a transient failure. A registry
+                    // without a bearer token is authorized with the basic credentials, if any.
+                    let token = proxy
+                        .retry
+                        .run(|| async {
+                            client
+                                .auth(&reference, &auth, RegistryOperation::Pull)
+                                .await
+                                .map_err(|err| {
+                                    Error::Internal(format!(
+                                        "failed to authenticate with registry: {err}"
+                                    ))
+                                })
+                        })
+                        .await?;
 
                     let authorization = match (token, auth) {
                         (Some(token), _) => Some(format!("Bearer {token}")),
@@ -1761,10 +1779,15 @@ impl Request for Proxy {
 
         // Pull the image manifests, all the platforms of a multi-platform image
         // index unless the platform is specified.
-        let (manifest, _) = client
-            .pull_manifest(&reference, &auth)
-            .await
-            .map_err(|err| Error::Internal(format!("failed to pull image manifest: {err}")))?;
+        let (manifest, _) = self
+            .retry
+            .run(|| async {
+                client
+                    .pull_manifest(&reference, &auth)
+                    .await
+                    .map_err(|err| Error::Internal(format!("failed to pull image manifest: {err}")))
+            })
+            .await?;
 
         let manifests = match manifest {
             OciManifest::Image(manifest) => vec![manifest],
@@ -1779,12 +1802,18 @@ impl Request for Proxy {
                         continue;
                     }
 
-                    let (manifest, _) = client
-                        .pull_image_manifest(&reference.clone_with_digest(entry.digest), &auth)
-                        .await
-                        .map_err(|err| {
-                            Error::Internal(format!("failed to pull image manifest: {err}"))
-                        })?;
+                    let digest_reference = reference.clone_with_digest(entry.digest);
+                    let (manifest, _) = self
+                        .retry
+                        .run(|| async {
+                            client
+                                .pull_image_manifest(&digest_reference, &auth)
+                                .await
+                                .map_err(|err| {
+                                    Error::Internal(format!("failed to pull image manifest: {err}"))
+                                })
+                        })
+                        .await?;
 
                     manifests.push(manifest);
                 }

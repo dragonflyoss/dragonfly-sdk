@@ -144,20 +144,34 @@ func (p *Proxy) PreheatImage(ctx context.Context, req *PreheatImageRequest) erro
 		opts = append(opts, oci.WithPlatform(*req.platform))
 	}
 
-	manifests, _, err := oci.Resolve(ctx, ref, opts...)
-	if err != nil {
+	var manifests []*oci.Manifest
+	if err := p.retry.run(ctx, func() error {
+		var err error
+		if manifests, _, err = oci.Resolve(ctx, ref, opts...); err != nil {
+			return fmt.Errorf("%w: %v", ErrInternal, err)
+		}
+
+		return nil
+	}); err != nil {
 		if cause := context.Cause(ctx); cause != nil {
 			return cause
 		}
 
-		return fmt.Errorf("%w: %v", ErrInternal, err)
+		return err
 	}
 
 	// Authorize the targets with one client, which keeps the token of the
 	// registry and renews it when it expires during a long preheat.
-	authClient, err := oci.NewAuthClient(ref, p.registryClient, req.username, req.password)
-	if err != nil {
-		return fmt.Errorf("%w: failed to authenticate with registry: %v", ErrInternal, err)
+	var authClient *oci.AuthClient
+	if err := p.retry.run(ctx, func() error {
+		var err error
+		if authClient, err = oci.NewAuthClient(ref, p.registryClient, req.username, req.password); err != nil {
+			return fmt.Errorf("%w: failed to authenticate with registry: %v", ErrInternal, err)
+		}
+
+		return nil
+	}); err != nil {
+		return err
 	}
 
 	// Build the accept header with the manifest media types for downloading
@@ -227,9 +241,16 @@ func (p *Proxy) PreheatImage(ctx context.Context, req *PreheatImageRequest) erro
 			}
 
 			// Authorize the target when it starts, the registry may need no authorization.
-			authorization, err := authClient.Authorization()
-			if err != nil {
-				return fmt.Errorf("%w: failed to authenticate with registry: %v", ErrInternal, err)
+			var authorization string
+			if err := p.retry.run(ctx, func() error {
+				var err error
+				if authorization, err = authClient.Authorization(); err != nil {
+					return fmt.Errorf("%w: failed to authenticate with registry: %v", ErrInternal, err)
+				}
+
+				return nil
+			}); err != nil {
+				return err
 			}
 
 			requestHeader := target.header.Clone()
