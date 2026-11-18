@@ -59,13 +59,20 @@ func (p *Proxy) StatImage(ctx context.Context, req *StatImageRequest) (*StatImag
 		opts = append(opts, oci.WithPlatform(*req.platform))
 	}
 
-	manifests, _, err := oci.Resolve(ctx, ref, opts...)
-	if err != nil {
+	var manifests []*oci.Manifest
+	if err := p.retry.run(ctx, func() error {
+		var err error
+		if manifests, _, err = oci.Resolve(ctx, ref, opts...); err != nil {
+			return fmt.Errorf("%w: %v", ErrInternal, err)
+		}
+
+		return nil
+	}); err != nil {
 		if cause := context.Cause(ctx); cause != nil {
 			return nil, cause
 		}
 
-		return nil, fmt.Errorf("%w: %v", ErrInternal, err)
+		return nil, err
 	}
 
 	// Collect the layers of the matched platforms. A layer shared by several
