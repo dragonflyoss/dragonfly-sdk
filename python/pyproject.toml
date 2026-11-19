@@ -1,0 +1,92 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dragonfly-sdk"
+dynamic = ["version"]
+description = "Python SDK for dfget: download models and datasets through a local dfdaemon."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "The Dragonfly Authors" }]
+keywords = ["dragonfly", "dfget", "p2p", "download", "ai", "model"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Typing :: Typed",
+]
+dependencies = [
+  "dragonfly-api>=2.3.8,<3.0.0",
+  "grpcio>=1.76.0",
+  "protobuf>=6.31.1,<8.0.0",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.0.0,<9",
+  "pytest-cov>=5.0.0,<8",
+]
+dev = [
+  "build>=1.2.0",
+  "mypy>=1.10.0,<2",
+  "pytest>=8.0.0,<9",
+  "pytest-cov>=5.0.0,<8",
+  "ruff>=0.5.0",
+  "twine>=7.0.0",
+  "types-grpcio>=1.0.0",
+  "types-protobuf>=6.31,<7",
+]
+
+[project.urls]
+Homepage = "https://d7y.io"
+Repository = "https://github.com/dragonflyoss/dragonfly-sdk"
+Issues = "https://github.com/dragonflyoss/dragonfly-sdk/issues"
+
+[tool.hatch.version]
+path = "src/dragonfly_sdk/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dragonfly_sdk"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "examples", "README.md", "LICENSE", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "integration: requires a running dfdaemon and DRAGONFLY_LIVE_TEST=1",
+]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["dragonfly_sdk"]
+
+[tool.mypy]
+python_version = "3.9"
+strict = true
+files = ["src"]
+warn_unused_ignores = true
+show_error_codes = true
+
+[[tool.mypy.overrides]]
+module = ["dragonfly_api.*"]
+follow_imports = "skip"
+ignore_missing_imports = true

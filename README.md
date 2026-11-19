@@ -12,6 +12,7 @@ Multi-language SDKs for Dragonfly.
 | :--------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------- |
 | [client-request (Rust)](./client-request/rust) | Request library for the Dragonfly client: streaming and buffered GET requests, preheating files and OCI images through seed peers, deleting preheated files and OCI images from them. |
 | [client-request (Go)](./client-request/go)     | Go implementation of the request library, generating identical task ids and seed peer selections as the Rust crate.                                                                  |
+| [Python](./python)                             | Python SDK for `dfget`: download models and datasets from HTTP(S), S3-compatible object storage, HuggingFace, ModelScope and OpenCSG through a local dfdaemon.                        |
 
 ## Documentation
 
