@@ -171,7 +171,7 @@ all its platforms unless a platform is set:
 
 ```toml
 [dependencies]
-dragonfly-client-request = { version = "1.15.0", features = ["preheat"] }
+dragonfly-client-request = { version = "1.15.1", features = ["preheat"] }
 ```
 
 ```rust

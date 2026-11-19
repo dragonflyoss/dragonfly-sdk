@@ -2852,7 +2852,10 @@ mod tests {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         mocks.mock(|when, then| {
             when.path("/scheduler.v2.Scheduler/ListHosts");
-            then.pb(ListHostsResponse { hosts });
+            then.pb(ListHostsResponse {
+                hosts,
+                next_page_token: None,
+            });
         });
 
         let server = MockServer::new_grpc("scheduler.v2.Scheduler").with_mocks(mocks);
