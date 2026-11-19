@@ -46,7 +46,10 @@ async fn setup_mock_scheduler(hosts: Vec<Host>) -> MockServer {
     let mut mocks = MockSet::new();
     mocks.mock(|when, then| {
         when.path("/scheduler.v2.Scheduler/ListHosts");
-        then.pb(ListHostsResponse { hosts });
+        then.pb(ListHostsResponse {
+            hosts,
+            next_page_token: None,
+        });
     });
 
     let server = MockServer::new_grpc("scheduler.v2.Scheduler").with_mocks(mocks);

@@ -101,7 +101,11 @@ impl SchedulerClient {
     pub async fn list_seed_peers(&self) -> Result<Vec<SeedPeer>> {
         // Filter for seed peer types, seed peer type is 1.
         // refer to dragonfly-client-config/src/dfdaemon.rs#HostType.
-        let request = tonic::Request::new(ListHostsRequest { r#type: Some(1) });
+        let request = tonic::Request::new(ListHostsRequest {
+            r#type: Some(1),
+            page_size: None,
+            page_token: None,
+        });
         let response = self.client.clone().list_hosts(request).await?;
         let hosts = response.into_inner().hosts;
 
