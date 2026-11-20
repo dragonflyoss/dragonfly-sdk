@@ -1,0 +1,98 @@
+name: CI (C++)
+
+on:
+  push:
+    branches: [main, release-*]
+  pull_request:
+    branches: [main, release-*]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: client-request/cpp
+
+env:
+  CLANG_FORMAT_VERSION: 23.1.5
+  APT_PACKAGES: >-
+    ninja-build clang clang-tidy libgrpc++-dev libprotobuf-dev protobuf-compiler
+    protobuf-compiler-grpc libcurl4-openssl-dev libssl-dev libabsl-dev
+    libgtest-dev libgmock-dev
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ env.APT_PACKAGES }}
+
+      - name: Run clang-format
+        run: |
+          pipx run clang-format==${{ env.CLANG_FORMAT_VERSION }} --dry-run --Werror $(git ls-files '*.h' '*.cc')
+
+      - name: Run clang-tidy
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_CXX_CLANG_TIDY=clang-tidy
+          cmake --build build
+
+  test:
+    name: Test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: gcc
+            os: ubuntu-latest
+            cxx: g++
+          - name: clang
+            os: ubuntu-latest
+            cxx: clang++
+          - name: sanitizers
+            os: ubuntu-latest
+            cxx: clang++
+            cxx_flags: -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer
+          - name: macos
+            os: macos-latest
+            cxx: clang++
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ env.APT_PACKAGES }}
+
+      - name: Install dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew install grpc ninja
+
+      - name: Run cmake
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} -DCMAKE_CXX_FLAGS="${{ matrix.cxx_flags }}" -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+
+      - name: Run build
+        run: |
+          cmake --build build
+
+      - name: Run ctest
+        run: |
+          ctest --test-dir build --output-on-failure
+
+      - name: Run install
+        run: |
+          cmake --install build --prefix "${{ runner.temp }}/install"
+          cmake -S examples -B build-examples -G Ninja -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} -DCMAKE_CXX_FLAGS="${{ matrix.cxx_flags }}" -DCMAKE_PREFIX_PATH="${{ runner.temp }}/install"
+          cmake --build build-examples

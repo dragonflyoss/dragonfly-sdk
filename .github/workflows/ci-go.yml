@@ -3,10 +3,8 @@ name: CI (Go)
 on:
   push:
     branches: [main, release-*]
-    paths: ['client-request/go/**', 'test/e2e/**', '!test/e2e/driver/rust/**', '.github/workflows/ci-go.yml']
   pull_request:
     branches: [main, release-*]
-    paths: ['client-request/go/**', 'test/e2e/**', '!test/e2e/driver/rust/**', '.github/workflows/ci-go.yml']
 
 defaults:
   run:

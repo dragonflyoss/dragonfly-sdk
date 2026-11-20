@@ -3,10 +3,8 @@ name: CI (Rust)
 on:
   push:
     branches: [main, release-*]
-    paths: ['client-request/rust/**', 'test/e2e/driver/rust/**', '.github/workflows/ci-rust.yml']
   pull_request:
     branches: [main, release-*]
-    paths: ['client-request/rust/**', 'test/e2e/driver/rust/**', '.github/workflows/ci-rust.yml']
 
 defaults:
   run:
