@@ -3,10 +3,8 @@ name: CI (C++)
 on:
   push:
     branches: [main, release-*]
-    paths: ['client-request/cpp/**', '.github/workflows/ci-cpp.yml']
   pull_request:
     branches: [main, release-*]
-    paths: ['client-request/cpp/**', '.github/workflows/ci-cpp.yml']
 
 permissions:
   contents: read
