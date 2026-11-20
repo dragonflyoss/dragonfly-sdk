@@ -64,3 +64,48 @@ graphify-out
 # Rust
 target/
 
+# C++ build directories
+build/
+build-*/
+cmake-build-*/
+out/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+CMakeUserPresets.json
+CTestTestfile.cmake
+_deps/
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+.ninja_deps
+.ninja_log
+build.ninja
+
+# C++ compiled files
+*.o
+*.obj
+*.lo
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.gch
+*.pch
+*.d
+
+# C++ tooling caches
+.cache/
+.clangd/
+.ccls-cache/
+.cquery_cache/
+vcpkg_installed/
+
+# C++ IDEs
+.idea/
+.vs/
+*.swp
