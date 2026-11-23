@@ -3,7 +3,7 @@ module d7y.io/dragonfly-sdk/client-request/go
 go 1.25.0
 
 require (
-	d7y.io/api/v2 v2.3.10
+	d7y.io/api/v2 v2.3.12
 	d7y.io/dragonfly/v2 v2.5.4-rc.2
 	d7y.io/hashring v0.3.0
 	github.com/cenkalti/backoff/v5 v5.0.3
