@@ -383,7 +383,7 @@ std::size_t CurlResponse::OnBody(char* data, std::size_t size,
   if (response->buffer_ != nullptr && n > 0) {
     std::memcpy(response->buffer_ + response->buffer_offset_, data, n);
     response->buffer_offset_ += n;
-    response->spill_.assign(data + n, size * count - n);
+    response->spill_.assign(data + n, (size * count) - n);
   } else {
     response->spill_.assign(data, size * count);
   }
@@ -420,7 +420,7 @@ absl::StatusOr<std::unique_ptr<HttpResponse>> HttpClient::Get(
 
 void HttpClient::Release(std::unique_ptr<CurlHandles> handles) {
   handles->released_at = std::chrono::steady_clock::now();
-  std::lock_guard<std::mutex> lock(mu_);
+  std::scoped_lock lock(mu_);
   if (idle_.size() < kMaxIdleHandles) {
     idle_.push_back(std::move(handles));
   }
@@ -431,7 +431,7 @@ std::unique_ptr<CurlHandles> HttpClient::Acquire() {
   // front. They are closed once the lock is released.
   std::vector<std::unique_ptr<CurlHandles>> stale;
   {
-    std::lock_guard<std::mutex> lock(mu_);
+    std::scoped_lock lock(mu_);
     const auto now = std::chrono::steady_clock::now();
     const auto fresh =
         std::find_if(idle_.begin(), idle_.end(), [now](const auto& handles) {

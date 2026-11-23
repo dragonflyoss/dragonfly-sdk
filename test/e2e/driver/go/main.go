@@ -15,8 +15,8 @@
  */
 
 // Command driver drives the Go client-request SDK for the e2e tests. It is the
-// Go counterpart of the Rust driver and speaks the same command line and JSON
-// output, so the e2e suite runs the same specs against both SDKs.
+// Go counterpart of the Rust and the C++ drivers and speaks the same command
+// line and JSON output, so the e2e suite runs the same specs against every SDK.
 //
 // Usage:
 //

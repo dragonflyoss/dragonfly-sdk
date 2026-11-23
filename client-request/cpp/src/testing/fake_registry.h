@@ -42,7 +42,7 @@ class FakeRegistry {
   HttpGetter getter() {
     return [this](const std::string& url,
                   const Header& header) -> absl::StatusOr<HttpResult> {
-      std::lock_guard<std::mutex> lock(mu_);
+      std::scoped_lock lock(mu_);
       requests.emplace_back(url, header);
       const auto it = answers_.find(url);
       if (it == answers_.end()) {

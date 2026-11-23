@@ -2,6 +2,10 @@
 # Follows the checks of google-cloud-cpp, refer to
 # https://github.com/googleapis/google-cloud-cpp/blob/main/.clang-tidy.
 #
+#  -portability-template-virtual-member-function: the check reports the
+#      virtual member functions of grpc::ServerWriter, a template in the
+#      headers of gRPC, wherever the fake servers of the tests write to one.
+#
 #  -readability-avoid-nested-conditional-operator: a chain of conditional
 #      operators reads as a table, such as the length of a UTF-8 sequence.
 Checks: >
@@ -30,6 +34,7 @@ Checks: >
   -modernize-use-nodiscard,
   -modernize-use-trailing-return-type,
   -performance-enum-size,
+  -portability-template-virtual-member-function,
   -readability-avoid-nested-conditional-operator,
   -readability-braces-around-statements,
   -readability-function-cognitive-complexity,

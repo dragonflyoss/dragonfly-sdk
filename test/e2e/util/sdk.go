@@ -45,9 +45,10 @@ const (
 )
 
 // SDK drives a client-request SDK through its e2e driver running in the runner
-// pod. The Go and the Rust drivers speak the same command line and JSON output.
+// pod. The Go, the Rust and the C++ drivers speak the same command line and
+// JSON output.
 type SDK struct {
-	// Name is the SDK name, "go" or "rust".
+	// Name is the SDK name, "go", "rust" or "cpp".
 	Name string
 
 	// driver is the path of the driver binary in the runner pod.
@@ -58,6 +59,7 @@ type SDK struct {
 var SDKs = []*SDK{
 	{Name: "go", driver: driverDir + "/driver-go"},
 	{Name: "rust", driver: driverDir + "/driver-rust"},
+	{Name: "cpp", driver: driverDir + "/driver-cpp"},
 }
 
 // GetResponse is the output of the get command of the drivers.

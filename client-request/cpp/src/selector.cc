@@ -63,7 +63,7 @@ void SeedPeerSelector::Run(std::shared_ptr<Scheduler> scheduler,
 
 void SeedPeerSelector::Close() {
   {
-    std::lock_guard<std::mutex> lock(close_mu_);
+    std::scoped_lock lock(close_mu_);
     closed_ = true;
   }
 

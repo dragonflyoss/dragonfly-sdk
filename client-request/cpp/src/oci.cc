@@ -389,7 +389,7 @@ absl::StatusOr<std::unique_ptr<RegistryClient>> RegistryClient::Create(
 absl::StatusOr<std::string> RegistryClient::Authorization() {
   std::string authorization;
   if (bearer_) {
-    std::lock_guard<std::mutex> lock(mu_);
+    std::scoped_lock lock(mu_);
     if (absl::Now() > token_expiration_) {
       absl::Status status = FetchToken();
       if (!status.ok()) {

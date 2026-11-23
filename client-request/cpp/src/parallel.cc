@@ -37,7 +37,7 @@ absl::Status ParallelFor(std::size_t count, std::size_t limit,
     for (std::size_t i = next++; i < count && !failed; i = next++) {
       absl::Status status = fn(i);
       if (!status.ok() && !failed.exchange(true)) {
-        std::lock_guard<std::mutex> lock(mu);
+        std::scoped_lock lock(mu);
         first_failure = std::move(status);
       }
     }
@@ -60,7 +60,7 @@ absl::Status ParallelFor(std::size_t count, std::size_t limit,
     thread.join();
   }
 
-  std::lock_guard<std::mutex> lock(mu);
+  std::scoped_lock lock(mu);
   return first_failure;
 }
 

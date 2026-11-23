@@ -70,18 +70,18 @@ class FakeSeedPeer final : public dfdaemon::v2::DfdaemonUpload::Service {
   }
 
   dfdaemon::v2::DownloadTaskRequest download_task_request() const {
-    std::lock_guard<std::mutex> lock(mu_);
+    std::scoped_lock lock(mu_);
     return download_task_requests_.back();
   }
 
   std::vector<dfdaemon::v2::DownloadTaskRequest> download_task_requests()
       const {
-    std::lock_guard<std::mutex> lock(mu_);
+    std::scoped_lock lock(mu_);
     return download_task_requests_;
   }
 
   dfdaemon::v2::DeleteImageRequest delete_image_request() const {
-    std::lock_guard<std::mutex> lock(mu_);
+    std::scoped_lock lock(mu_);
     return delete_image_request_;
   }
 
@@ -124,7 +124,7 @@ class FakeSeedPeer final : public dfdaemon::v2::DfdaemonUpload::Service {
       grpc::ServerWriter<dfdaemon::v2::DownloadTaskResponse>* writer) override {
     ++download_task_calls;
     {
-      std::lock_guard<std::mutex> lock(mu_);
+      std::scoped_lock lock(mu_);
       download_task_requests_.push_back(*request);
     }
 
@@ -155,7 +155,7 @@ class FakeSeedPeer final : public dfdaemon::v2::DfdaemonUpload::Service {
       dfdaemon::v2::DeleteImageResponse* response) override {
     ++delete_image_calls;
     {
-      std::lock_guard<std::mutex> lock(mu_);
+      std::scoped_lock lock(mu_);
       delete_image_request_ = *request;
     }
 
@@ -189,12 +189,12 @@ class FakeScheduler final : public scheduler::v2::Scheduler::Service {
   std::string endpoint() const { return absl::StrCat("http://", target()); }
 
   void set_hosts(std::vector<common::v2::Host> hosts) {
-    std::lock_guard<std::mutex> lock(mu_);
+    std::scoped_lock lock(mu_);
     hosts_ = std::move(hosts);
   }
 
   scheduler::v2::ListHostsRequest list_hosts_request() const {
-    std::lock_guard<std::mutex> lock(mu_);
+    std::scoped_lock lock(mu_);
     return list_hosts_request_;
   }
 
@@ -206,7 +206,7 @@ class FakeScheduler final : public scheduler::v2::Scheduler::Service {
                          const scheduler::v2::ListHostsRequest* request,
                          scheduler::v2::ListHostsResponse* response) override {
     ++list_hosts_calls;
-    std::lock_guard<std::mutex> lock(mu_);
+    std::scoped_lock lock(mu_);
     list_hosts_request_ = *request;
     for (const auto& host : hosts_) {
       *response->add_hosts() = host;

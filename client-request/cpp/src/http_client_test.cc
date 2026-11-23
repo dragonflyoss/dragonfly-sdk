@@ -56,7 +56,7 @@ absl::StatusOr<std::string> ReadAll(HttpResponse* response,
 std::string LargeBody(std::size_t size) {
   std::string body(size, '\0');
   for (std::size_t i = 0; i < size; ++i) {
-    body[i] = static_cast<char>('a' + (i * 31 + i / 251) % 26);
+    body[i] = static_cast<char>('a' + ((i * 31 + i / 251) % 26));
   }
 
   return body;
@@ -213,7 +213,7 @@ TEST(HttpClientTest, GetReturnsAnAnswerWhateverItsStatusCode) {
 }
 
 TEST(HttpClientTest, ReadStreamsTheBodyInPieces) {
-  const std::string body = LargeBody(3 * 1024 * 1024 + 17);
+  const std::string body = LargeBody((3 * 1024 * 1024) + 17);
   HttpServer server([&body](const TestRequest&) {
     TestResponse response;
     response.body = body;

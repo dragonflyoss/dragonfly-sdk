@@ -104,7 +104,7 @@ std::string QueryUnescape(absl::string_view s) {
     if (s[i] == '%' && i + 2 < s.size() && HexValue(s[i + 1]) >= 0 &&
         HexValue(s[i + 2]) >= 0) {
       bytes.push_back(
-          static_cast<char>(HexValue(s[i + 1]) * 16 + HexValue(s[i + 2])));
+          static_cast<char>((HexValue(s[i + 1]) * 16) + HexValue(s[i + 2])));
       i += 2;
     } else {
       bytes.push_back(s[i] == '+' ? ' ' : s[i]);

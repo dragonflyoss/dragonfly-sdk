@@ -28,7 +28,7 @@ HttpClientPool::HttpClientPool(std::size_t capacity,
 
 std::shared_ptr<HttpClient> HttpClientPool::Entry(
     const std::string& endpoint, std::chrono::steady_clock::time_point now) {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::scoped_lock lock(mu_);
 
   // Drop the idle clients that exceed the capacity or the idle timeout,
   // keeping those with active requests. A cleanup too soon after the last
@@ -56,7 +56,7 @@ std::shared_ptr<HttpClient> HttpClientPool::Entry(
 }
 
 std::size_t HttpClientPool::size() const {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::scoped_lock lock(mu_);
   return clients_.size();
 }
 

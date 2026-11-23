@@ -240,7 +240,7 @@ TEST(SeedPeerSelectorTest, ConcurrentSelectAndUpdate) {
     threads.emplace_back([&selector, i] {
       for (int j = 0; j < 50; ++j) {
         if (i % 2 == 0) {
-          selector.Update(TestSeedPeers(5 + j % 2));
+          selector.Update(TestSeedPeers(5 + (j % 2)));
         } else {
           EXPECT_THAT(
               SelectNames(selector, absl::StrCat("concurrent-task-", j), 2),

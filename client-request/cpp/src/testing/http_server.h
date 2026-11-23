@@ -100,7 +100,7 @@ class HttpServer {
 
   ~HttpServer() {
     {
-      std::lock_guard<std::mutex> lock(mu_);
+      std::scoped_lock lock(mu_);
       stopping_ = true;
       for (int fd : connection_fds_) {
         shutdown(fd, SHUT_RDWR);
@@ -127,17 +127,17 @@ class HttpServer {
   }
 
   int requests() const {
-    std::lock_guard<std::mutex> lock(mu_);
+    std::scoped_lock lock(mu_);
     return static_cast<int>(requests_.size());
   }
 
   std::vector<TestRequest> received() const {
-    std::lock_guard<std::mutex> lock(mu_);
+    std::scoped_lock lock(mu_);
     return requests_;
   }
 
   int connections() const {
-    std::lock_guard<std::mutex> lock(mu_);
+    std::scoped_lock lock(mu_);
     return static_cast<int>(connection_fds_.size());
   }
 
@@ -146,7 +146,7 @@ class HttpServer {
     for (;;) {
       pollfd poll_fd{listen_fd_, POLLIN, 0};
       const int ready = poll(&poll_fd, 1, 20);
-      std::lock_guard<std::mutex> lock(mu_);
+      std::scoped_lock lock(mu_);
       if (stopping_) {
         return;
       }
@@ -204,7 +204,7 @@ class HttpServer {
       buffer.erase(0, end + 4);
 
       {
-        std::lock_guard<std::mutex> lock(mu_);
+        std::scoped_lock lock(mu_);
         requests_.push_back(request);
       }
 

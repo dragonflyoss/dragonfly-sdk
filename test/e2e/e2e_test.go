@@ -17,7 +17,7 @@
 // Package e2e runs the client-request SDKs against a Dragonfly cluster in
 // kind: preheating files and OCI images to the seed peers, then downloading
 // them and checking the downloads hit the preheated seed peers. Every spec
-// runs against both the Go and the Rust SDK through their drivers.
+// runs against the Go, the Rust and the C++ SDK through their drivers.
 package e2e
 
 import (
