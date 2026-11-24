@@ -43,13 +43,10 @@ jobs:
         with:
           workspaces: test/e2e/driver/rust
 
-      - name: Install protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Get dependencies
         run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc libcurl4-openssl-dev libssl-dev libabsl-dev
           go install github.com/onsi/ginkgo/v2/ginkgo@v2.28.2
           mkdir -p ${{ env.ARTIFACT_DIR }}/bin ${{ env.ARTIFACT_DIR }}/dufs
           chmod -R 777 ${{ env.ARTIFACT_DIR }}

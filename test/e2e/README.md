@@ -1,37 +1,44 @@
 # E2E Tests
 
-The e2e tests run the Go and the Rust `client-request` SDKs against a Dragonfly
-cluster in [kind](https://kind.sigs.k8s.io/): a scheduler and four seed peers
-installed by the [Dragonfly helm chart](https://github.com/dragonflyoss/helm-charts),
+The e2e tests run the Go, the Rust and the C++ `client-request` SDKs against a
+Dragonfly cluster in [kind](https://kind.sigs.k8s.io/): a scheduler and four
+seed peers installed by the [Dragonfly helm chart](https://github.com/dragonflyoss/helm-charts),
 a [dufs](https://github.com/sigoden/dufs) file server serving the generated
 files and a runner pod the SDKs run in.
 
-Every spec runs against both SDKs through the drivers in `driver/go` and
-`driver/rust`, two small commands speaking the same command line and JSON
-output over each SDK. The specs preheat files and OCI images with the default
-two replicas, then check the preheats land on the seed peers `LookupEndpoints`
-selects and only on them, and that the gets, through the scheduler or bound to
-the looked up endpoints, are served from the preheated cache: the response
-carries the task id, the ip of a preheated seed peer and the download finished
-flag, the content matches and the file server sees no further download. They
-also delete a preheated file and a preheated image and check no seed peer holds
-the task, or the manifest and any blob, afterwards. With the all seed peers
-scope, they check a preheat lands the task on every seed peer and a delete
-removes it from every one of them.
+Every spec runs against every SDK through the drivers in `driver/go`,
+`driver/rust` and `driver/cpp`, three small commands speaking the same command
+line and JSON output over each SDK. The specs preheat files and OCI images with
+the default two replicas, then check the preheats land on the seed peers
+`LookupEndpoints` selects and only on them, and that the gets, through the
+scheduler or bound to the looked up endpoints, are served from the preheated
+cache: the response carries the task id, the ip of a preheated seed peer and
+the download finished flag, the content matches and the file server sees no
+further download. They also delete a preheated file and a preheated image and
+check no seed peer holds the task, or the manifest and any blob, afterwards.
+With the all seed peers scope, they check a preheat lands the task on every
+seed peer and a delete removes it from every one of them.
 
 ## Run locally
 
-Requirements: Docker, kind, kubectl, helm, Go, Rust, protoc and
-[ginkgo](https://onsi.github.io/ginkgo/).
+Requirements: Docker, kind, kubectl, helm, Go, Rust, protoc,
+[ginkgo](https://onsi.github.io/ginkgo/) and the
+[dependencies of the C++ SDK](../../client-request/cpp/README.md#install).
 
 The runner pod runs the drivers from `/tmp/artifact/bin`, which the kind nodes
 mount, so the drivers must be built for Linux and the architecture of the
-Docker host. On Linux `make build-e2e-drivers` does; on macOS build the Rust
-driver in a container, e.g.:
+Docker host, and the C++ driver on Ubuntu 24.04, the image of the runner pod
+whose gRPC library it loads. On Ubuntu 24.04 `make build-e2e-drivers` does;
+elsewhere build the Rust and the C++ drivers in a container and copy them to
+`/tmp/artifact/bin/driver-rust` and `/tmp/artifact/bin/driver-cpp`, e.g.:
 
 ```shell
 docker run --rm -v "$PWD:/work" -w /work/test/e2e/driver/rust rust:1.88-bookworm \
   sh -c 'apt-get update -qq && apt-get install -y -qq protobuf-compiler cmake && cargo build --release'
+docker run --rm -v "$PWD:/work" -w /work/test/e2e/driver/cpp ubuntu:24.04 \
+  sh -c 'apt-get update -qq && apt-get install -y -qq ca-certificates cmake ninja-build g++ libgrpc++-dev libprotobuf-dev \
+    protobuf-compiler protobuf-compiler-grpc libcurl4-openssl-dev libssl-dev libabsl-dev &&
+    cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build'
 ```
 
 Then create the cluster and run the tests:

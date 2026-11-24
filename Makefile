@@ -16,12 +16,15 @@
 # its bin directory and run from there by the e2e runner pod.
 ARTIFACT_DIR ?= /tmp/artifact
 
-# Build the Go and the Rust SDK drivers of the e2e tests for the e2e runner pod.
+# Build the Go, the Rust and the C++ SDK drivers of the e2e tests for the e2e
+# runner pod.
 build-e2e-drivers:
 	@mkdir -p $(ARTIFACT_DIR)/bin
 	@cd test/e2e && CGO_ENABLED=0 GOOS=linux go build -o $(ARTIFACT_DIR)/bin/driver-go ./driver/go
 	@cd test/e2e/driver/rust && cargo build --release
 	@cp test/e2e/driver/rust/target/release/driver $(ARTIFACT_DIR)/bin/driver-rust
+	@cd test/e2e/driver/cpp && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build
+	@cp test/e2e/driver/cpp/build/driver $(ARTIFACT_DIR)/bin/driver-cpp
 .PHONY: build-e2e-drivers
 
 # Run the e2e tests against the kind cluster, see test/e2e/README.md.

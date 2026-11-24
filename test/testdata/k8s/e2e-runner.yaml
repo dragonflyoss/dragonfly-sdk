@@ -3,7 +3,9 @@
 # pods are not reachable from the host. The drivers are built on the host into
 # /tmp/artifact/bin, which the kind nodes mount. The image is Ubuntu 24.04 with
 # the CA certificates, matching the GitHub Actions runner so the Rust driver
-# finds the glibc it was linked against.
+# finds the glibc and the C++ driver the shared libraries they were linked
+# against. The pod installs the gRPC library of the C++ driver, which brings
+# protobuf, abseil and RE2, and is ready once it is installed.
 apiVersion: v1
 kind: Pod
 metadata:
@@ -16,8 +18,18 @@ spec:
   containers:
     - name: e2e-runner
       image: buildpack-deps:noble-curl
-      command: ['sleep', 'infinity']
+      command:
+        - sh
+        - -c
+        - >-
+          apt-get update &&
+          apt-get install -y --no-install-recommends libgrpc++1.51t64 &&
+          touch /tmp/ready &&
+          exec sleep infinity
       imagePullPolicy: 'IfNotPresent'
+      readinessProbe:
+        exec:
+          command: ['test', '-f', '/tmp/ready']
       volumeMounts:
         - name: artifact
           mountPath: /tmp/artifact

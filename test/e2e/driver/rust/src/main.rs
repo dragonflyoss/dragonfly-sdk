@@ -15,8 +15,8 @@
  */
 
 //! Drives the Rust client-request SDK for the e2e tests. It is the Rust
-//! counterpart of the Go driver and speaks the same command line and JSON
-//! output, so the e2e suite runs the same specs against both SDKs.
+//! counterpart of the Go and the C++ drivers and speaks the same command line
+//! and JSON output, so the e2e suite runs the same specs against every SDK.
 //!
 //! The SDK builds its HTTP client without a default TLS crypto provider, so the
 //! driver installs one before using it.
