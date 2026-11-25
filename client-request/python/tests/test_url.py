@@ -21,6 +21,7 @@
 import pytest
 
 from dragonfly_client_request.errors import InvalidArgumentError
+from dragonfly_client_request.id_generator import task_id
 from dragonfly_client_request.url import _Encoding, _escape, filter_query_params
 
 
@@ -583,3 +584,13 @@ def test_filter_query_params_matches_go_scheduler(
     url: str, filtered_query_params: list[str], expected_url: str
 ) -> None:
     assert filter_query_params(url, filtered_query_params) == expected_url
+
+
+@pytest.mark.parametrize(
+    ("url", "filtered_query_params", "expected_task_id"),
+    [(url, params, expected_task_id) for url, params, _, expected_task_id in GO_PINNED],
+)
+def test_task_id_matches_go_scheduler(
+    url: str, filtered_query_params: list[str], expected_task_id: str
+) -> None:
+    assert task_id(url, None, "", "", filtered_query_params, "", True) == expected_task_id
