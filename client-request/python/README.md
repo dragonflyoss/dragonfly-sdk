@@ -7,9 +7,16 @@ crate [dragonfly-client-request](https://github.com/dragonflyoss/dragonfly-sdk/t
 and the Go module [client-request](https://github.com/dragonflyoss/dragonfly-sdk/tree/main/client-request/go).
 
 The package is being ported in steps. It currently has the error types the
-request surface raises and the rule for which failures are retried against
-another seed peer. The task id generation and the seed peer hash ring come
-next, then GET, stat, preheat and delete.
+request surface raises, the rule for which failures are retried against
+another seed peer, and the url canonicalization the task id is computed from.
+The task id generation and the seed peer hash ring come next, then GET, stat,
+preheat and delete.
+
+The scheduler canonicalizes urls with Go's `net/url`, so this package does the
+same. Where the Rust url crate applies a WHATWG normalization the scheduler
+does not (lowercasing the host, dropping a default port, resolving dot
+segments), the url is kept as written, like the scheduler. A url the
+scheduler rejects raises `InvalidArgumentError`.
 
 ## Development
 
