@@ -14,7 +14,8 @@
 
 """Request library for the Dragonfly client. It is the Python implementation
 of the Rust crate dragonfly-client-request and the Go module
-d7y.io/dragonfly-sdk/client-request/go, and generates identical task ids.
+d7y.io/dragonfly-sdk/client-request/go, and generates identical task ids and
+seed peer selections.
 """
 
 from .errors import (
@@ -27,6 +28,7 @@ from .errors import (
     RequestTimeoutError,
     ResponseError,
 )
+from .hashring import DEFAULT_VNODES_PER_NODE, VNode, VNodeHashRing
 from .id_generator import (
     CONTAINERD_FILTERED_QUERY_PARAMS,
     COS_FILTERED_QUERY_PARAMS,
@@ -47,6 +49,7 @@ __all__ = [
     "CONTAINERD_FILTERED_QUERY_PARAMS",
     "COS_FILTERED_QUERY_PARAMS",
     "DEFAULT_FILTERED_QUERY_PARAMS",
+    "DEFAULT_VNODES_PER_NODE",
     "GCS_FILTERED_QUERY_PARAMS",
     "OBS_FILTERED_QUERY_PARAMS",
     "OSS_FILTERED_QUERY_PARAMS",
@@ -60,6 +63,8 @@ __all__ = [
     "RequestError",
     "RequestTimeoutError",
     "ResponseError",
+    "VNode",
+    "VNodeHashRing",
     "task_id",
     "task_id_by_blob_digest",
     "task_id_by_content",

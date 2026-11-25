@@ -7,8 +7,8 @@ crate [dragonfly-client-request](https://github.com/dragonflyoss/dragonfly-sdk/t
 and the Go module [client-request](https://github.com/dragonflyoss/dragonfly-sdk/tree/main/client-request/go).
 
 The package is being ported in steps. It currently generates the same task ids
-as the Go and Rust SDKs, pinned by the shared cross-language test vectors. The
-seed peer hash ring comes next, then GET, stat, preheat and delete.
+and seed peer selections as the Go and Rust SDKs, pinned by the shared
+cross-language test vectors. GET, stat, preheat and delete come next.
 
 ## Usage
 
@@ -45,6 +45,22 @@ the task id, and a content string hashes the content instead of the url:
 id = task_id("https://registry.example.com/v2/library/ubuntu/blobs/sha256:b2c366cc...")
 
 id = task_id("", content_for_calculating_task_id="This is a test file")
+```
+
+Select the seed peers serving a task with the consistent hash ring the
+scheduler and the client use. The ring returns the virtual node owning the
+task first and the next ones clockwise. Neighboring virtual nodes can belong
+to the same seed peer, so skip repeated names the way the Go selector does:
+
+```python
+from dragonfly_client_request import VNodeHashRing
+
+ring = VNodeHashRing()
+for seed_peer in ["seed-peer-1", "seed-peer-2", "seed-peer-3"]:
+    ring.add(seed_peer)
+
+vnodes = ring.get_with_replicas(id, replicas=len(ring))
+seed_peers = list(dict.fromkeys(vnode.name for vnode in vnodes))[:2]
 ```
 
 ## Compatibility

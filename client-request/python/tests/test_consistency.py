@@ -13,13 +13,17 @@
 # limitations under the License.
 
 # Cross-language consistency vectors shared with the Go SDK
-# (client-request/go/consistency_test.go) and the Rust SDK
-# (client-request/rust/tests/consistency.rs). All three test suites assert the
-# same fixed outputs, so a change on any side that breaks task id compatibility
-# fails the build.
+# (client-request/go/consistency_test.go), the Rust SDK
+# (client-request/rust/tests/consistency.rs) and d7y.io/hashring. Every suite
+# asserts the same fixed outputs, so a change on any side that moves a task id
+# or a seed peer selection fails the build.
 
 import pytest
 
+from dragonfly_client_request.hashring import (
+    DEFAULT_VNODES_PER_NODE,
+    VNodeHashRing,
+)
 from dragonfly_client_request.id_generator import task_id
 
 TASK_ID_CASES = [
@@ -178,3 +182,171 @@ def test_task_id_matches_go_and_rust(
         )
         == expected
     )
+
+
+MOCK_SEED_PEERS = ["seed-peer-1", "seed-peer-2", "seed-peer-3"]
+MOCK_SEED_CLIENTS = [
+    "default-seed-client-0",
+    "default-seed-client-1",
+    "default-seed-client-2",
+]
+
+HASHRING_CASES = [
+    (3, MOCK_SEED_PEERS, "task-a", 2, ["seed-peer-3|2", "seed-peer-1|2", "seed-peer-3|0"]),
+    (3, MOCK_SEED_PEERS, "task-b", 2, ["seed-peer-2|0", "seed-peer-2|1", "seed-peer-1|0"]),
+    (3, MOCK_SEED_PEERS, "task-c", 2, ["seed-peer-2|1", "seed-peer-1|0", "seed-peer-3|2"]),
+    (
+        3,
+        MOCK_SEED_PEERS,
+        "task-a",
+        100,
+        [
+            "seed-peer-3|2",
+            "seed-peer-1|2",
+            "seed-peer-3|0",
+            "seed-peer-1|1",
+            "seed-peer-2|2",
+            "seed-peer-3|1",
+            "seed-peer-2|0",
+            "seed-peer-2|1",
+            "seed-peer-1|0",
+        ],
+    ),
+    (
+        DEFAULT_VNODES_PER_NODE,
+        MOCK_SEED_CLIENTS,
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        2,
+        ["default-seed-client-1|260", "default-seed-client-0|383", "default-seed-client-0|281"],
+    ),
+    (
+        DEFAULT_VNODES_PER_NODE,
+        MOCK_SEED_CLIENTS,
+        "0000000000000000000000000000000000000000000000000000000000001eef",
+        2,
+        ["default-seed-client-1|375", "default-seed-client-2|109", "default-seed-client-0|483"],
+    ),
+    (
+        DEFAULT_VNODES_PER_NODE,
+        MOCK_SEED_CLIENTS,
+        "0000000000000000000000000000000000000000000000000000000000003dde",
+        2,
+        ["default-seed-client-2|366", "default-seed-client-0|374", "default-seed-client-1|30"],
+    ),
+    (
+        DEFAULT_VNODES_PER_NODE,
+        MOCK_SEED_CLIENTS,
+        "0000000000000000000000000000000000000000000000000000000000005ccd",
+        2,
+        ["default-seed-client-0|69", "default-seed-client-0|121", "default-seed-client-2|243"],
+    ),
+    (
+        DEFAULT_VNODES_PER_NODE,
+        MOCK_SEED_CLIENTS,
+        "0000000000000000000000000000000000000000000000000000000000007bbc",
+        2,
+        ["default-seed-client-0|239", "default-seed-client-1|156", "default-seed-client-1|157"],
+    ),
+    (
+        DEFAULT_VNODES_PER_NODE,
+        MOCK_SEED_CLIENTS,
+        "0000000000000000000000000000000000000000000000000000000000009aab",
+        2,
+        ["default-seed-client-1|501", "default-seed-client-0|435", "default-seed-client-1|308"],
+    ),
+    (
+        DEFAULT_VNODES_PER_NODE,
+        MOCK_SEED_CLIENTS,
+        "000000000000000000000000000000000000000000000000000000000000b99a",
+        2,
+        ["default-seed-client-0|223", "default-seed-client-0|9", "default-seed-client-2|83"],
+    ),
+    (
+        DEFAULT_VNODES_PER_NODE,
+        MOCK_SEED_CLIENTS,
+        "000000000000000000000000000000000000000000000000000000000000d889",
+        2,
+        ["default-seed-client-1|429", "default-seed-client-2|220", "default-seed-client-1|220"],
+    ),
+    (
+        DEFAULT_VNODES_PER_NODE,
+        MOCK_SEED_CLIENTS,
+        "000000000000000000000000000000000000000000000000000000000000f778",
+        2,
+        ["default-seed-client-2|326", "default-seed-client-1|155", "default-seed-client-0|473"],
+    ),
+    (
+        DEFAULT_VNODES_PER_NODE,
+        MOCK_SEED_CLIENTS,
+        "0000000000000000000000000000000000000000000000000000000000011667",
+        2,
+        ["default-seed-client-0|293", "default-seed-client-1|334", "default-seed-client-2|199"],
+    ),
+    (
+        DEFAULT_VNODES_PER_NODE,
+        MOCK_SEED_CLIENTS,
+        "0000000000000000000000000000000000000000000000000000000000013556",
+        2,
+        ["default-seed-client-2|246", "default-seed-client-2|65", "default-seed-client-0|369"],
+    ),
+    (
+        DEFAULT_VNODES_PER_NODE,
+        MOCK_SEED_CLIENTS,
+        "0000000000000000000000000000000000000000000000000000000000015445",
+        2,
+        ["default-seed-client-2|480", "default-seed-client-1|24", "default-seed-client-1|147"],
+    ),
+    (
+        DEFAULT_VNODES_PER_NODE,
+        MOCK_SEED_CLIENTS,
+        "",
+        2,
+        ["default-seed-client-1|163", "default-seed-client-2|24", "default-seed-client-1|252"],
+    ),
+    (
+        DEFAULT_VNODES_PER_NODE,
+        MOCK_SEED_CLIENTS,
+        "a",
+        2,
+        ["default-seed-client-0|392", "default-seed-client-1|40", "default-seed-client-0|359"],
+    ),
+    (
+        DEFAULT_VNODES_PER_NODE,
+        MOCK_SEED_CLIENTS,
+        "00000",
+        2,
+        ["default-seed-client-2|115", "default-seed-client-2|286", "default-seed-client-1|355"],
+    ),
+    (
+        DEFAULT_VNODES_PER_NODE,
+        MOCK_SEED_CLIENTS,
+        "dragonfly",
+        2,
+        ["default-seed-client-1|397", "default-seed-client-0|422", "default-seed-client-2|153"],
+    ),
+    (
+        DEFAULT_VNODES_PER_NODE,
+        MOCK_SEED_CLIENTS,
+        "dragonfly-seed-client-0",
+        2,
+        ["default-seed-client-2|477", "default-seed-client-0|157", "default-seed-client-0|199"],
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("vnodes_per_node", "nodes", "key", "replicas", "expected"), HASHRING_CASES
+)
+def test_hashring_matches_go_and_rust(
+    vnodes_per_node: int, nodes: list[str], key: str, replicas: int, expected: list[str]
+) -> None:
+    ring = VNodeHashRing(vnodes_per_node=vnodes_per_node)
+    for name in nodes:
+        ring.add(name)
+
+    vnode = ring.get(key)
+    assert vnode is not None
+
+    vnodes = ring.get_with_replicas(key, replicas)
+    assert vnodes[0] == vnode
+    assert [str(vnode) for vnode in vnodes] == expected
