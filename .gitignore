@@ -109,3 +109,13 @@ vcpkg_installed/
 .idea/
 .vs/
 *.swp
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv/
+dist/
