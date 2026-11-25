@@ -1,0 +1,61 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dragonfly-client-request"
+description = "Request library for the dragonfly client"
+version = "1.15.1"
+authors = [{ name = "The Dragonfly Developers" }]
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+keywords = ["container", "docker-image", "dragonfly", "dragonfly-client", "p2p"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Libraries",
+  "Topic :: System :: Networking",
+  "Typing :: Typed",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://d7y.io/"
+Repository = "https://github.com/dragonflyoss/dragonfly-sdk"
+
+[dependency-groups]
+dev = [
+  "mypy>=1.11",
+  "pytest>=8.0",
+  "ruff>=0.6",
+]
+
+[tool.hatch.build.targets.sdist]
+only-include = ["src", "tests", "README.md"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dragonfly_client_request"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "N", "RUF", "SIM", "UP", "W"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
